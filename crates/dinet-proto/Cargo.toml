@@ -1,0 +1,11 @@
+[package]
+name = "dinet-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire-протокол DI-NET v0 (детерминированный CBOR-lite, std-only)"
+
+[dependencies]
+
+[dev-dependencies]
+dinet-crypto = { path = "../dinet-crypto" }

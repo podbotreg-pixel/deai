@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dinet-crypto",
+    "crates/dinet-proto",
+    "crates/dinet-core",
+    "crates/dinet-fl",
+    "crates/dinet-net",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later OR Apache-2.0"
+rust-version = "1.75"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

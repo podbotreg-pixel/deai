@@ -1,0 +1,11 @@
+[package]
+name = "dinet-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Сетевой слой DI-NET: bootstrap-источники, роли, ставка репутации (сборка-скелет; libp2p — точка прикрепления)"
+
+[dependencies]
+dinet-proto = { path = "../dinet-proto" }
+dinet-core = { path = "../dinet-core" }
+dinet-crypto = { path = "../dinet-crypto" }

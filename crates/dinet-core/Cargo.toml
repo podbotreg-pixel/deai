@@ -1,0 +1,8 @@
+[package]
+name = "dinet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Конфигурация и планировщик ресурсов DI-NET («вежливый гость» системы)"
+
+[dependencies]
