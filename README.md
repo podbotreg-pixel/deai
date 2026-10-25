@@ -30,6 +30,7 @@ crates/
   dinet-proto/        wire-протокол v0 (детерминированный CBOR-lite), коды сообщений
   dinet-core/         конфигурация, планировщик ресурсов (лимиты CPU/RAM/батарея/сеть)
   dinet-fl/           quant+error feedback, DP-клиппинг, trimmed mean / Krum, FedGraph-score
+  dinet-node/         узел: DiLoCo-расписание эр, robust-скрининг, fork-choice, симуляция роя
   dinet-net/          пeer-to-peer слой (libp2p-интеграция — точка прикрепления)
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
@@ -41,6 +42,7 @@ PROMPT.md             исходный мега-промт проектиров�
 cargo build          # только std, никаких внешних зависимостей
 cargo test           # юнит-тесты всех крейтов
 python3 prototype/proto.py   # демо: подпись→CBOR→secure-aggregation
+cargo run -p dinet-node      # демо роя: 20 узлов, 10% отравителей, robust-агрегация, чек-пойнты
 ```
 
 ## Ключевые документы

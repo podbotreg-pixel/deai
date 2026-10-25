@@ -6,3 +6,4 @@ license.workspace = true
 description = "Федеративная математика DI-NET: квантование, DP-клиппинг, trimmed mean / Krum, FedGraph-score (std-only)"
 
 [dependencies]
+dinet-crypto = { path = "../dinet-crypto" }

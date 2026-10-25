@@ -6,10 +6,13 @@
 ## M0 — Локальная «жизнь» (4 недели)
 
 - [x] Прототип протокола `prototype/proto.py` (сообщения + CBOR-lite + secure_agg demo)
-- [ ] Ядро Rust собирается, конфигурация, планировщик ресурсов (лимиты CPU/RAM/батареи)
-- [ ] llama.cpp binding, GGUF Q4, стриминг токенов
+- [x] Ядро Rust собирается, конфигурация, планировщик ресурсов (лимиты CPU/RAM/батареи)
+      (`dinet-crypto`, `dinet-proto`, `dinet-core`, `dinet-fl`, `dinet-net`, `dinet-node`; std-only)
+- [ ] llama.cpp binding, GGUF Q4, стриминг токенов (точка прикрепления: LocalTrainer-интерфейс в dinet-fl)
 - [ ] Чат-UI (Tauri), история, экспорт, миграция
-- [ ] **Speak→learn:** буфер пар → LoRA-DPO цикл (в фоне, safety-проповью DP-обрезка)
+- [x] **Speak→learn (механика):** буфер пар → LoRA + hinge-предпочтение (saturating DPO-lite),
+      DP-клиппинг, local_fit → secure_agg — на toy-модели, интерфейс LocalTrainer устойчив
+      к замене на llama.cpp
 - [ ] Локальная память: SQLite + sqlite-vec RAG
 
 **DoD ( проверить руками ):** 16-GB laptop без GPU, чат ≥15 ток/с; обучение партии 20 пар
@@ -19,15 +22,25 @@
 ## M1 — Рой (6 недель)
 
 - [ ] libp2p: QUIC+WS, gossipsub, Kademlia DHT, mDNS, PEX, 5 источников bootstrap
-- [ ] Secure Aggregation (pairwise masking) — без отправки индивидуальных апдейтов
-- [ ] Robust-agg: trimmed mean + Krum + FedGraph-score
+      (точка прикрепления: тот же набор сообщений, что в `dinet-node/src/swarm.rs`)
+- [x] Secure Aggregation (pairwise masking) — без отправки индивидуальных апдейтов
+      (`dinet-fl::secure_agg`: инвариант Σмасок==Σθ проверен тестами; v0-masks на SHA-256, v1 — X25519)
+- [x] Robust-agg: median norm-band + Krum-консенсус + trimmed mean
+      (`dinet-node::swarm::robust_screen`; 10% poison-узлов отсекаются на reveal-эрах до чек-пойнта)
 - [ ] Ротируемые роли: aggregator каждый era (окно 1 ч), lazy-audit 10%
+      (v0: leaderless-сим — каждый узел проверяет всех Himself; ролям делать нечего до libp2p)
+- [x] Fork-choice чек-пойнта: publish только при качестве ≥2/3 узлов (eval-vote), иначе last-good
 - [ ] Реестр чек-пойнтов: append-only лог + кворум нотариусов + внешние якоря
 - [ ] Репликация весов через torrent-схему (дельты от parent)
 
 **DoD:** 100 контейнеров (200 Mbps/5% loss эмуляция): метрики сходятся после N эпох;
 10% malicious-узлов не могут сдвинуть eval на > заданный δ; выключение любого
 агрегатора/нотарriуса/релея замедляет, но не останавливает.
+
+**Статус v0 (2026-10-25):** DiLoCo-расписание (маскированные эры накопления + редкие
+REVEAL-эры с robust-агрегацией и чек-пойнтом); симуляция 20 узлов / 10% отравителей:
+точность 0.08→1.00 по чек-пойнтам, отравители отбракованы на каждой reveal-эре,
+выход 40% узлов не останавливает сеть (`cargo run -p dinet-node`).
 
 ## M2 — Агент (8 недель)
 

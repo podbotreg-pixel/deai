@@ -13,6 +13,9 @@ version = "0.1.0"
 [[package]]
 name = "dinet-fl"
 version = "0.1.0"
+dependencies = [
+ "dinet-crypto",
+]
 
 [[package]]
 name = "dinet-net"
@@ -20,6 +23,16 @@ version = "0.1.0"
 dependencies = [
  "dinet-core",
  "dinet-crypto",
+ "dinet-proto",
+]
+
+[[package]]
+name = "dinet-node"
+version = "0.1.0"
+dependencies = [
+ "dinet-core",
+ "dinet-crypto",
+ "dinet-fl",
  "dinet-proto",
 ]
 

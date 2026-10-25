@@ -241,6 +241,7 @@ pub trait Signer: Send + Sync {
 /// Заглушка-детерминированный signer: ТОЛЬКО для прототипа/тестов.
 /// Не даёт криптографических гарантий (HMAC-подобный self-check по SHA-256).
 /// Заменяется на ed25519-dalek при появлении crates.io.
+#[derive(Debug)]
 pub struct DemoSigner {
     seed: [u8; ED25519_PUB_LEN],
     did: String,

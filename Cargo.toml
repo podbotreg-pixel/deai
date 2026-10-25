@@ -6,6 +6,7 @@ members = [
     "crates/dinet-core",
     "crates/dinet-fl",
     "crates/dinet-net",
+    "crates/dinet-node",
 ]
 
 [workspace.package]
@@ -18,3 +19,7 @@ rust-version = "1.75"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# тесты/сборка отладки: чуть быстрее симуляции (математика FL — численный бенчмарк)
+[profile.dev]
+opt-level = 1

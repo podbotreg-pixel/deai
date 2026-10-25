@@ -1,0 +1,16 @@
+[package]
+name = "dinet-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Узел DI-NET: роя-логика, DILoCo-расписание, leaderless-агрегация, ledger чек-пойнтов"
+
+[dependencies]
+dinet-crypto = { path = "../dinet-crypto" }
+dinet-proto = { path = "../dinet-proto" }
+dinet-core = { path = "../dinet-core" }
+dinet-fl = { path = "../dinet-fl" }
+
+[[bin]]
+name = "dinet-node"
+path = "src/main.rs"

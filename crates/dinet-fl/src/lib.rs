@@ -31,6 +31,9 @@ pub fn dequantize(q: &[i8], scale: f32) -> Vec<f32> {
     q.iter().map(|&x| x as f32 * scale).collect()
 }
 
+pub mod secure_agg;
+pub mod toy_llm;
+
 /// Euclidean-норма.
 pub fn norm2(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
