@@ -34,20 +34,14 @@ pub fn prg_stream(seed: &[u8], n: usize) -> Vec<u8> {
     out
 }
 
-/// Маска для пары (i,j) при позиции d — i64 по потоку.
-fn mask_element(seed_ij: &[u8], d: usize) -> i64 {
-    const B: usize = 8;
-    let stream = prg_stream(seed_ij, (d + 1) * B);
-    let mut b = [0u8; B];
-    b.copy_from_slice(&stream[d * B..(d + 1) * B]);
-    i64::from_be_bytes(b)
-}
-
 /// f32 -> fixedpoint i64 (clamped), детерминировано.
 pub fn to_fx(x: f32) -> i64 {
     let v = (x as f64 * FX_SCALE).round() as i64;
     v.clamp(-(1i64 << 52), 1i64 << 52)
 }
+
+// Маск-элемент устарел: маски теперь из одиночного PRG-потока пары (bulk в
+// client_share). Оставалась функция с O(d) вызовами потока — удалена.
 
 pub fn from_fx(v: i64) -> f32 {
     (v as f64 / FX_SCALE) as f32
@@ -57,22 +51,31 @@ pub fn from_fx(v: i64) -> f32 {
 /// share[d] = θ[d] + Σ_{j<i_case_sign} sign(i,j) * mask_{ij,d}
 /// Sign консистентен с каноническим ключом: min-сторона добавляет маску,
 /// max-сторона вычитает ту же величину.
+///
+/// Маска пары генерируется ОДНИМ PRG-потоком на пару (dim·8 байт), а не
+/// отдельным вызовом на компоненту — O(n·dim) вместо O(n²·dim).
 pub fn client_share(
     my_id: usize,
-    my_seed: &[u8],
+    _my_seed: &[u8],
     registry: &[(usize, usize, [u8; 16])], // (i, j, seed_ij), i<j
     update_fx: &[i64],
 ) -> Vec<i64> {
+    let dim = update_fx.len();
     let mut share: Vec<i64> = update_fx.to_vec();
-    for &(i, j, ref seed_ij) in registry {
+    for &(i, j, seed_ij) in registry {
         if i != my_id && j != my_id {
             continue;
         }
         let sign: i64 = if my_id == i { 1 } else { -1 };
+        // Один поток на пару: маска компоненты d — байты [d*8, d*8+8) потока (BE).
+        let stream = prg_stream(&seed_ij, dim * 8);
         for (d, s) in share.iter_mut().enumerate() {
-            *s = s.wrapping_add(sign.wrapping_mul(mask_element(seed_ij, d)));
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&stream[d * 8..(d + 1) * 8]);
+            let mask = i64::from_be_bytes(b);
+            *s = s.wrapping_add(sign.wrapping_mul(mask));
         }
-        let _ = my_seed; // рынок v1: derive X25519 shared secret из этого seed
+        let _ = _my_seed; // рынок v1: derive X25519 shared secret из этого seed
     }
     share
 }

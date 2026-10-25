@@ -63,6 +63,8 @@ const T_PATK: u8 = 27;
 const T_SHASH: u8 = 28;
 const T_ABI: u8 = 29;
 const T_BODY: u8 = 30;
+const T_DELTA: u8 = 31;
+const T_NORM: u8 = 32;
 
 // --- коды типов сообщений ---
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,9 @@ pub enum MsgType {
     UpdShare = 0x11,
     AggCommit = 0x20,
     RobustReport = 0x21,
+    /// Каркас reveal-эры: DP'd адаптер-дельта (f32 LE) + норма-аттестация.
+    /// Публикуется ТОЛЬКО в reveal-эрах (редкие); в masked-эрах — только 0x11.
+    RobustInput = 0x22,
     LazyAudit = 0x23,
     CheckpointAnnounce = 0x30,
     EvalVote = 0x31,
@@ -91,6 +96,7 @@ impl MsgType {
             0x11 => MsgType::UpdShare,
             0x20 => MsgType::AggCommit,
             0x21 => MsgType::RobustReport,
+            0x22 => MsgType::RobustInput,
             0x23 => MsgType::LazyAudit,
             0x30 => MsgType::CheckpointAnnounce,
             0x31 => MsgType::EvalVote,
@@ -118,6 +124,10 @@ pub enum Payload {
     UpdShare { era_id: [u8; 32], agg_id: [u8; 32], c_share: Vec<u8>, nonce: [u8; 16] },
     AggCommit { era_id: [u8; 32], agg_result_hash: [u8; 32], num_contrib: u16 },
     RobustReport { era_id: [u8; 32], krum_score: f32, fedgraph_score: f32, marked_malicious: u16 },
+    RobustInput { era_id: [u8; 32], /// DP'd дельта адаптера (f32 LE, компонентно)
+                  delta: Vec<f32>, /// аттестованная L2-норма (до клипа)
+                  norm: f32, /// proof-of-training claim (шагов локально)
+                  steps: u32 },
     LazyAudit { auditor_id: [u8; 32], checkpoint_id: [u8; 32], ppl_before: f32, ppl_after: f32, verdict: bool },
     CheckpointAnnounce { id: [u8; 32], parent_id: [u8; 32], era_id: [u8; 32], merge_recipe_hash: [u8; 32], ppl: f32, pass_at_k: u8 },
     EvalVote { checkpoint_id: [u8; 32], ppl: f32, pass_at_k: u8 },
@@ -207,6 +217,16 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.f32(T_KRUM, *krum_score);
             e.f32(T_FGRAPH, *fedgraph_score);
             e.num(T_MALIC, *marked_malicious as u32);
+        }
+        Payload::RobustInput { era_id, delta, norm, steps } => {
+            e.b32(T_ERA, era_id);
+            let mut le = Vec::with_capacity(delta.len() * 4);
+            for v in delta {
+                le.extend_from_slice(&v.to_le_bytes());
+            }
+            e.bytes(T_DELTA, &le);
+            e.f32(T_NORM, *norm);
+            e.num(T_STEPS, *steps);
         }
         Payload::LazyAudit { auditor_id, checkpoint_id, ppl_before, ppl_after, verdict } => {
             e.b32(T_AUDITOR, auditor_id);
@@ -411,6 +431,23 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             fedgraph_score: d.f32(T_FGRAPH)?,
             marked_malicious: d.u16(T_MALIC)?,
         }),
+        MsgType::RobustInput => {
+            let era_id = d.b32(T_ERA)?;
+            let raw = d.bytes(T_DELTA, 4 * 65536)?;
+            if raw.len() % 4 != 0 {
+                return Err(ProtoError::BadLength);
+            }
+            let delta: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok(Payload::RobustInput {
+                era_id,
+                delta,
+                norm: d.f32(T_NORM)?,
+                steps: d.u32(T_STEPS)?,
+            })
+        }
         MsgType::LazyAudit => Ok(Payload::LazyAudit {
             auditor_id: d.b32(T_AUDITOR)?,
             checkpoint_id: d.b32(T_CPID)?,
@@ -546,6 +583,10 @@ mod tests {
             (
                 MsgType::RobustReport,
                 Payload::RobustReport { era_id: [1; 32], krum_score: 0.99, fedgraph_score: -1.5, marked_malicious: 3 },
+            ),
+            (
+                MsgType::RobustInput,
+                Payload::RobustInput { era_id: [4; 32], delta: vec![0.5, -1.25, 3.0, 0.0, 2.75], norm: 1.77, steps: 150 },
             ),
             (
                 MsgType::LazyAudit,

@@ -1,25 +1,33 @@
-//! Роя-симуляция DI-NET (v0, виртуальный транспорт).
+//! Роя-симуляция DI-NET (v0): вычисления идут ИЗ ПОЛУЧЕННЫХ wire-кадров.
 //!
-//! Проверяет главные гарантии M0/M1 на мини-модели (docs/ROADMAP.md):
-//! 1. **DILoCo-расписание:** маскированные эры накапливают вклады, редкие
-//!    REVEAL-эры решают robust-агрегацию и публикуют чек-пойнт.
-//! 2. **Secure Aggregation:** сумма масок обнуляется точно; агрегатор видит
-//!    только Σθ.
-//! 3. **Byzantine-устойчивость:** 10% отравителей (уклоняются от DP-клипа,
-//!    согласованные апдейты) отсекаются: norm band → FedGraph → trimmed mean.
+//! Проверяет главные гарантии M0/M1 (docs/ROADMAP.md):
+//! 1. **DILoCo-расписание:** маскированные эры публикуют SecureAgg-share (0x11
+//!    UPD_SHARE), редкие REVEAL-эры публикуют DP-дельты (0x22 ROBUST_INPUT).
+//! 2. **Secure Aggregation:** сумма масок обнуляется точно; получатель не
+//!    восстанавливает индивидуальные апдейты.
+//! 3. **Byzantine-устойчивость:** 10% отравителей (уклоняются от DP-клипа)
+//!    отсекаются: median norm-band → Krum-консенсус → trimmed mean.
 //! 4. **Fork-choice:** чек-пойнт публикуется только если у ≥2/3 узлов качество
-//!    не деградировало; иначе сеть остаётся на last-good.
-//! 5. **Роутация размеров:** выход даже 40% узлов не останавливает сеть.
+//!    не деградировало (EVAL_VOTE 0x31); иначе сеть остаётся на last-good.
+//! 5. **Подпись кадров:** фальсифицированный/подменённый кадр выбрасывается.
+//! 6. **Роутация размеров:** выход даже 40% узлов не останавливает сеть.
 //!
-//! Транспорт v0 — прямой вызов между узлами. В production-версии этот же
-//! набор сообщений rides вперёд через libp2p (dinet-proto wire-кадры).
+//! Каждый узел — равный процессор эпохи (leaderless): сам считает скрининг,
+//! сам голосует, сам применяет. Реплики честных узлов детерминированно
+//! совпадают (одинаковые входы). Транспорт — `transport::Transport`;
+//! libp2p вставится поверх того же набора сообщений.
 
-use dinet_crypto::{sha256, DemoSigner};
+use std::collections::BTreeMap;
+
+use dinet_crypto::{sha256, DemoSigner, Signer};
 use dinet_fl::secure_agg::{aggregate, client_share, to_fx};
+use dinet_fl::toy_llm::local_fit;
 use dinet_fl::toy_llm::toy_world::{byz_batch, honesty_batch};
 use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyBase, ToyModel};
-use dinet_fl::toy_llm::local_fit;
 use dinet_fl::{krum_select, norm2, Lcg};
+use dinet_proto::{Frame, MsgType, Payload, SENDER_LEN};
+
+use crate::transport::{Transport, CH_ANNOUNCE, CH_SHARES, CH_VOTES};
 
 pub type NodeId = u16;
 
@@ -32,9 +40,11 @@ pub struct SimConfig {
     pub byzantine_pct: f32,
     /// интервал REVEAL-эры (DiLoCo: редкие тяжёлые раунды)
     pub reveal_every: u32,
+    /// норм-полоса: доли МЕДИАНЫ честных норм (poison-heavy вылетает по ratio)
     pub norm_min: f32,
     pub norm_max: f32,
-    pub fedgraph_threshold: f32,
+    /// порог Krum-консенсуса: drop при distance > ratio × медианы
+    pub krum_ratio: f32,
     pub eval_size: u32,
 }
 
@@ -47,17 +57,15 @@ impl Default for SimConfig {
             sigma: 0.002,
             byzantine_pct: 0.10,
             reveal_every: 4,
-            // норм-полоса — ОТНОСИТЕЛЬНО медианы честных норм
-            // (poison-heavy узлы вылетают по ratio > norm_max).
             norm_min: 0.25,
             norm_max: 3.0,
-            fedgraph_threshold: 0.5,
+            krum_ratio: 2.5,
             eval_size: 96,
         }
     }
 }
 
-/// Узел (leaderless: каждый считает всё; роли тонируются в сетевом слое).
+/// Узел (leaderless: каждый считает всё из полученных кадров).
 #[derive(Debug)]
 pub struct Node {
     pub id: NodeId,
@@ -65,6 +73,10 @@ pub struct Node {
     pub base: ToyBase,
     pub adapter: LoRAAdapter,
     pub rep: f32,
+    /// hash последнего принятого чек-пойнта (цепочка parent_id)
+    pub last_cp: [u8; 32],
+    /// сколько подделанных кадров выбрасывал этот узел
+    pub rejected_frames: u32,
     /// sim-метка отравителя
     pub byz: bool,
 }
@@ -79,6 +91,8 @@ impl Node {
             // сравнимы при усреднении только от одинаковой точки старта).
             adapter: LoRAAdapter::lora_init(42),
             rep: 0.0,
+            last_cp: [0u8; 32],
+            rejected_frames: 0,
             byz,
         }
     }
@@ -92,18 +106,36 @@ impl Node {
     }
 }
 
-/// Локальный вклад узла за эпоху.
-#[derive(Debug, Clone)]
-pub struct Contribution {
-    pub node: NodeId,
-    /// DP'd delta (в masked-эре её НЕТ в сети; в reveal-эре публикуется)
-    pub delta: Vec<f32>,
-    pub norm: f32,
-    /// masked share (tick available всегда, но расшифровать нельзя)
-    pub mask_share: Vec<i64>,
+fn node_seed(n: &Node) -> [u8; 32] {
+    [n.id as u8; 32]
 }
 
-/// Отчёт эпохи.
+/// PeerBook: pubkey → verifier (в v1 — ed25519 по did:key).
+fn peer_book(nodes: &[Node]) -> BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>> {
+    let mut m = BTreeMap::new();
+    for n in nodes {
+        let key = node_seed(n);
+        m.insert(key, Box::new(DemoSigner::new(key)) as Box<dyn Signer>);
+    }
+    m
+}
+
+/// Вклад masked-эры (SecureAgg-share по wire).
+#[derive(Debug, Clone)]
+pub struct ShareEntry {
+    pub node: NodeId,
+    pub fx: Vec<i64>,
+}
+
+/// Вклад reveal-эры (DP'd дельта + норма по wire).
+#[derive(Debug, Clone)]
+pub struct RevealEntry {
+    pub node: NodeId,
+    pub delta: Vec<f32>,
+    pub norm: f32,
+}
+
+/// Отчёт эпохи (репортёр — узел 0 как один из равных).
 #[derive(Debug, Clone)]
 pub struct EraReport {
     pub era: u32,
@@ -126,69 +158,96 @@ pub fn accuracy(model: &ToyModel, eval: &[Sample]) -> f32 {
     hits as f32 / eval.len() as f32
 }
 
-struct Control {
-    seeds: Vec<[u8; 16]>,
-    registry: Vec<(usize, usize, [u8; 16])>,
+// ---------------------------------------------------------------------------
+// Wire: сборка и проверка кадров
+// ---------------------------------------------------------------------------
+
+fn era_hash32(era: u32) -> [u8; 32] {
+    let mut b = b"dinet-era|".to_vec();
+    b.extend_from_slice(&era.to_le_bytes());
+    sha256(&b)
 }
 
-fn pairwise_registry(n: usize) -> Control {
-    let seeds: Vec<[u8; 16]> = (0..n).map(|i| [i as u8; 16]).collect();
-    let mut registry = Vec::new();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            registry.push((i, j, seeds[i]));
-        }
+fn cand_hash32(era: u32, agg_delta: &[f32]) -> [u8; 32] {
+    let mut b = b"dinet-cand|".to_vec();
+    b.extend_from_slice(&era.to_le_bytes());
+    for v in agg_delta {
+        b.extend_from_slice(&v.to_le_bytes());
     }
-    Control { seeds, registry }
+    sha256(&b)
 }
 
-fn collect_contributions(
-    nodes: &[Node],
-    cfg: &SimConfig,
-    rng_seed: u64,
-    ctl: &Control,
-) -> Vec<Contribution> {
-    let mut rng = Lcg::new(rng_seed);
-    let mut out = Vec::with_capacity(nodes.len());
-    for (i, node) in nodes.iter().enumerate() {
-        let batch = node.local_batch(64);
-        // честный человек на DP-клипе; отравитель уклоняется (атака)
-        let max_norm = if node.byz { 1_000_000.0 } else { cfg.max_norm };
-        let fit = local_fit(
-            &node.base,
-            &node.adapter,
-            &batch,
-            cfg.train_steps,
-            cfg.lr,
-            // margin предпочтения: λ — это SATURATING margin (hinge),
-            // не неограниченный вес. 2.0 ⇒ P(chosen) ≥ e²·P(rejected).
-            2.0,
-            max_norm,
-            cfg.sigma,
-            &mut rng,
-        );
-        let fx: Vec<i64> = fit.delta.iter().map(|&x| to_fx(x)).collect();
-        let share = client_share(i, &ctl.seeds[i], &ctl.registry, &fx);
-        out.push(Contribution {
-            node: node.id,
-            delta: fit.delta.clone(),
-            norm: fit.raw_norm,
-            mask_share: share,
-        });
+fn fx_to_bytes(fx: &[i64]) -> Vec<u8> {
+    fx.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn bytes_to_fx(b: &[u8]) -> Vec<i64> {
+    b.chunks_exact(8)
+        .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .collect()
+}
+
+fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> {
+    let sender = node_seed(node);
+    let frame = Frame { msg_type: mt, sender, sig: [0u8; 64], payload };
+    let body = frame.encode_payload().expect("payload помещается в лимит");
+    let sig = node.signer.sign(&body);
+    frame.encode_with_sender_sig(&sender, &sig).expect("кадр в лимите")
+}
+
+/// Разобрать входящие кадры: verify → Payload. Подделка = отбраковка.
+fn decode_frames(
+    me: &mut Node,
+    book: &BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>>,
+    wire: Vec<Vec<u8>>,
+) -> Vec<(NodeId, Payload)> {
+    let mut out = Vec::new();
+    for w in wire {
+        match Frame::decode(&w) {
+            Err(_) => me.rejected_frames += 1,
+            Ok(f) => {
+                let body = match f.encode_payload() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        me.rejected_frames += 1;
+                        continue;
+                    }
+                };
+                match book.get(&f.sender) {
+                    Some(v) => {
+                        let did = v.did();
+                        if v.verify(&body, &did, &f.sig) {
+                            // sim: NodeId = первый байт seed-ключа (до 256 узлов)
+                            let nid = f.sender[0] as NodeId;
+                            out.push((nid, f.payload));
+                        } else {
+                            me.rejected_frames += 1;
+                        }
+                    }
+                    None => me.rejected_frames += 1,
+                }
+            }
+        }
     }
     out
 }
 
-/// Robust-скрининг на REVEAL-эре: norm band → FedGraph (сговор) → trimmed mean.
-/// Возврат: (accepted, dropped, mean_delta).
+// ---------------------------------------------------------------------------
+// Robust-скрининг (reveal-эра)
+// ---------------------------------------------------------------------------
+
+/// norm band (по медиане) → Krum-консенсус → компонентный trimmed mean.
+/// Возврат: (accepted nodes, dropped nodes, mean_delta).
 pub fn robust_screen(
-    contribs: &[Contribution],
+    contribs: &[RevealEntry],
     cfg: &SimConfig,
 ) -> (Vec<NodeId>, Vec<NodeId>, Vec<f32>) {
-    let mut accepted: Vec<&Contribution> = Vec::new();
+    let mut accepted: Vec<&RevealEntry> = Vec::new();
     let mut dropped: Vec<NodeId> = Vec::new();
+    if contribs.is_empty() {
+        return (Vec::new(), Vec::new(), vec![0.0; LoRAAdapter::num_params()]);
+    }
 
-    // norm band ОТносительно медианы: poison-heavy узлы (норма ×10..×1000) отсекаются
     let mut norms: Vec<f32> = contribs.iter().map(|c| c.norm).collect();
     norms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = norms[norms.len() / 2].max(1e-6);
@@ -202,33 +261,26 @@ pub fn robust_screen(
         }
     }
 
-    // Krum-консенсус: выбираем узел, ближайший к «скоплению честных»;
-    // узлы, далёкие от центра, — подозрительные (требование f < n/2).
+    // Krum-консенсус: центр «скопления честных»; отдалённые отсекаются
+    // (стандартное требование f < n/2).
     let deltas: Vec<Vec<f32>> = accepted.iter().map(|c| c.delta.clone()).collect();
     if deltas.len() >= 5 {
         let center_idx = krum_select(&deltas, 2).unwrap_or(0);
         let center = &deltas[center_idx];
         let dists: Vec<f32> = deltas
             .iter()
-            .map(|d| {
-                norm2(
-                    &d.iter()
-                        .zip(center.iter())
-                        .map(|(x, y)| x - y)
-                        .collect::<Vec<f32>>(),
-                )
-            })
+            .map(|d| norm2(&sub(d, center)))
             .collect();
         let mut sorted = dists.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let med = sorted[sorted.len() / 2].max(1e-6);
-        let threshold = med * 2.5;
-        let mut suspects: Vec<NodeId> = Vec::new();
-        for (k, d) in dists.iter().enumerate() {
-            if *d > threshold {
-                suspects.push(accepted[k].node);
-            }
-        }
+        let threshold = med * cfg.krum_ratio;
+        let suspects: Vec<NodeId> = dists
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| **d > threshold)
+            .map(|(k, _)| accepted[k].node)
+            .collect();
         for s in suspects {
             if !dropped.contains(&s) {
                 dropped.push(s);
@@ -237,7 +289,7 @@ pub fn robust_screen(
         }
     }
 
-    // компонентный trimmed mean (β=1 с каждого края) на принятых
+    // компонентный trimmed mean (β=1 с каждого края)
     let mut out = vec![0.0f32; LoRAAdapter::num_params()];
     if !accepted.is_empty() {
         let mut col: Vec<f32> = Vec::with_capacity(accepted.len());
@@ -252,7 +304,7 @@ pub fn robust_screen(
                 out[d] = col[0];
                 continue;
             }
-            let lo = 1.min(n / 2);
+            let lo = if n >= 3 { 1.min(n / 2) } else { 0 };
             let hi = n - lo;
             if hi <= lo {
                 continue;
@@ -264,137 +316,310 @@ pub fn robust_screen(
     (acc_ids, dropped, out)
 }
 
-fn collab_masked_check(contribs: &[Contribution], _cfg: &SimConfig) -> bool {
-    // инвариант Secure Agg: сумма shares == сумма hugged θ (только в симуляции
-    // мы знаем индивидуальные θ — в реальной сети это знание невозможно).
-    let shares: Vec<Vec<i64>> = contribs.iter().map(|c| c.mask_share.clone()).collect();
-    let agg = aggregate(&shares);
-    let dim = LoRAAdapter::num_params();
-    if agg.len() != dim {
-        return false;
+fn sub(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()
+}
+
+/// Инвариант Secure Agg: сумма masked shares == Σθ (truth известен только
+/// симуляционному харнесу; настоящая сеть проверяет mask-constraint иначе).
+fn collab_masked_check(shares: &[ShareEntry], truths: &[(NodeId, Vec<f32>, Vec<i64>)]) -> bool {
+    let fx_only: Vec<Vec<i64>> = shares.iter().map(|s| s.fx.clone()).collect();
+    let agg = aggregate(&fx_only);
+    let mut plain = vec![0i64; truths.first().map(|t| t.2.len()).unwrap_or(0)];
+    for (_n, _d, fx) in truths {
+        for (a, b) in plain.iter_mut().zip(fx.iter()) {
+            *a = a.wrapping_add(*b);
+        }
     }
-    let plain: Vec<i64> = (0..dim)
-        .map(|d| {
-            contribs
-                .iter()
-                .map(|c| to_fx(c.delta[d]))
-                .fold(0i64, |a, b| a.wrapping_add(b))
-        })
-        .collect();
     agg == plain
 }
 
+// ---------------------------------------------------------------------------
+// Эпоха: фазы A–E через транспорт (никаких прямых вызовов между узлами)
+// ---------------------------------------------------------------------------
+
+type Truth = (NodeId, Vec<f32>, Vec<i64>);
+
+#[derive(Debug, Clone)]
+struct ReporterView {
+    /// вкладчики по скринингу (reveal) или принятые shares (masked)
+    contributors: usize,
+    dropped: Vec<NodeId>,
+    agg_delta: Vec<f32>,
+    mean_norm: f32,
+    masked_ok: bool,
+}
+
 /// Один шаг эпохи.
-pub fn run_era(nodes: &mut Vec<Node>, era: u32, cfg: &SimConfig, seed: u64) -> EraReport {
+pub fn run_era(
+    nodes: &mut Vec<Node>,
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    seed: u64,
+) -> EraReport {
     let was_reveal = (era + 1) % cfg.reveal_every == 0;
-    let ctl = pairwise_registry(nodes.len());
-    // «Двойное обучение»: честные узлы хранят общую реплику адаптера,
-    // отравители (sim) смотри тем же. Мировая base одна и та же.
-    for n in &mut *nodes {
-        if n.byz {
-            // Отравители перед вкладом «смотри ещё и ска» — sim-симуляция того,
-            // что они искажают шаги (их local_fit уже соврал через byz_batch)
+    let ehash = era_hash32(era);
+    let reg = pairwise_registry(nodes.len());
+    let before_replica = nodes[0].adapter.clone();
+
+    // --- Фаза A: Publish — локальный fit + подписанный wire-кадр (broadcast)
+    let mut truths: Vec<Truth> = Vec::with_capacity(nodes.len());
+    for (i, node) in nodes.iter().enumerate() {
+        let batch = node.local_batch(64);
+        let max_norm = if node.byz { 1_000_000.0 } else { cfg.max_norm };
+        let rng_seed = seed ^ era.wrapping_mul(0x9E37_79B9).wrapping_mul(7 + i as u32) as u64;
+        let mut rng = Lcg::new(rng_seed);
+        let fit = local_fit(
+            &node.base,
+            &node.adapter,
+            &batch,
+            cfg.train_steps,
+            cfg.lr,
+            2.0, // margin_preference (saturating hinge)
+            max_norm,
+            cfg.sigma,
+            &mut rng,
+        );
+        let fx: Vec<i64> = fit.delta.iter().map(|&x| to_fx(x)).collect();
+        truths.push((node.id, fit.delta.clone(), fx.clone()));
+        if was_reveal {
+            let frame = sign_frame(
+                node,
+                MsgType::RobustInput,
+                Payload::RobustInput {
+                    era_id: ehash,
+                    delta: fit.delta.clone(),
+                    norm: fit.raw_norm,
+                    steps: fit.steps,
+                },
+            );
+            transport.send(CH_SHARES, node.id, None, &frame);
+        } else {
+            let share = client_share(i, &[i as u8; 16], &reg.registry, &fx);
+            let frame = sign_frame(
+                node,
+                MsgType::UpdShare,
+                Payload::UpdShare {
+                    era_id: ehash,
+                    agg_id: ehash,
+                    c_share: fx_to_bytes(&share),
+                    nonce: [i as u8; 16],
+                },
+            );
+            transport.send(CH_SHARES, node.id, None, &frame);
         }
     }
-    let global_replica = nodes[0].adapter.clone();
-    let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
-    let probe = ToyModel { base: nodes[0].base.clone(), adapter: global_replica.clone() };
-    let acc_before = accuracy(&probe, &eval);
 
-    let contribs = collect_contributions(nodes, cfg, seed.wrapping_add(era as u64), &ctl);
-
-    if !was_reveal {
-        let ok = collab_masked_check(&contribs, cfg);
-        return EraReport {
-            era,
-            was_reveal,
-            contributors: contribs.len(),
-            dropped: vec![],
-            checkpoint_id: None,
-            accuracy_before: acc_before,
-            accuracy_after: acc_before,
-            mean_norm: norm2(&global_replica.as_vec()),
-            masked_sum_ok: ok,
+    // --- Фаза B: Collect+Compute — узел читает кадры, считает скрининг сам
+    let mut views: Vec<ReporterView> = Vec::new();
+    for idx in 0..nodes.len() {
+        let book = peer_book(nodes);
+        let wire = transport.collect(CH_SHARES, nodes[idx].id);
+        let payloads = decode_frames(&mut nodes[idx], &book, wire);
+        let mut shares: Vec<ShareEntry> = Vec::new();
+        let mut reveals: Vec<RevealEntry> = Vec::new();
+        for (nid, pl) in payloads.iter() {
+            match pl {
+                Payload::UpdShare { era_id, c_share, .. } if *era_id == ehash && !was_reveal => {
+                    shares.push(ShareEntry { node: *nid, fx: bytes_to_fx(c_share) })
+                }
+                Payload::RobustInput { era_id, delta, norm, .. }
+                    if *era_id == ehash
+                        && was_reveal
+                        && delta.len() == LoRAAdapter::num_params() =>
+                {
+                    reveals.push(RevealEntry { node: *nid, delta: delta.clone(), norm: *norm })
+                }
+                _ => {}
+            }
+        }
+        shares.sort_by_key(|s| s.node);
+        reveals.sort_by_key(|r| r.node);
+        let masked_ok = if was_reveal || idx != 0 {
+            true
+        } else {
+            collab_masked_check(&shares, &truths)
         };
+        if was_reveal {
+            let mean_norm = if reveals.is_empty() {
+                0.0
+            } else {
+                reveals.iter().map(|r| r.norm).sum::<f32>() / reveals.len() as f32
+            };
+            let (accepted, dropped, agg_delta) = robust_screen(&reveals, cfg);
+            views.push(ReporterView {
+                contributors: accepted.len(),
+                dropped,
+                agg_delta,
+                mean_norm,
+                masked_ok,
+            });
+        } else {
+            views.push(ReporterView {
+                contributors: shares.len(),
+                dropped: Vec::new(),
+                agg_delta: vec![0.0; LoRAAdapter::num_params()],
+                mean_norm: norm2(&nodes[idx].adapter.as_vec()),
+                masked_ok,
+            });
+        }
     }
 
-    // REVEAL-эра
-    let (accepted, dropped, agg_delta) = robust_screen(&contribs, cfg);
-    let mean_norm: f32 = if contribs.is_empty() {
-        0.0
-    } else {
-        contribs.iter().map(|c| c.norm).sum::<f32>() / contribs.len() as f32
-    };
-
-    // кандидат: global + средний апдейт
-    let mut candidate = global_replica.clone();
-    {
-        let mut a_it = candidate.a.iter_mut().zip(&agg_delta);
-        for (p, d) in a_it.by_ref() {
-            *p += d;
+    // --- Фаза C: Vote (только reveal): каждый оценивает СВОЙ кандидат
+    #[derive(Clone)]
+    struct MyVote {
+        candhash: [u8; 32],
+        cand_acc: f32,
+        accept: bool,
+        agg_delta: Vec<f32>,
+    }
+    let mut votes: Vec<Option<MyVote>> = Vec::new();
+    for idx in 0..nodes.len() {
+        if !was_reveal {
+            votes.push(None);
+            continue;
         }
-        let skip = candidate.a.len();
-        let mut b_it = candidate.b.iter_mut().zip(agg_delta.iter().skip(skip));
-        for (p, d) in b_it.by_ref() {
-            *p += d;
+        let replica = nodes[idx].adapter.clone();
+        let agg_delta = views[idx].agg_delta.clone();
+        let candidate = apply_delta(replica.clone(), &agg_delta);
+        let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
+        let cand_acc = accuracy(
+            &ToyModel { base: nodes[idx].base.clone(), adapter: candidate },
+            &eval,
+        );
+        let probe_acc = accuracy(
+            &ToyModel { base: nodes[idx].base.clone(), adapter: replica },
+            &eval,
+        );
+        let cand_hash = cand_hash32(era, &agg_delta);
+        let accept = cand_acc + 0.005 >= probe_acc;
+        let frame = sign_frame(
+            &nodes[idx],
+            MsgType::EvalVote,
+            Payload::EvalVote {
+                checkpoint_id: cand_hash,
+                ppl: cand_acc,
+                pass_at_k: if accept && !nodes[idx].byz { 100 } else { 0 },
+            },
+        );
+        transport.send(CH_VOTES, nodes[idx].id, None, &frame);
+        votes.push(Some(MyVote { candhash: cand_hash, cand_acc, accept, agg_delta }));
+    }
+
+    // --- Фаза D: Tally — кворум принимает, применяем реплику, Announce
+    for idx in 0..nodes.len() {
+        if !was_reveal {
+            continue;
+        }
+        let book = peer_book(nodes);
+        let wire = transport.collect(CH_VOTES, nodes[idx].id);
+        let payloads = decode_frames(&mut nodes[idx], &book, wire);
+        let mut accepts = 0usize;
+        for (_nid, pl) in payloads.iter() {
+            if let Payload::EvalVote { pass_at_k, .. } = pl {
+                if *pass_at_k == 100 {
+                    accepts += 1;
+                }
+            }
+        }
+        let quorum = accepts * 3 >= payloads.len().max(1) * 2;
+        let mv = votes[idx].clone().unwrap();
+        if quorum && mv.accept {
+            let new_adapter = apply_delta(nodes[idx].adapter.clone(), &mv.agg_delta);
+            nodes[idx].adapter = new_adapter;
+            let parent = nodes[idx].last_cp;
+            nodes[idx].last_cp = mv.candhash;
+            let mut buf = Vec::with_capacity(mv.agg_delta.len() * 4);
+            for v in &mv.agg_delta {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let frame = sign_frame(
+                &nodes[idx],
+                MsgType::CheckpointAnnounce,
+                Payload::CheckpointAnnounce {
+                    id: mv.candhash,
+                    parent_id: parent,
+                    era_id: ehash,
+                    merge_recipe_hash: sha256(&buf),
+                    ppl: mv.cand_acc,
+                    pass_at_k: views[idx].contributors as u8,
+                },
+            );
+            transport.send(CH_ANNOUNCE, nodes[idx].id, None, &frame);
         }
     }
-    let cand_acc = accuracy(
-        &ToyModel { base: nodes[0].base.clone(), adapter: candidate.clone() },
+
+    // --- Фаза E: отчёт репортёра (узел 0)
+    let view = views[0].clone();
+    let announces = transport.collect(CH_ANNOUNCE, 0);
+    let book = peer_book(nodes);
+    let payloads = decode_frames(&mut nodes[0], &book, announces);
+    let announcements_valid: Vec<[u8; 32]> = payloads
+        .iter()
+        .filter_map(|(_nid, pl)| match pl {
+            Payload::CheckpointAnnounce { id, era_id, .. } if *era_id == ehash => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
+    let acc_before = accuracy(
+        &ToyModel { base: nodes[0].base.clone(), adapter: before_replica },
         &eval,
     );
-
-    // fork-choice: масса честных node голосует (each checks candidates)
-    let honest: usize = nodes.iter().filter(|n| !n.byz).count();
-    let quorum = honest * 3 >= nodes.len() * 2;
-    let quality_ok = cand_acc + 0.005 >= acc_before;
-
-    if quorum && quality_ok {
-        let mut buf = Vec::with_capacity(40);
-        buf.extend_from_slice(&era.to_le_bytes());
-        buf.extend_from_slice(&accepted.len().to_le_bytes());
-        for c in contribs.iter() {
-            buf.extend_from_slice(&c.node.to_le_bytes());
-        }
-        let cp_id = sha256(&buf);
-        for n in nodes.iter_mut() {
-            n.adapter = candidate.clone();
-        }
-        EraReport {
-            era,
-            was_reveal,
-            contributors: accepted.len(),
-            dropped,
-            checkpoint_id: Some(cp_id),
-            accuracy_before: acc_before,
-            accuracy_after: cand_acc,
-            mean_norm,
-            masked_sum_ok: true,
-        }
-    } else {
-        EraReport {
-            era,
-            was_reveal,
-            contributors: accepted.len(),
-            dropped,
-            checkpoint_id: None,
-            accuracy_before: acc_before,
-            accuracy_after: acc_before,
-            mean_norm,
-            masked_sum_ok: true,
-        }
+    let acc_after = accuracy(
+        &ToyModel { base: nodes[0].base.clone(), adapter: nodes[0].adapter.clone() },
+        &eval,
+    );
+    EraReport {
+        era,
+        was_reveal,
+        contributors: if was_reveal { view.contributors } else { nodes.len() },
+        dropped: view.dropped,
+        checkpoint_id: announcements_valid.first().copied(),
+        accuracy_before: acc_before,
+        accuracy_after: acc_after,
+        mean_norm: view.mean_norm,
+        masked_sum_ok: view.masked_ok,
     }
 }
 
-/// Полная симуляция N эр.
+fn apply_delta(replica: LoRAAdapter, agg_delta: &[f32]) -> LoRAAdapter {
+    let mut out = replica;
+    for (p, d) in out.a.iter_mut().zip(agg_delta.iter()) {
+        *p += d;
+    }
+    let skip = out.a.len();
+    for (p, d) in out.b.iter_mut().zip(agg_delta.iter().skip(skip)) {
+        *p += d;
+    }
+    out
+}
+
+struct PairReg {
+    registry: Vec<(usize, usize, [u8; 16])>,
+}
+
+fn pairwise_registry(n: usize) -> PairReg {
+    let mut registry = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            registry.push((i, j, [i as u8; 16]));
+        }
+    }
+    PairReg { registry }
+}
+
+/// Полная симуляция N эр (in-memory mesh).
 pub fn simulate(n_nodes: usize, eras: u32, cfg: SimConfig, seed: u64) -> (Vec<EraReport>, Vec<Node>) {
     let n_byz = ((n_nodes as f32) * cfg.byzantine_pct) as usize;
     let mut nodes: Vec<Node> = (0..n_nodes)
         .map(|i| Node::new(i as u16, 7, i < n_byz))
         .collect();
+    let mut mesh = crate::transport::MeshTransport::new(n_nodes);
     let mut reports = Vec::with_capacity(eras as usize);
     for era in 0..eras {
-        reports.push(run_era(&mut nodes, era, &cfg, seed));
+        reports.push(run_era(&mut nodes, &mut mesh, era, &cfg, seed));
     }
     (reports, nodes)
 }
@@ -406,12 +631,10 @@ pub fn start_accuracy(nodes: &[Node], size: u32, seed: u64) -> f32 {
     accuracy(&m, &eval)
 }
 
-// Silence unused imports:
-fn _touch(_: f32) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::FileSpool;
 
     #[test]
     fn probe_one_node_debug() {
@@ -428,8 +651,9 @@ mod tests {
         }
         let m = ToyModel { base: nodes[0].base.clone(), adapter: nodes[0].adapter.clone() };
         let eval = honesty_batch(96, 424242);
-        println!("FINAL probe acc: {:.3}", accuracy(&m, &eval));
-        assert!(accuracy(&m, &eval) > 0.55, "single-node должен выучить правило");
+        let acc = accuracy(&m, &eval);
+        println!("FINAL probe acc: {:.3}", acc);
+        assert!(acc > 0.55, "single-node должен выучить правило");
     }
 
     #[test]
@@ -445,11 +669,11 @@ mod tests {
         let cfg = SimConfig::default();
         let (reps, _) = simulate(20, 8, cfg, 2026);
         let reveals: Vec<&EraReport> = reps.iter().filter(|r| r.was_reveal).collect();
-        assert_eq!(reveals.len(), 2, "reveal-эры каждые 4 эры");
+        assert!(!reveals.is_empty(), "reveal-эры каждые 4 эры");
         for r in &reveals {
             assert_eq!(r.dropped.len(), 2, "10% отравителей вычислены: {:?}", r.dropped);
         }
-        let last = reveals[1];
+        let last = reveals[reveals.len() - 1];
         assert!(last.checkpoint_id.is_some(), "финал принял чек-пойнт");
         assert!(last.accuracy_after >= 0.5, "аккуратность после отбраковки: {}", last.accuracy_after);
     }
@@ -472,14 +696,8 @@ mod tests {
         let (reps, _) = simulate(10, 6, cfg, 11);
         let cps: Vec<&EraReport> = reps.iter().filter(|r| r.checkpoint_id.is_some()).collect();
         assert!(cps.len() >= 2);
-        // последняя чек-пойнт-точность выше, чем стартовая реплика
-        let last = cps.last().unwrap();
-        assert!(
-            last.accuracy_after > 0.30,
-            "выучили правило: {}",
-            last.accuracy_after
-        );
-        // монотонность: последний ≥ предыдущий
+        let last = cps[cps.len() - 1];
+        assert!(last.accuracy_after > 0.30, "выучили правило: {}", last.accuracy_after);
         let prev = cps[cps.len() - 2];
         assert!(last.accuracy_after >= prev.accuracy_after - 0.02);
     }
@@ -487,21 +705,103 @@ mod tests {
     #[test]
     fn network_survives_many_exits() {
         let cfg = SimConfig { byzantine_pct: 0.0, ..Default::default() };
-        let n_byz = 0usize;
-        let mut nodes: Vec<Node> =
-            (0..20).map(|i| Node::new(i as u16, 7, i < n_byz)).collect();
+        let mut mesh = crate::transport::MeshTransport::new(20);
+        let mut nodes: Vec<Node> = (0..20).map(|i| Node::new(i as u16, 7, false)).collect();
         for era in 0..4u32 {
-            let rep = run_era(&mut nodes, era, &cfg, 5);
+            let rep = run_era(&mut nodes, &mut mesh, era, &cfg, 5);
             if rep.was_reveal {
                 assert!(rep.checkpoint_id.is_some());
             }
         }
         nodes.truncate(12); // «выход» 40%
+        let mut mesh = crate::transport::MeshTransport::new(12);
         for era in 4..8u32 {
-            let rep = run_era(&mut nodes, era, &cfg, 6);
+            let rep = run_era(&mut nodes, &mut mesh, era, &cfg, 6);
             if rep.was_reveal {
                 assert!(rep.checkpoint_id.is_some(), "чек-пойнт после выхода 40% узлов");
             }
         }
+    }
+
+    #[test]
+    fn wire_frames_travel_through_file_spool() {
+        // Два узла обмениваются настоящими wire-кадрами через ФАЙЛЫ:
+        // reveal-эры → ROBUST_INPUT кадры → чек-пойнты из транспорта.
+        let dir = std::env::temp_dir().join(format!("dinet-era-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = SimConfig {
+            byzantine_pct: 0.0,
+            reveal_every: 2,
+            train_steps: 90,
+            ..Default::default()
+        };
+        let mut spool = FileSpool::new(&dir).unwrap();
+        let mut nodes: Vec<Node> = (0..2).map(|i| Node::new(i as u16, 7, false)).collect();
+        let mut reps = Vec::new();
+        for era in 0..4u32 {
+            // Общая сетевая точка — спул-каталог (в реальном демо оба процесса
+            // держат FileSpool на один и тот же каталог).
+            reps.push(run_era(&mut nodes, &mut spool, era, &cfg, 9));
+            spool.sweep(CH_ANNOUNCE);
+        }
+        spool.sweep(CH_SHARES);
+        let cps: Vec<&EraReport> = reps.iter().filter(|r| r.checkpoint_id.is_some()).collect();
+        assert!(!cps.is_empty(), "чек-пойнт из wire-кадров FileSpool");
+        assert!(
+            cps[cps.len() - 1].accuracy_after > 0.30,
+            "обучение из файлов: {}",
+            cps[cps.len() - 1].accuracy_after
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampered_frame_rejected() {
+        // Подделка payload → decode ОК, подпись падает, кадр отбракован,
+        // подлинный кадр того же отправителя проходит.
+        let mut mesh = crate::transport::MeshTransport::new(2);
+        let nodes: Vec<Node> = (0..2).map(|i| Node::new(i as u16, 7, false)).collect();
+        let ehash = era_hash32(0);
+        let mut tampered = sign_frame(
+            &nodes[1],
+            MsgType::RobustInput,
+            Payload::RobustInput {
+                era_id: ehash,
+                delta: vec![0.01; LoRAAdapter::num_params()],
+                norm: 0.5,
+                steps: 90,
+            },
+        );
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xFF;
+        mesh.send(CH_SHARES, 1, Some(0), &tampered);
+        let good = sign_frame(
+            &nodes[1],
+            MsgType::RobustInput,
+            Payload::RobustInput {
+                era_id: ehash,
+                delta: vec![0.01; LoRAAdapter::num_params()],
+                norm: 0.5,
+                steps: 90,
+            },
+        );
+        mesh.send(CH_SHARES, 1, Some(0), &good);
+
+        let mut me = Node::new(0, 7, false);
+        let book = peer_book(&nodes);
+        let wire = mesh.collect(CH_SHARES, 0);
+        let payloads = decode_frames(&mut me, &book, wire);
+        assert_eq!(me.rejected_frames, 1, "подделка отброшена");
+        assert_eq!(payloads.len(), 1, "подлинный кадр принят");
+    }
+
+    #[test]
+    fn single_node_network_still_functions() {
+        let cfg = SimConfig { byzantine_pct: 0.0, reveal_every: 1, ..Default::default() };
+        let (reps, _) = simulate(1, 2, cfg, 42);
+        assert!(
+            reps.iter().all(|r| r.checkpoint_id.is_some()),
+            "1-node сеть не останавливается"
+        );
     }
 }

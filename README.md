@@ -32,6 +32,9 @@ crates/
   dinet-fl/           quant+error feedback, DP-клиппинг, trimmed mean / Krum, FedGraph-score
   dinet-node/         узел: DiLoCo-расписание эр, robust-скрининг, fork-choice, симуляция роя
   dinet-net/          пeer-to-peer слой (libp2p-интеграция — точка прикрепления)
+  dinet-node/         рой: эпохи DiLoCo, secure-agg, robust-скрининг, fork-choice,
+                      транспорт wire-кадров (in-memory mesh + файловый спул; libp2p —
+                      следующий backend через трейт `Transport`)
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```

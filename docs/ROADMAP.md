@@ -22,7 +22,9 @@
 ## M1 — Рой (6 недель)
 
 - [ ] libp2p: QUIC+WS, gossipsub, Kademlia DHT, mDNS, PEX, 5 источников bootstrap
-      (точка прикрепления: тот же набор сообщений, что в `dinet-node/src/swarm.rs`)
+      (точка прикрепления: трейт `transport::Transport` — тот же wire-набор 0x11/0x22/0x30/0x31)
+- [x] Transport v0 в симуляции: обмен РЕАЛЬНЫМИ подписанными wire-кадрами dinet-proto
+      (in-memory mesh + файловый спул между процессами; подделка payload → отбраковка по подписи)
 - [x] Secure Aggregation (pairwise masking) — без отправки индивидуальных апдейтов
       (`dinet-fl::secure_agg`: инвариант Σмасок==Σθ проверен тестами; v0-masks на SHA-256, v1 — X25519)
 - [x] Robust-agg: median norm-band + Krum-консенсус + trimmed mean

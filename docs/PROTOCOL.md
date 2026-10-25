@@ -32,6 +32,7 @@
 | 0x12 | `POW-TR` (proof-of-training) | min_train_swarm-seconds, подпись времени, hash-LM-snapshot (merkle) |
 | 0x20 | `AGG_COMMIT` | aggregator_id, era_id, agg_result_hash(32B), num_contrib(u16), кворум-подписи |
 | 0x21 | `ROBUST_REPORT` | Krum/Trimmed-нормы, FedGraph-score (f32), флаги выбраковки |
+| 0x22 | `ROBUST_INPUT` | era_id; delta (f32[N] LE, DP'd LoRA-дельта); norm (f32, L2 до клипа); steps (u32, claim PoW) |
 | 0x23 | `LAZY_AUDIT` | auditor_id, checkpoint_id, ppl_before/after(f32), entropy(f32), verdict |
 | 0x30 | `CHECKPOINT_ANNOUNCE` | id(32B), parent_id(32B), era_id, merge_recipe_hash(32B), eval-метрики (CBOR), watermark_blob, notary-кворум |
 | 0x31 | `EVAL_VOTE` | evaluator_id, checkpoint_id, ppl(f32), pass@k(u8), sig |
