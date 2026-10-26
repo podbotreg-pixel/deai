@@ -13,7 +13,10 @@
 - [x] **Speak→learn (механика):** буфер пар → LoRA + hinge-предпочтение (saturating DPO-lite),
       DP-клиппинг, local_fit → secure_agg — на toy-модели, интерфейс LocalTrainer устойчив
       к замене на llama.cpp
-- [ ] Локальная память: SQLite + sqlite-vec RAG
+- [x] Локальная память v0: append-only KV-лог на std (замена SQLite — ноль зависимостей,
+      WAL-семантика: обрыв хвоста обрезается, CRC-записи, tombstones, компактация)
+      + hash-embedding RAG (замена sqlite-vec; точка прикрепления: `rag::embed()` → llama.cpp)
+      (`dinet-memory`: `KvStore` + `Retriever`; REPL-демо `memdemo`)
 
 **DoD ( проверить руками ):** 16-GB laptop без GPU, чат ≥15 ток/с; обучение партии 20 пар
 ≤20 мин с приоритетом ниже окна браузера; RAM-лимит держится (≤2 ГБ); кнопка «стоп»

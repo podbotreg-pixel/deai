@@ -289,9 +289,34 @@ impl Signer for DemoSigner {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CRC-32 (IEEE 802.3, полинои 0xEDB88320) — целостность записей локальных
+// логов (dinet-memory). Побитово, без таблицы — записи маленькие.
+// ---------------------------------------------------------------------------
+
+#[must_use]
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc32_ieee_reference() {
+        // Check-value из спецификации IEEE (голый "123456789")
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
 
     #[test]
     fn sha256_empty() {

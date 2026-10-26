@@ -18,6 +18,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinet-memory"
+version = "0.1.0"
+dependencies = [
+ "dinet-crypto",
+]
+
+[[package]]
 name = "dinet-net"
 version = "0.1.0"
 dependencies = [

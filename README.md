@@ -35,6 +35,8 @@ crates/
   dinet-node/         рой: эпохи DiLoCo, secure-agg, robust-скрининг, fork-choice,
                       транспорт wire-кадров (in-memory mesh + файловый спул; libp2p —
                       следующий backend через трейт `Transport`)
+  dinet-memory/       локальная память: append-only KV-лог (std-only, замена SQLite)
+                      + hash-эмбеддинг RAG (замена sqlite-vec); libp2p/llama.cpp — v1
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -46,6 +48,8 @@ cargo build          # только std, никаких внешних зави�
 cargo test           # юнит-тесты всех крейтов
 python3 prototype/proto.py   # демо: подпись→CBOR→secure-aggregation
 cargo run -p dinet-node      # демо роя: 20 узлов, 10% отравителей, robust-агрегация, чек-пойнты
+cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
+                             # REPL памяти: /remember | /ask | /forget | /stats
 ```
 
 ## Ключевые документы
