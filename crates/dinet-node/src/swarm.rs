@@ -111,13 +111,10 @@ fn node_seed(n: &Node) -> [u8; 32] {
 }
 
 /// PeerBook: pubkey → verifier (в v1 — ed25519 по did:key).
+#[cfg(test)]
 fn peer_book(nodes: &[Node]) -> BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>> {
-    let mut m = BTreeMap::new();
-    for n in nodes {
-        let key = node_seed(n);
-        m.insert(key, Box::new(DemoSigner::new(key)) as Box<dyn Signer>);
-    }
-    m
+    let ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
+    peer_book_ids(&ids)
 }
 
 /// Вклад masked-эры (SecureAgg-share по wire).
@@ -338,37 +335,60 @@ fn collab_masked_check(shares: &[ShareEntry], truths: &[(NodeId, Vec<f32>, Vec<i
 // Эпоха: фазы A–E через транспорт (никаких прямых вызовов между узлами)
 // ---------------------------------------------------------------------------
 
-type Truth = (NodeId, Vec<f32>, Vec<i64>);
-
-#[derive(Debug, Clone)]
-struct ReporterView {
-    /// вкладчики по скринингу (reveal) или принятые shares (masked)
-    contributors: usize,
-    dropped: Vec<NodeId>,
-    agg_delta: Vec<f32>,
-    mean_norm: f32,
-    masked_ok: bool,
+/// PeerBook по узлам этого процесса (тесты; партиции юзают peer_book_ids).: партициям (между процессами) не нужно
+/// держать чужие Node'ы — достаточно id, чтобы проверить их подписи.
+fn peer_book_ids(ids: &[NodeId]) -> BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>> {
+    let mut m = BTreeMap::new();
+    for &id in ids {
+        let key = [id as u8; 32];
+        m.insert(key, Box::new(DemoSigner::new(key)) as Box<dyn Signer>);
+    }
+    m
 }
 
-/// Один шаг эпохи.
-pub fn run_era(
-    nodes: &mut Vec<Node>,
+/// Plain-дельты эпохи (truth харнеса: run_era сверяет с masked-суммой).
+pub type Truth = (NodeId, Vec<f32>, Vec<i64>);
+
+/// Промежуточное состояние узла после фаз B/C (вход tally-фазы).
+#[derive(Debug, Clone)]
+pub struct MidNode {
+    pub contributors: usize,
+    pub dropped: Vec<NodeId>,
+    pub agg_delta: Vec<f32>,
+    pub mean_norm: f32,
+    pub masked_ok: bool,
+    pub before_replica: LoRAAdapter,
+    pub vote: Option<Vote>,
+}
+
+/// Собственный голос узла (для tally).
+#[derive(Debug, Clone)]
+pub struct Vote {
+    pub candhash: [u8; 32],
+    pub cand_acc: f32,
+    pub accept: bool,
+    pub agg_delta: Vec<f32>,
+}
+
+/// ФАЗА A: Publish — локальный fit + подписанный wire-кадр (broadcast).
+/// Возврат: plain-дельты СВОИХ узлов (truth; харнесу/тегам проверки).
+pub fn era_publish(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
     transport: &mut dyn Transport,
     era: u32,
     cfg: &SimConfig,
     seed: u64,
-) -> EraReport {
+) -> Vec<Truth> {
     let was_reveal = (era + 1) % cfg.reveal_every == 0;
     let ehash = era_hash32(era);
-    let reg = pairwise_registry(nodes.len());
-    let before_replica = nodes[0].adapter.clone();
-
-    // --- Фаза A: Publish — локальный fit + подписанный wire-кадр (broadcast)
-    let mut truths: Vec<Truth> = Vec::with_capacity(nodes.len());
-    for (i, node) in nodes.iter().enumerate() {
+    let reg = pairwise_registry(all_ids.len());
+    let mut truths: Vec<Truth> = Vec::with_capacity(mine.len());
+    for node in mine.iter() {
         let batch = node.local_batch(64);
         let max_norm = if node.byz { 1_000_000.0 } else { cfg.max_norm };
-        let rng_seed = seed ^ era.wrapping_mul(0x9E37_79B9).wrapping_mul(7 + i as u32) as u64;
+        let rng_seed =
+            seed ^ era.wrapping_mul(0x9E37_79B9).wrapping_mul(7 + node.id as u32) as u64;
         let mut rng = Lcg::new(rng_seed);
         let fit = local_fit(
             &node.base,
@@ -396,7 +416,7 @@ pub fn run_era(
             );
             transport.send(CH_SHARES, node.id, None, &frame);
         } else {
-            let share = client_share(i, &[i as u8; 16], &reg.registry, &fx);
+            let share = client_share(node.id as usize, &[node.id as u8; 16], &reg.registry, &fx);
             let frame = sign_frame(
                 node,
                 MsgType::UpdShare,
@@ -404,19 +424,34 @@ pub fn run_era(
                     era_id: ehash,
                     agg_id: ehash,
                     c_share: fx_to_bytes(&share),
-                    nonce: [i as u8; 16],
+                    nonce: [node.id as u8; 16],
                 },
             );
             transport.send(CH_SHARES, node.id, None, &frame);
         }
     }
+    truths
+}
 
-    // --- Фаза B: Collect+Compute — узел читает кадры, считает скрининг сам
-    let mut views: Vec<ReporterView> = Vec::new();
-    for idx in 0..nodes.len() {
-        let book = peer_book(nodes);
-        let wire = transport.collect(CH_SHARES, nodes[idx].id);
-        let payloads = decode_frames(&mut nodes[idx], &book, wire);
+/// ФАЗЫ B+C: Collect+Compute (скрининг по полученным кадрам) и собственный голос.
+///
+/// `checker` — только для run_era: (все plain- truths роя, id узла-репортёра);
+/// партиция передаёт None (у неё нет чужих plain-дельт).
+pub fn era_collect_and_vote(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    checker: Option<(&[Truth], NodeId)>,
+) -> Vec<MidNode> {
+    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let ehash = era_hash32(era);
+    let mut mids = Vec::with_capacity(mine.len());
+    for idx in 0..mine.len() {
+        let book = peer_book_ids(all_ids);
+        let wire = transport.collect(CH_SHARES, mine[idx].id);
+        let payloads = decode_frames(&mut mine[idx], &book, wire);
         let mut shares: Vec<ShareEntry> = Vec::new();
         let mut reveals: Vec<RevealEntry> = Vec::new();
         for (nid, pl) in payloads.iter() {
@@ -425,10 +460,7 @@ pub fn run_era(
                     shares.push(ShareEntry { node: *nid, fx: bytes_to_fx(c_share) })
                 }
                 Payload::RobustInput { era_id, delta, norm, .. }
-                    if *era_id == ehash
-                        && was_reveal
-                        && delta.len() == LoRAAdapter::num_params() =>
-                {
+                    if *era_id == ehash && was_reveal && delta.len() == LoRAAdapter::num_params() => {
                     reveals.push(RevealEntry { node: *nid, delta: delta.clone(), norm: *norm })
                 }
                 _ => {}
@@ -436,10 +468,14 @@ pub fn run_era(
         }
         shares.sort_by_key(|s| s.node);
         reveals.sort_by_key(|r| r.node);
-        let masked_ok = if was_reveal || idx != 0 {
-            true
-        } else {
-            collab_masked_check(&shares, &truths)
+        let mut mid = MidNode {
+            contributors: 0,
+            dropped: Vec::new(),
+            agg_delta: vec![0.0; LoRAAdapter::num_params()],
+            mean_norm: 0.0,
+            masked_ok: true,
+            before_replica: mine[idx].adapter.clone(),
+            vote: None,
         };
         if was_reveal {
             let mean_norm = if reveals.is_empty() {
@@ -448,73 +484,72 @@ pub fn run_era(
                 reveals.iter().map(|r| r.norm).sum::<f32>() / reveals.len() as f32
             };
             let (accepted, dropped, agg_delta) = robust_screen(&reveals, cfg);
-            views.push(ReporterView {
-                contributors: accepted.len(),
-                dropped,
-                agg_delta,
-                mean_norm,
-                masked_ok,
-            });
+            mid.contributors = accepted.len();
+            mid.dropped = dropped;
+            mid.agg_delta = agg_delta;
+            mid.mean_norm = mean_norm;
         } else {
-            views.push(ReporterView {
-                contributors: shares.len(),
-                dropped: Vec::new(),
-                agg_delta: vec![0.0; LoRAAdapter::num_params()],
-                mean_norm: norm2(&nodes[idx].adapter.as_vec()),
-                masked_ok,
+            mid.contributors = shares.len();
+            mid.mean_norm = norm2(&mine[idx].adapter.as_vec());
+            if let Some((truths, reporter)) = checker {
+                if mine[idx].id == reporter {
+                    mid.masked_ok = collab_masked_check(&shares, truths);
+                }
+            }
+        }
+        // --- Фаза C: голос на СВОЕГО кандидата (только reveal)
+        if was_reveal {
+            let replica = mine[idx].adapter.clone();
+            let candidate = apply_delta(replica.clone(), &mid.agg_delta);
+            let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
+            let cand_acc =
+                accuracy(&ToyModel { base: mine[idx].base.clone(), adapter: candidate }, &eval);
+            let probe_acc =
+                accuracy(&ToyModel { base: mine[idx].base.clone(), adapter: replica }, &eval);
+            let cand_hash = cand_hash32(era, &mid.agg_delta);
+            let accept = cand_acc + 0.005 >= probe_acc;
+            let frame = sign_frame(
+                &mine[idx],
+                MsgType::EvalVote,
+                Payload::EvalVote {
+                    checkpoint_id: cand_hash,
+                    ppl: cand_acc,
+                    pass_at_k: if accept && !mine[idx].byz { 100 } else { 0 },
+                },
+            );
+            transport.send(CH_VOTES, mine[idx].id, None, &frame);
+            mid.vote = Some(Vote {
+                candhash: cand_hash,
+                cand_acc,
+                accept,
+                agg_delta: mid.agg_delta.clone(),
             });
         }
+        mids.push(mid);
     }
+    mids
+}
 
-    // --- Фаза C: Vote (только reveal): каждый оценивает СВОЙ кандидат
-    #[derive(Clone)]
-    struct MyVote {
-        candhash: [u8; 32],
-        cand_acc: f32,
-        accept: bool,
-        agg_delta: Vec<f32>,
-    }
-    let mut votes: Vec<Option<MyVote>> = Vec::new();
-    for idx in 0..nodes.len() {
-        if !was_reveal {
-            votes.push(None);
-            continue;
-        }
-        let replica = nodes[idx].adapter.clone();
-        let agg_delta = views[idx].agg_delta.clone();
-        let candidate = apply_delta(replica.clone(), &agg_delta);
-        let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
-        let cand_acc = accuracy(
-            &ToyModel { base: nodes[idx].base.clone(), adapter: candidate },
-            &eval,
-        );
-        let probe_acc = accuracy(
-            &ToyModel { base: nodes[idx].base.clone(), adapter: replica },
-            &eval,
-        );
-        let cand_hash = cand_hash32(era, &agg_delta);
-        let accept = cand_acc + 0.005 >= probe_acc;
-        let frame = sign_frame(
-            &nodes[idx],
-            MsgType::EvalVote,
-            Payload::EvalVote {
-                checkpoint_id: cand_hash,
-                ppl: cand_acc,
-                pass_at_k: if accept && !nodes[idx].byz { 100 } else { 0 },
-            },
-        );
-        transport.send(CH_VOTES, nodes[idx].id, None, &frame);
-        votes.push(Some(MyVote { candhash: cand_hash, cand_acc, accept, agg_delta }));
-    }
+/// ФАЗЫ D+E: Tally (кворум/apply/announce) и отчёт каждого своего узла.
+pub fn era_tally(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    mids: Vec<MidNode>,
+) -> Vec<EraReport> {
+    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let ehash = era_hash32(era);
 
-    // --- Фаза D: Tally — кворум принимает, применяем реплику, Announce
-    for idx in 0..nodes.len() {
+    // --- Фаза D
+    for idx in 0..mine.len() {
         if !was_reveal {
             continue;
         }
-        let book = peer_book(nodes);
-        let wire = transport.collect(CH_VOTES, nodes[idx].id);
-        let payloads = decode_frames(&mut nodes[idx], &book, wire);
+        let book = peer_book_ids(all_ids);
+        let wire = transport.collect(CH_VOTES, mine[idx].id);
+        let payloads = decode_frames(&mut mine[idx], &book, wire);
         let mut accepts = 0usize;
         for (_nid, pl) in payloads.iter() {
             if let Payload::EvalVote { pass_at_k, .. } = pl {
@@ -524,64 +559,104 @@ pub fn run_era(
             }
         }
         let quorum = accepts * 3 >= payloads.len().max(1) * 2;
-        let mv = votes[idx].clone().unwrap();
-        if quorum && mv.accept {
-            let new_adapter = apply_delta(nodes[idx].adapter.clone(), &mv.agg_delta);
-            nodes[idx].adapter = new_adapter;
-            let parent = nodes[idx].last_cp;
-            nodes[idx].last_cp = mv.candhash;
-            let mut buf = Vec::with_capacity(mv.agg_delta.len() * 4);
-            for v in &mv.agg_delta {
-                buf.extend_from_slice(&v.to_le_bytes());
+        if let Some(mv) = mids[idx].vote.clone() {
+            if quorum && mv.accept {
+                mine[idx].adapter = apply_delta(mine[idx].adapter.clone(), &mv.agg_delta);
+                let parent = mine[idx].last_cp;
+                mine[idx].last_cp = mv.candhash;
+                let mut buf = Vec::with_capacity(mv.agg_delta.len() * 4);
+                for v in &mv.agg_delta {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                let frame = sign_frame(
+                    &mine[idx],
+                    MsgType::CheckpointAnnounce,
+                    Payload::CheckpointAnnounce {
+                        id: mv.candhash,
+                        parent_id: parent,
+                        era_id: ehash,
+                        merge_recipe_hash: sha256(&buf),
+                        ppl: mv.cand_acc,
+                        pass_at_k: mids[idx].contributors as u8,
+                    },
+                );
+                transport.send(CH_ANNOUNCE, mine[idx].id, None, &frame);
             }
-            let frame = sign_frame(
-                &nodes[idx],
-                MsgType::CheckpointAnnounce,
-                Payload::CheckpointAnnounce {
-                    id: mv.candhash,
-                    parent_id: parent,
-                    era_id: ehash,
-                    merge_recipe_hash: sha256(&buf),
-                    ppl: mv.cand_acc,
-                    pass_at_k: views[idx].contributors as u8,
-                },
-            );
-            transport.send(CH_ANNOUNCE, nodes[idx].id, None, &frame);
         }
     }
 
-    // --- Фаза E: отчёт репортёра (узел 0)
-    let view = views[0].clone();
-    let announces = transport.collect(CH_ANNOUNCE, 0);
-    let book = peer_book(nodes);
-    let payloads = decode_frames(&mut nodes[0], &book, announces);
-    let announcements_valid: Vec<[u8; 32]> = payloads
-        .iter()
-        .filter_map(|(_nid, pl)| match pl {
-            Payload::CheckpointAnnounce { id, era_id, .. } if *era_id == ehash => Some(*id),
-            _ => None,
-        })
-        .collect();
-    let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
-    let acc_before = accuracy(
-        &ToyModel { base: nodes[0].base.clone(), adapter: before_replica },
-        &eval,
-    );
-    let acc_after = accuracy(
-        &ToyModel { base: nodes[0].base.clone(), adapter: nodes[0].adapter.clone() },
-        &eval,
-    );
-    EraReport {
-        era,
-        was_reveal,
-        contributors: if was_reveal { view.contributors } else { nodes.len() },
-        dropped: view.dropped,
-        checkpoint_id: announcements_valid.first().copied(),
-        accuracy_before: acc_before,
-        accuracy_after: acc_after,
-        mean_norm: view.mean_norm,
-        masked_sum_ok: view.masked_ok,
+    // --- Фаза E: отчёт
+    let mut reports = Vec::with_capacity(mine.len());
+    for idx in 0..mine.len() {
+        let announces = transport.collect(CH_ANNOUNCE, mine[idx].id);
+        let book = peer_book_ids(all_ids);
+        let payloads = decode_frames(&mut mine[idx], &book, announces);
+        let announcements_valid: Vec<[u8; 32]> = payloads
+            .iter()
+            .filter_map(|(_nid, pl)| match pl {
+                Payload::CheckpointAnnounce { id, era_id, .. } if *era_id == ehash => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
+        let acc_before = accuracy(
+            &ToyModel { base: mine[idx].base.clone(), adapter: mids[idx].before_replica.clone() },
+            &eval,
+        );
+        let acc_after = accuracy(
+            &ToyModel { base: mine[idx].base.clone(), adapter: mine[idx].adapter.clone() },
+            &eval,
+        );
+        reports.push(EraReport {
+            era,
+            was_reveal,
+            contributors: mids[idx].contributors,
+            dropped: mids[idx].dropped.clone(),
+            checkpoint_id: announcements_valid.first().copied(),
+            accuracy_before: acc_before,
+            accuracy_after: acc_after,
+            mean_norm: mids[idx].mean_norm,
+            masked_sum_ok: mids[idx].masked_ok,
+        });
     }
+    reports
+}
+
+/// Фазы A–E над ПОДМНОЖЕСТВОМ узлов роя (без барьеров внутри — для тестов:
+/// многопроцессный драйвер зовёт фазы по одной и скрещивает их барьерами).
+pub fn run_era_partition(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    seed: u64,
+) -> Vec<EraReport> {
+    let _truths = era_publish(mine, all_ids, transport, era, cfg, seed);
+    let mids = era_collect_and_vote(mine, all_ids, transport, era, cfg, None);
+    era_tally(mine, all_ids, transport, era, cfg, mids)
+}
+
+/// Один шаг эпохи (полный рой в этом процессе + secure-agg инвариант).
+pub fn run_era(
+    nodes: &mut Vec<Node>,
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    seed: u64,
+) -> EraReport {
+    let all_ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
+    let truths = era_publish(nodes, &all_ids, transport, era, cfg, seed);
+    let mids = era_collect_and_vote(
+        nodes,
+        &all_ids,
+        transport,
+        era,
+        cfg,
+        Some((&truths, all_ids[0])),
+    );
+    let reports = era_tally(nodes, &all_ids, transport, era, cfg, mids);
+    reports.into_iter().next().expect("рою нужен хотя бы один узел")
 }
 
 fn apply_delta(replica: LoRAAdapter, agg_delta: &[f32]) -> LoRAAdapter {
@@ -793,6 +868,61 @@ mod tests {
         let payloads = decode_frames(&mut me, &book, wire);
         assert_eq!(me.rejected_frames, 1, "подделка отброшена");
         assert_eq!(payloads.len(), 1, "подлинный кадр принят");
+    }
+
+    #[test]
+    fn partition_full_set_matches_run_era() {
+        // партиция «в этом процессе все узлы роя» обязана давать те же
+        // числа, что и run_era (включая bit-точную математику той же эры)
+        let cfg = SimConfig { byzantine_pct: 0.0, ..Default::default() };
+        let (reps_full, nodes_full) = simulate(6, 4, cfg, 2026);
+        // recreate same stream через партицию
+        let mut mesh = crate::transport::MeshTransport::new(6);
+        let mut nodes: Vec<Node> = (0..6).map(|i| Node::new(i as u16, 7, false)).collect();
+        let ids: Vec<NodeId> = (0..6).map(|i| i as u16).collect();
+        for era in 0..4u32 {
+            let rep = run_era_partition(&mut nodes, &ids, &mut mesh, era, &cfg, 2026)
+                .remove(0);
+            let f = &reps_full[era as usize];
+            assert_eq!(rep.era, f.era);
+            assert_eq!(rep.was_reveal, f.was_reveal);
+            assert_eq!(rep.contributors, f.contributors, "era {era}");
+            assert_eq!(rep.dropped, f.dropped);
+            assert_eq!(rep.checkpoint_id, f.checkpoint_id);
+            assert_eq!(rep.accuracy_after, f.accuracy_after, "era {era}");
+            assert_eq!(rep.masked_sum_ok, f.masked_sum_ok);
+        }
+        let _ = nodes_full;
+    }
+
+    #[test]
+    fn barrier_emulated_two_processes_match_run_era() {
+        // Процесс A владеет узлами {0,1,2}, B — {3,4,5}: фазы скрещиваются
+        // барьерами (здесь — последовательным порядком), общий один transport
+        // (в бине spoolswarm — ФАЙЛЫ спула). Результат обязан бит-точно
+        // совпасть с run_ера полного роя: fit детерминирован по node.id.
+        let cfg = SimConfig { byzantine_pct: 0.0, reveal_every: 2, train_steps: 90, ..Default::default() };
+        let (reps_full, nodes_full) = simulate(6, 4, cfg, 5);
+
+        let mut a: Vec<Node> = (0..3).map(|i| Node::new(i as u16, 7, false)).collect();
+        let mut b: Vec<Node> = (3..6).map(|i| Node::new(i as u16, 7, false)).collect();
+        let ids: Vec<NodeId> = (0..6).map(|i| i as u16).collect();
+        let mut shared = crate::transport::MeshTransport::new(6);
+        for era in 0..4u32 {
+            era_publish(&mut a, &ids, &mut shared, era, &cfg, 5);
+            era_publish(&mut b, &ids, &mut shared, era, &cfg, 5);
+            let ma = era_collect_and_vote(&mut a, &ids, &mut shared, era, &cfg, None);
+            let mb = era_collect_and_vote(&mut b, &ids, &mut shared, era, &cfg, None);
+            let ra = era_tally(&mut a, &ids, &mut shared, era, &cfg, ma);
+            let _rb = era_tally(&mut b, &ids, &mut shared, era, &cfg, mb);
+            // чек-пойнты обеих сторон совпадают с полным роем
+            assert_eq!(ra[0].checkpoint_id, reps_full[era as usize].checkpoint_id, "era {era}");
+        }
+        // финальные реплики бит-точно равны полностью одному рою
+        for i in 0..3 {
+            assert_eq!(a[i].adapter.as_vec(), nodes_full[i].adapter.as_vec(), "узел {i}");
+            assert_eq!(b[i].adapter.as_vec(), nodes_full[i + 3].adapter.as_vec(), "узел {}", i + 3);
+        }
     }
 
     #[test]

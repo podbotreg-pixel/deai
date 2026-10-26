@@ -50,6 +50,11 @@ cargo build          # только std, никаких внешних зави�
 cargo test           # юнит-тесты всех крейтов
 python3 prototype/proto.py   # демо: подпись→CBOR→secure-aggregation
 cargo run -p dinet-node      # демо роя: 20 узлов, 10% отравителей, robust-агрегация, чек-пойнты
+# рой в РАЗНЫХ процессах (обмен только файлами, без сокетов):
+rm -rf /tmp/swarm && \
+cargo run -p dinet-node --bin spoolswarm -- /tmp/swarm --pid 0 --procs 2 --nodes 4 --eras 4 &
+cargo run -p dinet-node --bin spoolswarm -- /tmp/swarm --pid 1 --procs 2 --nodes 4 --eras 4
+                             # оба процесса сходятся к одним чек-пойнтам
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
