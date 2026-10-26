@@ -248,11 +248,12 @@ mod tests {
     #[test]
     fn clip_l2_works() {
         let v = vec![3.0, 4.0]; // |v|=5
-        let (c, was) = clip_l2(&v, 5.0);
+        let (c0, was) = clip_l2(&v, 5.0);
         assert!(!was);
         let (c, was) = clip_l2(&v, 2.5);
         assert!(was);
         assert!(approx(norm2(&c), 2.5));
+        let _ = c0;
     }
 
     #[test]

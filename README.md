@@ -37,6 +37,8 @@ crates/
                       следующий backend через трейт `Transport`)
   dinet-memory/       локальная память: append-only KV-лог (std-only, замена SQLite)
                       + hash-эмбеддинг RAG (замена sqlite-vec); libp2p/llama.cpp — v1
+  dinet-chat/         чат-сессия: история, RAG-контекст хода, буфер speak→learn;
+                      `ChatModel` — точка прикрепления llama.cpp (toy-v0 проверяет пайплайн)
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -50,6 +52,8 @@ python3 prototype/proto.py   # демо: подпись→CBOR→secure-aggregat
 cargo run -p dinet-node      # демо роя: 20 узлов, 10% отравителей, robust-агрегация, чек-пойнты
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
+cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
+                             # REPL-чат: история, RAG-контекст, пары speak→learn
 ```
 
 ## Ключевые документы

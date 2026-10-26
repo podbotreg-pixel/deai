@@ -9,7 +9,10 @@
 - [x] Ядро Rust собирается, конфигурация, планировщик ресурсов (лимиты CPU/RAM/батареи)
       (`dinet-crypto`, `dinet-proto`, `dinet-core`, `dinet-fl`, `dinet-net`, `dinet-node`; std-only)
 - [ ] llama.cpp binding, GGUF Q4, стриминг токенов (точка прикрепления: LocalTrainer-интерфейс в dinet-fl)
-- [ ] Чат-UI (Tauri), история, экспорт, миграция
+- [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
+      RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
+      точка прикрепления llama.cpp
+- [ ] Чат-UI (Tauri) поверх `ChatSession`, экспорт, миграция (механика сессии уже готова)
 - [x] **Speak→learn (механика):** буфер пар → LoRA + hinge-предпочтение (saturating DPO-lite),
       DP-клиппинг, local_fit → secure_agg — на toy-модели, интерфейс LocalTrainer устойчив
       к замене на llama.cpp

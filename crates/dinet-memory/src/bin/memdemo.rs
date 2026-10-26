@@ -11,7 +11,8 @@
 //!   /stats              — сколько фактов на диске
 //!   /exit               — выход (все записи уже на диске)
 
-use dinet_memory::Retriever;
+use dinet_memory::kv::KvStore;
+use dinet_memory::rag::{doc_count, remove_doc, search_store, store_doc};
 use std::io::{BufRead, Write};
 
 const USAGE: &str = "команды: /remember <текст> | /ask <вопрос> | /forget <id> | /stats | /exit";
@@ -20,14 +21,14 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| "./dinet-mem".to_string());
     let path = std::path::Path::new(&dir).join("mem.dlog");
-    let mut r = match Retriever::open(&path) {
-        Ok(r) => r,
+    let mut store = match KvStore::open(&path) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("не смогли открыть память {path:?}: {e}");
             std::process::exit(1);
         }
     };
-    println!("DI-NET память: {path:?} ({} фактов)", r.count());
+    println!("DI-NET память: {path:?} ({} фактов)", doc_count(&store));
     println!("{USAGE}");
     let stdin = std::io::stdin();
     loop {
@@ -42,11 +43,10 @@ fn main() {
             continue;
         }
         if let Some(text) = line.strip_prefix("/remember ").or(line.strip_prefix("/r ")) {
-            let id = r.add(text, 0).unwrap_or(u64::MAX);
+            let id = store_doc(&mut store, text, 0).unwrap_or(u64::MAX);
             println!("[запомнено #{id}]");
         } else if let Some(q) = line.strip_prefix("/ask ").or(line.strip_prefix("/a ")) {
-            // про миллисекунды: демо измеряет стоимость «вежливо» — без таймера ядра
-            let hits = r.search(q, 3);
+            let hits = search_store(&store, q, 3);
             if hits.is_empty() {
                 println!("(память пуста — /remember чтобы добавить)");
             }
@@ -56,7 +56,7 @@ fn main() {
         } else if let Some(id_s) = line.strip_prefix("/forget ").or(line.strip_prefix("/f ")) {
             match id_s.trim().parse::<u64>() {
                 Ok(id) => {
-                    if r.remove(id).unwrap_or(false) {
+                    if remove_doc(&mut store, id).unwrap_or(false) {
                         println!("[удалено #{id}]");
                     } else {
                         println!("[#{id} нет]");
@@ -65,14 +65,14 @@ fn main() {
                 Err(_) => println!("id — число"),
             }
         } else if line == "/stats" || line == "/s" {
-            println!("фактов: {}", r.count());
+            println!("фактов: {}", doc_count(&store));
         } else if line == "/exit" || line == "/q" || line == "exit" {
             break;
         } else if line.starts_with('/') {
             println!("{USAGE}");
         } else {
             // голые строки — тоже запоминаем (поток разговора)
-            let id = r.add(line, 0).unwrap_or(u64::MAX);
+            let id = store_doc(&mut store, line, 0).unwrap_or(u64::MAX);
             println!("[запомнено #{id}] (команды: {USAGE})");
         }
     }

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "dinet-chat"
+version = "0.1.0"
+dependencies = [
+ "dinet-memory",
+]
+
+[[package]]
 name = "dinet-core"
 version = "0.1.0"
 

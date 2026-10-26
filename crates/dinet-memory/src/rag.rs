@@ -31,14 +31,27 @@ pub fn tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Hash-эмбеддинг текста (bag-of-tokens, L2-нормированный).
+/// Hash-эмбеддинг текста (bag-of-tokens + 5-граммные префиксы, L2-норма).
+///
+/// Точный токен весит 1.0; префикс первых 5 букв (если длина ≥ 5) — 0.5.
+/// Префиксы дают сходство словоформ («фотография» ~ «фотографию») — до
+/// замены `embed()` на llama.cpp-эмбеддинги в v1.
 #[must_use]
 pub fn embed(text: &str) -> Vec<f32> {
     let mut v = vec![0.0f32; EMBED_DIM];
-    for tok in tokens(text) {
-        let h = sha256(tok.as_bytes());
+    fn add(v: &mut [f32], t: &str, w: f32) {
+        let h = sha256(t.as_bytes());
         let idx = (u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as usize) % EMBED_DIM;
-        v[idx] += 1.0; // TF: каждый повтор добавляет
+        v[idx] += w; // TF: каждый повтор добавляет
+    }
+    for tok in tokens(text) {
+        add(&mut v, &tok, 1.0);
+        // префикс первых 5 букв (Юникодные чары) — сходство словоформ
+        let chars: Vec<char> = tok.chars().collect();
+        if chars.len() >= 5 {
+            let prefix: String = chars[..5].iter().collect();
+            add(&mut v, &prefix, 0.5);
+        }
     }
     let n = (v.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-9);
     for x in &mut v {
@@ -80,13 +93,65 @@ fn read_doc(store: &KvStore, key: &str) -> Option<Doc> {
     })
 }
 
-fn write_doc(v: &mut Vec<u8>, doc: &Doc) {
-    v.clear();
-    v.extend_from_slice(&doc.ts.to_be_bytes());
-    v.extend_from_slice(doc.text.as_bytes());
+fn write_doc_enc(doc: &Doc) -> Vec<u8> {
+    let mut enc = Vec::with_capacity(8 + doc.text.len());
+    enc.extend_from_slice(&doc.ts.to_be_bytes());
+    enc.extend_from_slice(doc.text.as_bytes());
+    enc
 }
 
-/// Открытый ретривер над KV-логом. Все документы сидят в том же файле.
+// ---------------------------------------------------------------------------
+// Свободные функции над переданным хранилищем: несколько подсистем (чат,
+// память) живут в ОДНОМ файле, каждая в своём префиксе ключей.
+// ---------------------------------------------------------------------------
+
+/// Записать документ в память (им_FOLLOW свободной функции Retriever::add).
+pub fn store_doc(store: &mut KvStore, text: &str, ts: u64) -> std::io::Result<u64> {
+    let id = next_id(store)?;
+    store.put(&doc_key(id), &write_doc_enc(&Doc { id, ts, text: text.to_string() }))?;
+    Ok(id)
+}
+
+/// Убрать документ.
+pub fn remove_doc(store: &mut KvStore, id: u64) -> std::io::Result<bool> {
+    store.delete(&doc_key(id))
+}
+
+/// Сколько документов в памяти.
+pub fn doc_count(store: &KvStore) -> usize {
+    store.scan(P_DOC).len()
+}
+
+/// Поиск top-k по cosine над переданным хранилищем.
+pub fn search_store(store: &KvStore, query: &str, k: usize) -> Vec<(Doc, f32)> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let q = embed(query);
+    let mut scored: Vec<(Doc, f32)> = Vec::new();
+    for key in store.scan(P_DOC) {
+        if let Some(doc) = read_doc(store, &key) {
+            let s = dot(&q, &embed(&doc.text));
+            scored.push((doc, s));
+        }
+    }
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    scored
+}
+
+fn next_id(store: &mut KvStore) -> std::io::Result<u64> {
+    let next: u64 = store
+        .get(P_NEXT)
+        .and_then(|b| <[u8; 8]>::try_from(b[..8].to_vec()).ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(1);
+    store.put(P_NEXT, &next.wrapping_add(1).to_le_bytes())?;
+    Ok(next)
+}
+
+/// Открытый ретривер над KV-логом (удобная обёртка одиночной памяти).
+/// Для файла с несколькими подсистемами (чат + память) — free-функции выше.
 #[derive(Debug)]
 pub struct Retriever {
     store: KvStore,
@@ -103,52 +168,24 @@ impl Retriever {
 
     /// Добавить документ; возвращает id.
     pub fn add(&mut self, text: &str, ts: u64) -> std::io::Result<u64> {
-        let id = self.next_id()?;
-        let doc = Doc { id, ts, text: text.to_string() };
-        let mut enc = Vec::new();
-        write_doc(&mut enc, &doc);
-        self.store.put(&doc_key(id), &enc)?;
-        Ok(id)
+        store_doc(&mut self.store, text, ts)
     }
 
     /// Убрать документ из памяти.
     pub fn remove(&mut self, id: u64) -> std::io::Result<bool> {
-        self.store.delete(&doc_key(id))
-    }
-
-    fn next_id(&mut self) -> std::io::Result<u64> {
-        let next: u64 = self
-            .store
-            .get(P_NEXT)
-            .and_then(|b| <[u8; 8]>::try_from(b[..8].to_vec()).ok())
-            .map(u64::from_le_bytes)
-            .unwrap_or(1);
-        self.store.put(P_NEXT, &next.wrapping_add(1).to_le_bytes())?;
-        Ok(next)
+        remove_doc(&mut self.store, id)
     }
 
     /// Поиск top-k по cosine: `(doc, score)`, убывание score.
     pub fn search(&self, query: &str, k: usize) -> Vec<(Doc, f32)> {
-        if k == 0 {
-            return Vec::new();
-        }
-        let q = embed(query);
-        let mut scored: Vec<(Doc, f32)> = Vec::new();
-        for key in self.store.scan(P_DOC) {
-            if let Some(doc) = read_doc(&self.store, &key) {
-                let s = dot(&q, &embed(&doc.text));
-                scored.push((doc, s));
-            }
-        }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        scored
+        search_store(&self.store, query, k)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv::KvStore;
     use std::fs;
     use std::path::PathBuf;
 
@@ -242,5 +279,37 @@ mod tests {
         // пустой запрос → нулевой вектор → все score 0, но ответы валидны
         assert!(top.len() <= 1);
         assert!(top.iter().all(|(_, s)| s.abs() < 1e-9));
+    }
+
+    #[test]
+    fn embed_matches_word_forms_via_prefix() {
+        // «фотография» и «фотографию» — разные токены, но общий 5-граммный
+        // префикс «фотог» даёт ненулевое сходство (до llama.cpp-эмбеддингов v1)
+        let s = dot(&embed("фотография"), &embed("любишь фотографию"));
+        assert!(s > 0.05, "сходство словоформ: {s}");
+        // полный непересекающийся контент — ноль
+        assert!(dot(&embed("погода"), &embed("борщ")).abs() < 1e-6);
+    }
+
+    #[test]
+    fn free_functions_share_one_file() {
+        // несколько подсистем в одном файле: RAG + своя н_strcmp пространства
+        let dir = tmpdir("shared");
+        let path = dir.join("multi.dlog");
+        let mut store = KvStore::open(&path).unwrap();
+        let id = store_doc(&mut store, "факт для rag", 5).unwrap();
+        store.put("chat:turn:1", "не rag данные".as_bytes()).unwrap();
+        assert_eq!(doc_count(&store), 1);
+        let top = search_store(&store, "факт", 3);
+        assert!(top.iter().any(|(d, _)| d.id == id));
+        // добавление чужой подсистемы не сломало rag next-счётчик
+        assert!(remove_doc(&mut store, id).unwrap());
+        store_doc(&mut store, "новый факт", 6).unwrap();
+        assert_eq!(doc_count(&store), 1);
+        // reopen: всё живо
+        let store = KvStore::open(&path).unwrap();
+        assert_eq!(doc_count(&store), 1);
+        assert_eq!(store.get("chat:turn:1"), Some("не rag данные".as_bytes().to_vec()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

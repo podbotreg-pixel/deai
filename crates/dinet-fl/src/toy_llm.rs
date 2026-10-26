@@ -470,7 +470,7 @@ mod tests {
     fn probe_pref_grad_trajectory() {
         let base = ToyBase::from_seed(7);
         let adapter = LoRAAdapter::lora_init(42);
-        let mut rng = Lcg::new(5);
+        let _rng = Lcg::new(5);
         let batch = toy_world::honesty_batch(64, 1000);
         let probe = toy_world::honesty_batch(96, 42_424_212);
         let probe_model = |m: &ToyModel| {

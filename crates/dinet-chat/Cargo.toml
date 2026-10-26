@@ -1,0 +1,10 @@
+[package]
+name = "dinet-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Чат-пайплайн DI-NET: сессия над локальной памятью, контекст через RAG, буфер speak→learn; ChatModel — точка прикрепления llama.cpp"
+
+[dependencies]
+dinet-memory = { path = "../dinet-memory" }

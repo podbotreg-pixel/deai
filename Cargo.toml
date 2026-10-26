@@ -8,6 +8,7 @@ members = [
     "crates/dinet-net",
     "crates/dinet-node",
     "crates/dinet-memory",
+    "crates/dinet-chat",
 ]
 
 [workspace.package]

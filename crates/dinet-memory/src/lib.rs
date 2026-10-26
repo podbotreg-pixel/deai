@@ -10,4 +10,4 @@ pub mod kv;
 pub mod rag;
 
 pub use kv::KvStore;
-pub use rag::{Doc, Retriever, EMBED_DIM, embed, dot};
+pub use rag::{Doc, Retriever, EMBED_DIM, embed, dot, tokens};
