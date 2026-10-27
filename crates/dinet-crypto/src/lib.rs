@@ -157,6 +157,38 @@ pub fn sha256(data: &[u8]) -> [u8; SHA256_LEN] {
 }
 
 // ---------------------------------------------------------------------------
+// X25519 (secure_agg v1: парный секрет = настоящий Диффи-Хеллман)
+// ---------------------------------------------------------------------------
+
+/// X25519-ключи узла.
+pub struct X25519Key {
+    pub sk: [u8; 32],
+    pub pk: [u8; 32],
+}
+
+/// Детерминированная X25519-пара из seed: sk = SHA-256("dinet-x25519"||seed),
+/// pk = базовая точка × sk. Сим выводит из node.id; v1 клиент ГЕНЕРИРУЕТ ключ
+/// и объявляет pubkey в Hello/PEX (открыто; секрет не покидает машину).
+pub fn x25519_from_seed(seed: &[u8; ED25519_PUB_LEN]) -> X25519Key {
+    let mut msg = Vec::with_capacity(12 + ED25519_PUB_LEN);
+    msg.extend_from_slice(b"dinet-x25519");
+    msg.extend_from_slice(seed);
+    let sk_b = sha256(&msg);
+    let ss = x25519_dalek::StaticSecret::from(sk_b);
+    let pk = x25519_dalek::PublicKey::from(&ss).to_bytes();
+    X25519Key { sk: sk_b, pk }
+}
+
+/// Парный секрет: DH(sk_a, pk_b) — СИММЕТРИЧЕН (a,b и b,a дают одно и то же
+/// поле-число) — из этого схлопывание pairwise-масок в ноль.
+pub fn x_pair_secret(sk: &[u8; 32], pk: &[u8; 32]) -> [u8; 32] {
+    // diffie_hellman — метод StaticSecret (not PublicKey)
+    x25519_dalek::StaticSecret::from(*sk)
+        .diffie_hellman(&x25519_dalek::PublicKey::from(*pk))
+        .to_bytes()
+}
+
+// ---------------------------------------------------------------------------
 // DID
 // ---------------------------------------------------------------------------
 
@@ -443,6 +475,20 @@ mod tests {
         let b = Ed25519Signer::from_seed(&[3u8; 32]);
         assert_eq!(a.pubkey(), b.pubkey());
         assert_eq!(a.did(), b.did());
+    }
+
+    #[test]
+    fn x25519_pair_secret_symmetric_and_deterministic() {
+        let a = x25519_from_seed(&[1u8; 32]);
+        let b = x25519_from_seed(&[2u8; 32]);
+        assert_ne!(a.pk, b.pk, "разные seed → разные pubkey");
+        // DH(sk_a, pk_b) == DH(sk_b, pk_a) — база взаимного схлопывания масок
+        assert_eq!(x_pair_secret(&a.sk, &b.pk), x_pair_secret(&b.sk, &a.pk));
+        // секрет ≠ любым из открытых ключей и стабилен от вызова к вызову
+        let s = x_pair_secret(&a.sk, &b.pk);
+        assert_ne!(s, a.pk);
+        assert_ne!(s, b.pk);
+        assert_eq!(s, x_pair_secret(&a.sk, &b.pk), "детерминирован");
     }
 
     #[test]

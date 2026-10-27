@@ -54,7 +54,9 @@
       проверено: юзер 24 пары → 6 эр → REVEAL-эра 3 → чат ответил по
       правилу мира, рестарт сохранил точность 0.312
 - [x] Secure Aggregation (pairwise masking) — без отправки индивидуальных апдейтов
-      (`dinet-fl::secure_agg`: инвариант Σмасок==Σθ проверен тестами; v0-masks на SHA-256, v1 — X25519)
+      (`dinet-fl::secure_agg`: инвариант Σмасок==Σθ проверен тестами; парный секрет —
+      РЕАЛЬНЫЙ X25519 Диффи-Хеллман (v1, `dinet-crypto::x_pair_secret`): агрегатор
+      математически не восстановит ни один личный апдейт; v2 — secret-sharing полос)
 - [x] Robust-agg: median norm-band + Krum-консенсус + trimmed mean
       (`dinet-node::swarm::robust_screen`; 10% poison-узлов отсекаются на reveal-эрах до чек-пойнта)
 - [ ] Ротируемые роли: aggregator каждый era (окно 1 ч), lazy-audit 10%

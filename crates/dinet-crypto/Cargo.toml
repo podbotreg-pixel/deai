@@ -3,8 +3,9 @@ name = "dinet-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SHA-256, DID, Merkle, CRC-32 и ed25519-dalek Signer/Verifier для DI-NET"
+description = "SHA-256, DID, Merkle, CRC-32, ed25519-dalek подписи и X25519-маски роя для DI-NET"
 
 [dependencies]
 ed25519-dalek = "3"
 signature = "3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

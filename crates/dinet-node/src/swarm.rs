@@ -406,7 +406,12 @@ pub fn era_publish(
 ) -> Vec<Truth> {
     let was_reveal = (era + 1) % cfg.reveal_every == 0;
     let ehash = era_hash32(era);
-    let reg = pairwise_registry(all_ids.len());
+    // X25519-ключи роя: парный секрет secure_agg v1 = РЕАЛЬНЫЙ Диффи-Хеллман
+    let xk = peer_keys(all_ids);
+    let peers: Vec<(usize, [u8; 32])> = all_ids
+        .iter()
+        .filter_map(|&id| xk.get(&id).map(|k| (id as usize, k.pk)))
+        .collect();
     let mut truths: Vec<Truth> = Vec::with_capacity(mine.len());
     for node in mine.iter() {
         let batch = node.local_batch(64);
@@ -440,7 +445,8 @@ pub fn era_publish(
             );
             transport.send(CH_SHARES, node.id, None, &frame);
         } else {
-            let share = client_share(node.id as usize, &[node.id as u8; 16], &reg.registry, &fx);
+            let sk = &xk[&node.id].sk;
+            let share = client_share(node.id as usize, sk, &peers, &fx);
             let frame = sign_frame(
                 node,
                 MsgType::UpdShare,
@@ -695,18 +701,12 @@ fn apply_delta(replica: LoRAAdapter, agg_delta: &[f32]) -> LoRAAdapter {
     out
 }
 
-struct PairReg {
-    registry: Vec<(usize, usize, [u8; 16])>,
-}
-
-fn pairwise_registry(n: usize) -> PairReg {
-    let mut registry = Vec::new();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            registry.push((i, j, [i as u8; 16]));
-        }
-    }
-    PairReg { registry }
+/// X25519-ключи роя по id (sim: детерминированный вывод из [id;32]).
+/// v1: настоящий клиент шлёт свой pubkey в Hello — тут остаётся карта id→pk.
+fn peer_keys(ids: &[NodeId]) -> BTreeMap<NodeId, dinet_crypto::X25519Key> {
+    ids.iter()
+        .map(|&id| (id, dinet_crypto::x25519_from_seed(&[id as u8; 32])))
+        .collect()
 }
 
 /// Полная симуляция N эр (in-memory mesh).
