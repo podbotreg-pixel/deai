@@ -71,6 +71,10 @@ cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
 cargo run -p dinet-p2p --bin p2pmesh -- 6
                              # 6 узлов, полный меш, каждое сообщение проходит ed25519-проверку
                              # (кадры dinet-proto поверх gossipsub; подделка невозможна)
+# РОЙ ПОВЕРХ РЕАЛЬНОЙ СЕТИ: полные фазы эр (publish→vote→tally) через GossipBridge (трейт Transport):
+cargo run -p dinet-p2p --bin p2pswarm -- 4 2
+                             # 4 узла × 2 эры: реплики БИТ-В-БИТ равны in-memory симуляции —
+                             # сетевой транспорт не меняет математику роя (mean acc 0.542)
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem

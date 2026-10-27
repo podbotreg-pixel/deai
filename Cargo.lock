@@ -684,6 +684,8 @@ name = "dinet-p2p"
 version = "0.1.0"
 dependencies = [
  "dinet-crypto",
+ "dinet-fl",
+ "dinet-node",
  "dinet-proto",
  "futures",
  "libp2p",
