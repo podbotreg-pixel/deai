@@ -225,17 +225,121 @@ pub fn merkle_root(mut hashes: Vec<[u8; SHA256_LEN]>) -> [u8; SHA256_LEN] {
 // Signer-трейт: единая точка прикрепления реальной подписи.
 // ---------------------------------------------------------------------------
 
+fn ed_check(
+    vk: &ed25519_dalek::VerifyingKey,
+    msg: &[u8],
+    sig: &[u8; ED25519_SIG_LEN],
+) -> bool {
+    match ed25519_dalek::Signature::from_slice(sig) {
+        Ok(s) => vk.verify_strict(msg, &s).is_ok(),
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignError {
     Unsupported,
     InvalidSig,
 }
 
-/// Подписывающий ключ узла (ed25519 в v1; интерфейс абстрагирован).
-pub trait Signer: Send + Sync {
+/// Проверяющий по публичному ключу: у PeerBook роя СЕКРЕТОВ ЧУЖИХ узлов нет.
+pub trait Verifier: Send + Sync {
+    fn pubkey(&self) -> [u8; ED25519_PUB_LEN];
     fn did(&self) -> String;
+    fn verify(&self, msg: &[u8], sig: &[u8; ED25519_SIG_LEN]) -> bool;
+}
+
+/// Подписывающий ключ узла (ed25519 в v1; интерфейс абстрагирован).
+pub trait Signer: Verifier {
     fn sign(&self, msg: &[u8]) -> [u8; ED25519_SIG_LEN];
-    fn verify(&self, msg: &[u8], signer_did: &str, sig: &[u8; ED25519_SIG_LEN]) -> bool;
+}
+
+/// ed25519-dalek: собственный ключ узла (детерминированный из 32-байт seed).
+/// Заменяет DemoSigner в проде; DemoSigner остаётся в тестах-двойниках.
+#[derive(Debug)]
+pub struct Ed25519Signer {
+    sk: ed25519_dalek::SigningKey,
+    pub_bytes: [u8; ED25519_PUB_LEN],
+    did: String,
+}
+
+impl Ed25519Signer {
+    /// Ключевая пара из 32-байт seed (детерминированная; для реального роя —
+    /// сгенерированная и хранимая клиентом состояние).
+    pub fn from_seed(seed: &[u8; ED25519_PUB_LEN]) -> Self {
+        let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+        let pub_bytes = sk.verifying_key().to_bytes();
+        let did = did_key(&pub_bytes);
+        Ed25519Signer { sk, pub_bytes, did }
+    }
+
+    /// Публичный ключ (то, что уходит в wire-кадр как sender).
+    pub fn pubkey(&self) -> [u8; ED25519_PUB_LEN] {
+        self.pub_bytes
+    }
+
+    /// Проверяющая сторона с этим же публичным ключом (для PeerBook).
+    pub fn verifier(&self) -> Ed25519Verifier {
+        match Ed25519Verifier::new(self.pub_bytes) {
+            Some(v) => v,
+            None => unreachable!("собственный публичный ключ обязан валиден"),
+        }
+    }
+}
+
+impl Verifier for Ed25519Signer {
+    fn pubkey(&self) -> [u8; ED25519_PUB_LEN] {
+        self.pub_bytes
+    }
+
+    fn did(&self) -> String {
+        self.did.clone()
+    }
+
+    fn verify(&self, msg: &[u8], sig: &[u8; ED25519_SIG_LEN]) -> bool {
+        ed_check(&self.sk.verifying_key(), msg, sig)
+    }
+}
+
+impl Signer for Ed25519Signer {
+    fn sign(&self, msg: &[u8]) -> [u8; ED25519_SIG_LEN] {
+        use ::signature::Signer as _; // trait из signature 3 (крейт-деп)
+        self.sk.sign(msg).to_bytes()
+    }
+}
+
+/// ВерификаторPeerBook: только публичный ключ, никакого секрета.
+#[derive(Debug)]
+pub struct Ed25519Verifier {
+    vk: Option<ed25519_dalek::VerifyingKey>,
+    pub_bytes: [u8; ED25519_PUB_LEN],
+    did: String,
+}
+
+impl Ed25519Verifier {
+    /// None — байты не декодируются в кривую (мусор в PeerBook).
+    pub fn new(pub_bytes: [u8; ED25519_PUB_LEN]) -> Option<Self> {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes).ok()?;
+        let did = did_key(&pub_bytes);
+        Some(Ed25519Verifier { vk: Some(vk), pub_bytes, did })
+    }
+}
+
+impl Verifier for Ed25519Verifier {
+    fn pubkey(&self) -> [u8; ED25519_PUB_LEN] {
+        self.pub_bytes
+    }
+
+    fn did(&self) -> String {
+        self.did.clone()
+    }
+
+    fn verify(&self, msg: &[u8], sig: &[u8; ED25519_SIG_LEN]) -> bool {
+        match &self.vk {
+            Some(vk) => ed_check(vk, msg, sig),
+            None => false,
+        }
+    }
 }
 
 /// Заглушка-детерминированный signer: ТОЛЬКО для прототипа/тестов.
@@ -254,11 +358,25 @@ impl DemoSigner {
     }
 }
 
-impl Signer for DemoSigner {
+impl Verifier for DemoSigner {
+    fn pubkey(&self) -> [u8; ED25519_PUB_LEN] {
+        self.seed
+    }
+
     fn did(&self) -> String {
         self.did.clone()
     }
 
+    fn verify(&self, msg: &[u8], sig: &[u8; ED25519_SIG_LEN]) -> bool {
+        let h = sha256(&[self.seed.as_slice(), msg].concat());
+        let mut block2 = h.to_vec();
+        block2.push(0x01);
+        let h2 = sha256(&block2);
+        sig[..32] == h && sig[32..] == h2
+    }
+}
+
+impl Signer for DemoSigner {
     fn sign(&self, msg: &[u8]) -> [u8; ED25519_SIG_LEN] {
         let mut out = [0u8; ED25519_SIG_LEN];
         let mut block = Vec::with_capacity(self.seed.len() + msg.len());
@@ -273,19 +391,6 @@ impl Signer for DemoSigner {
         out[..32].copy_from_slice(&h);
         out[32..].copy_from_slice(&h2);
         out
-    }
-
-    fn verify(&self, msg: &[u8], signer_did: &str, sig: &[u8; ED25519_SIG_LEN]) -> bool {
-        // вытаскиваем seed из did — только для демо!
-        let _ = signer_did;
-        let mut block = Vec::with_capacity(self.seed.len() + msg.len());
-        block.extend_from_slice(&self.seed);
-        block.extend_from_slice(msg);
-        let h = sha256(&block);
-        let mut block2 = h.to_vec();
-        block2.push(0x01);
-        let h2 = sha256(&block2);
-        sig[..32] == h && sig[32..] == h2
     }
 }
 
@@ -310,6 +415,35 @@ pub fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ed25519_signer_real_roundtrip_and_tamper() {
+        let sk = Ed25519Signer::from_seed(&[7u8; 32]);
+        let msg = b"dinet:0x22:delta";
+        let sig = sk.sign(msg);
+        assert_eq!(sig.len(), 64);
+        // PeerBook-путь: только публичный ключ, реальная проверка
+        let vk = Ed25519Verifier::new(sk.pubkey()).expect("валидный ключ");
+        assert!(vk.verify(msg, &sig), "корректная подпись принимается");
+        assert_eq!(vk.did(), sk.did(), "did из одного pubkey");
+        // подделка любого байта сообщения/подписи отбраковывается
+        assert!(!vk.verify(b"dinet:0x22:delta!", &sig), "правка msg отброшена");
+        let mut bad_sig = sig;
+        bad_sig[0] ^= 1;
+        assert!(!vk.verify(msg, &bad_sig), "правка sig отброшена");
+        // чужой ключ не подтверждает чью-то подпись
+        let other = Ed25519Verifier::new(Ed25519Signer::from_seed(&[8u8; 32]).pubkey())
+            .expect("валидный");
+        assert!(!other.verify(msg, &sig), "чужой pubkey отброшен");
+    }
+
+    #[test]
+    fn ed25519_keys_derived_deterministically() {
+        let a = Ed25519Signer::from_seed(&[3u8; 32]);
+        let b = Ed25519Signer::from_seed(&[3u8; 32]);
+        assert_eq!(a.pubkey(), b.pubkey());
+        assert_eq!(a.did(), b.did());
+    }
 
     #[test]
     fn crc32_ieee_reference() {

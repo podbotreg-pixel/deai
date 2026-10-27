@@ -46,7 +46,7 @@ PROMPT.md             исходный мега-промт проектиров�
 ## Сборка
 
 ```bash
-cargo build          # только std, никаких внешних зависимостей
+cargo build          # std + ed25519-dalek (подписи wire-кадров — настоящие)
 cargo test           # юнит-тесты всех крейтов
 python3 prototype/proto.py   # демо: подпись→CBOR→secure-aggregation
 cargo run -p dinet-node      # демо роя: 20 узлов, 10% отравителей, robust-агрегация, чек-пойнты

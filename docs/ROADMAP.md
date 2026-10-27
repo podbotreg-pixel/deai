@@ -7,7 +7,11 @@
 
 - [x] Прототип протокола `prototype/proto.py` (сообщения + CBOR-lite + secure_agg demo)
 - [x] Ядро Rust собирается, конфигурация, планировщик ресурсов (лимиты CPU/RAM/батареи)
-      (`dinet-crypto`, `dinet-proto`, `dinet-core`, `dinet-fl`, `dinet-net`, `dinet-node`; std-only)
+      (`dinet-crypto`, `dinet-proto`, `dinet-core`, `dinet-fl`, `dinet-net`, `dinet-node`)
+- [x] Реальные подписи wire-кадров: ed25519-dalek прикреплён (crates.io стал доступен);
+      PeerBook хранит ТОЛЬКО публичные ключи (Verifer/Signer-сплит), tamper-тест
+      криптографичен; v1 — ключи, генерируемые клиентом, вместо sim-вывода из id
+      (`dinet-crypto::Ed25519Signer/Ed25519Verifier`)
 - [ ] llama.cpp binding, GGUF Q4, стриминг токенов (точка прикрепления: LocalTrainer-интерфейс в dinet-fl)
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —

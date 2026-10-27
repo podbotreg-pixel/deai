@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use dinet_crypto::{sha256, DemoSigner, Signer};
+use dinet_crypto::{sha256, Ed25519Signer, Signer, Verifier};
 use dinet_fl::secure_agg::{aggregate, client_share, to_fx};
 use dinet_fl::toy_llm::local_fit;
 use dinet_fl::toy_llm::toy_world::{byz_batch, honesty_batch};
@@ -66,10 +66,9 @@ impl Default for SimConfig {
 }
 
 /// Узел (leaderless: каждый считает всё из полученных кадров).
-#[derive(Debug)]
 pub struct Node {
     pub id: NodeId,
-    pub signer: DemoSigner,
+    pub signer: Box<dyn Signer>,
     pub base: ToyBase,
     pub adapter: LoRAAdapter,
     pub rep: f32,
@@ -89,7 +88,9 @@ impl Node {
     pub fn new(id: NodeId, world_seed: u64, byz: bool) -> Node {
         Node {
             id,
-            signer: DemoSigner::new([id as u8; 32]),
+            // РЕАЛЬНАЯ подпись: ed25519-dalek, seed = [id;32} (sim-вывод).
+            // В v1 настоящий рой клиент ГЕНЕРИРУЕТ ключ и обменивается pubkey.
+            signer: Box::new(Ed25519Signer::from_seed(&[id as u8; 32])),
             base: ToyBase::from_seed(world_seed),
             // ОБЩИЙ LoRA-init для всех узлов (FedIT-принцип: дельты узлов
             // сравнимы при усреднении только от одинаковой точки старта).
@@ -114,15 +115,43 @@ impl Node {
     }
 }
 
-fn node_seed(n: &Node) -> [u8; 32] {
-    [n.id as u8; 32]
+/// PeerBook: sender (публичный ключ kadра) → проверка подписи.
+/// Только публичные ключи — чужих секретов узел не знает никогда.
+pub struct PeerBook {
+    verifiers: BTreeMap<[u8; SENDER_LEN], Box<dyn Verifier>>,
+    /// sim-привязка pubkey → NodeId (v1: NodeId сам выводит из DID/DHT)
+    nid_by_sender: BTreeMap<[u8; SENDER_LEN], NodeId>,
 }
 
-/// PeerBook: pubkey → verifier (в v1 — ed25519 по did:key).
+impl PeerBook {
+    pub fn dids(&self) -> Vec<String> {
+        self.verifiers.values().map(|v| v.did()).collect()
+    }
+}
+
+/// PeerBook по узлам этого процесса (тесты).
 #[cfg(test)]
-fn peer_book(nodes: &[Node]) -> BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>> {
+fn peer_book(nodes: &[Node]) -> PeerBook {
     let ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
     peer_book_ids(&ids)
+}
+
+/// PeerBook по известным id роя (sim: ключи выводятся ДЕТЕРМЕНИРОВАНО из id;
+/// настоящий клиент обменивается реальными pubkey при handshake).
+fn peer_book_ids(ids: &[NodeId]) -> PeerBook {
+    let mut b = PeerBook {
+        verifiers: BTreeMap::new(),
+        nid_by_sender: BTreeMap::new(),
+    };
+    for &id in ids {
+        let s = Ed25519Signer::from_seed(&[id as u8; 32]);
+        let pub_bytes = s.pubkey();
+        if let Some(v) = dinet_crypto::Ed25519Verifier::new(pub_bytes) {
+            b.verifiers.insert(pub_bytes, Box::new(v));
+            b.nid_by_sender.insert(pub_bytes, id);
+        }
+    }
+    b
 }
 
 /// Вклад masked-эры (SecureAgg-share по wire).
@@ -193,7 +222,7 @@ fn bytes_to_fx(b: &[u8]) -> Vec<i64> {
 }
 
 fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> {
-    let sender = node_seed(node);
+    let sender = node.signer.pubkey();
     let frame = Frame { msg_type: mt, sender, sig: [0u8; 64], payload };
     let body = frame.encode_payload().expect("payload помещается в лимит");
     let sig = node.signer.sign(&body);
@@ -201,9 +230,10 @@ fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> {
 }
 
 /// Разобрать входящие кадры: verify → Payload. Подделка = отбраковка.
+/// Возвращает (NodeId, payload); reject учитывается в me.rejected_frames.
 fn decode_frames(
     me: &mut Node,
-    book: &BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>>,
+    book: &PeerBook,
     wire: Vec<Vec<u8>>,
 ) -> Vec<(NodeId, Payload)> {
     let mut out = Vec::new();
@@ -218,18 +248,15 @@ fn decode_frames(
                         continue;
                     }
                 };
-                match book.get(&f.sender) {
-                    Some(v) => {
-                        let did = v.did();
-                        if v.verify(&body, &did, &f.sig) {
-                            // sim: NodeId = первый байт seed-ключа (до 256 узлов)
-                            let nid = f.sender[0] as NodeId;
-                            out.push((nid, f.payload));
+                match (book.verifiers.get(&f.sender), book.nid_by_sender.get(&f.sender)) {
+                    (Some(v), Some(nid)) => {
+                        if v.verify(&body, &f.sig) {
+                            out.push((*nid, f.payload));
                         } else {
                             me.rejected_frames += 1;
                         }
                     }
-                    None => me.rejected_frames += 1,
+                    _ => me.rejected_frames += 1,
                 }
             }
         }
@@ -342,17 +369,6 @@ fn collab_masked_check(shares: &[ShareEntry], truths: &[(NodeId, Vec<f32>, Vec<i
 // ---------------------------------------------------------------------------
 // Эпоха: фазы A–E через транспорт (никаких прямых вызовов между узлами)
 // ---------------------------------------------------------------------------
-
-/// PeerBook по узлам этого процесса (тесты; партиции юзают peer_book_ids).: партициям (между процессами) не нужно
-/// держать чужие Node'ы — достаточно id, чтобы проверить их подписи.
-fn peer_book_ids(ids: &[NodeId]) -> BTreeMap<[u8; SENDER_LEN], Box<dyn Signer>> {
-    let mut m = BTreeMap::new();
-    for &id in ids {
-        let key = [id as u8; 32];
-        m.insert(key, Box::new(DemoSigner::new(key)) as Box<dyn Signer>);
-    }
-    m
-}
 
 /// Plain-дельты эпохи (truth харнеса: run_era сверяет с masked-суммой).
 pub type Truth = (NodeId, Vec<f32>, Vec<i64>);

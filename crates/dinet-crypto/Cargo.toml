@@ -3,8 +3,8 @@ name = "dinet-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SHA-256, DID, Merkle и Signer-трейт для DI-NET (std-only)"
+description = "SHA-256, DID, Merkle, CRC-32 и ed25519-dalek Signer/Verifier для DI-NET"
 
 [dependencies]
-# Сознательно пусто: crates.io недоступен, сборка std-only.
-# TODO(deps-v2): ed25519-dalek + rand (см. Signer::attach_software).
+ed25519-dalek = "3"
+signature = "3"
