@@ -148,6 +148,82 @@ pub fn build_prompt(user: &str, context: &[String]) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// WORKER-РЕЖИМ: llama.cpp не обязан быть Send+Sync — модель живёт в выделенном
+// потоке, а наружу торчит лёгкий мост-канал c трейтом ChatModel (webchat
+// кладёт его в глобальное состояние и ходит через Mutex).
+// ---------------------------------------------------------------------------
+
+use std::sync::mpsc as std_mpsc;
+
+/// Задача хода: вопрос + контекст памяти → одноразовый канал ответа.
+struct LlamaJob {
+    user: String,
+    context: Vec<String>,
+    reply: std_mpsc::Sender<String>,
+}
+
+/// ChatModel-мост поверх потока-владельца LlamaChatModel.
+pub struct LlamaWorkerBridge {
+    job: std_mpsc::Sender<LlamaJob>,
+}
+
+impl dinet_chat::ChatModel for LlamaWorkerBridge {
+    fn respond(&mut self, user: &str, context: &[String]) -> String {
+        let (tx, rx) = std_mpsc::channel();
+        let ok = self
+            .job
+            .send(LlamaJob {
+                user: user.to_string(),
+                context: context.to_vec(),
+                reply: tx,
+            })
+            .is_ok();
+        if !ok {
+            return "(llama-поток остановлен)".to_string();
+        }
+        rx.recv().unwrap_or_else(|_| "(llama-поток молчит)".to_string())
+    }
+
+    fn name(&self) -> &'static str {
+        "llama.cpp(GGUF)"
+    }
+}
+
+impl LlamaChatModel {
+    /// Поднять выделенный поток llama.cpp; модель загрузится при первом ходе
+    /// (возврат bridge не вешает запуск webchat). Ошибку загрузки
+    /// вернёт КАЖДЫЙ ход — диагностика не теряется.
+    pub fn spawn_worker(path: std::path::PathBuf, opts: LlamaOptions) -> LlamaWorkerBridge {
+        let (job, job_rx) = std_mpsc::channel::<LlamaJob>();
+        let _ = std::thread::Builder::new()
+            .name("dinet-llama-worker".into())
+            .spawn(move || {
+                let mut model: Option<LlamaChatModel> = None;
+                let mut load_err: Option<String> = None;
+                for LlamaJob { user, context, reply } in job_rx.iter() {
+                    if model.is_none() && load_err.is_none() {
+                        match LlamaChatModel::load(&path, opts) {
+                            Ok(m) => model = Some(m),
+                            Err(e) => load_err = Some(e),
+                        }
+                    }
+                    let answer = if let Some(e) = &load_err {
+                        format!("(llama.cpp: {e})")
+                    } else if let Some(m) = model.as_mut() {
+                        m.generate(&build_prompt(&user, &context))
+                            .unwrap_or_else(|e| format!("(llama.cpp: {e})"))
+                    } else {
+                        unreachable!("либо модель, либо ошибка загрузки");
+                    };
+                    let _ = reply.send(answer);
+                }
+            });
+        LlamaWorkerBridge { job }
+    }
+}
+
+
 fn short(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()

@@ -669,6 +669,7 @@ dependencies = [
  "dinet-chat",
  "dinet-crypto",
  "dinet-fl",
+ "dinet-llama",
  "dinet-memory",
  "dinet-node",
 ]

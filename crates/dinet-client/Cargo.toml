@@ -11,6 +11,11 @@ dinet-chat = { path = "../dinet-chat" }
 dinet-fl = { path = "../dinet-fl" }
 dinet-memory = { path = "../dinet-memory" }
 dinet-node = { path = "../dinet-node" }
+# llama.cpp для GUI-чата: фича llama + --model (сборка настоящей LLM в webchat)
+dinet-llama = { path = "../dinet-llama", optional = true }
+
+[features]
+llama = ["dep:dinet-llama"]
 
 [[bin]]
 name = "clientswarm"

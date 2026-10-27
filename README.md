@@ -67,6 +67,12 @@ cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
                              # кнопка «Учить» = пара учителя → каждые 4 пары локальная эра роя
                              # → REVEAL-эра принимает чек-пойнт → ЧАТ ОТВЕЧАЕТ ОБУЧЕННЫМ РЕПЛИКОЙ
                              # (реплика переживает рестарт: ./dinet-web-mem.roi)
+# GUI + НАСТОЯЩАЯ LLM (llama.cpp): свободные ходы — GGUF, микроязык — рой:
+cargo run -p dinet-client --features llama --bin webchat -- \
+    ./dinet-web-mem --port 8080 --model /tmp/opencode/gemma270m.gguf
+                             # русский свободно отвечает llama.cpp («Ты кто?»),
+                             # слова «ай би ви…» отвечает реплика роя; обучение
+                             # на парах учителя и эры работают так же (stats: model=…)
 # РЕАЛЬНАЯ P2P-СЕТЬ (libp2p): TCP+Noise+Yamux+gossipsub на localhost, узлы с ed25519-ключами:
 cargo run -p dinet-p2p --bin p2pmesh -- 6
                              # 6 узлов, полный меш, каждое сообщение проходит ed25519-проверку

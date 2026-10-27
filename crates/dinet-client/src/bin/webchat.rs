@@ -1,12 +1,19 @@
 //! webchat — ГРАФИЧЕСКАЯ ОБОЛОЧКА DI-NET: браузерный чат на localhost
-//! (std-only: `std::net::TcpListener`, без внешних зависимостей) + вклад
+//! (std-only: `std::net::TcpListener`; llama.cpp — опция) + вклад
 //! клиента в рой с живого ввода.
 //!
 //! ```sh
 //! cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
 //! # открой http://localhost:8080
+//! # РЕАЛЬНАЯ LLM (gemma-270m и другие GGUF): фича llama + --model:
+//! cargo run -p dinet-client --features llama --bin webchat -- \
+//!     ./dinet-web-mem --port 8080 --model /tmp/opencode/gemma270m.gguf
 //! ```
 //!
+//! Выбор ответчика с --model: ходы на МИКРОЯЗЫКЕ роя (слова «ай би ви…»)
+//! отвечаются репликой роя (то, что рой дообучил, и отвечает); всё
+//! остальное — свободной генерацией llama.cpp. Обучение на парах учителя
+//! и вклад в эры роя работают identично в обоих режимах.
 //! Оболочка = та же страница, которую позже завернёт Tauri 2 в окно
 //! (двойное использование: web UI → desktop UI без переписывания).
 //!
@@ -152,6 +159,10 @@ struct ChatState {
     session: Mutex<ChatSession>,
     era: Arc<Mutex<EraNode>>,
     every: u32,
+    /// РЕАЛЬНАЯ llama.cpp (фича llama + --model путь.gguf): мост в поток-владелец.
+    /// `dyn + Send`: мост держит только mpsc-канал — сам llama.cpp не покидает поток.
+    #[cfg(feature = "llama")]
+    llama: Option<Mutex<Box<dyn dinet_chat::ChatModel + Send>>>,
 }
 
 fn now_ts() -> u64 {
@@ -207,6 +218,33 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
 // HTTP-обработчики
 // ---------------------------------------------------------------------------
 
+/// Диспетчер моделей хода (обе ветви отвечают СВОЕЙ сетью):
+/// - микроязык роя (слова «ай би ви…») → реплика роя (ToyChatModel::trained);
+///   llama-режим — ВСЕ остальные ходы уходят на llama.cpp.
+/// - без llama-фичи: только реплика роя (как раньше).
+#[cfg_attr(not(feature = "llama"), allow(unused_variables))]
+fn turn_model(
+    st: &ChatState,
+    g: &mut ChatSession,
+    user: &str,
+    replica: ToyModel,
+) -> std::io::Result<(String, Vec<String>)> {
+    // микроязыковые ходы всегда понимает рой-реплика
+    #[cfg(feature = "llama")]
+    {
+        let lex_mode = dinet_client::lex_to_tokens(user).is_some();
+        match (&st.llama, lex_mode) {
+            (Some(slot), false) => {
+                let mut m = slot.lock().expect("llama slot");
+                return g.turn(&mut **m, user, now_ts());
+            }
+            _ => {}
+        }
+    }
+    let mut toy = ToyChatModel::trained(replica);
+    g.turn(&mut toy, user, now_ts())
+}
+
 fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpStream) {
     match (method, path) {
         ("GET", "/") => respond(out, "200 OK", "text/html", PAGE),
@@ -217,15 +255,14 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 return;
             }
             let mut g = st.session.lock().expect("session lock");
-            // чат отвечает РЕПЛИКОЙ РОЯ: последний принятый чек-пойнт
-            let mut model = {
+            // реплика роя: последний принятый чек-пойнт (клоны, без удержания lock)
+            let replica = {
                 let e = st.era.lock().expect("era lock");
-                ToyChatModel::trained(ToyModel {
-                    base: e.node.base.clone(),
-                    adapter: e.node.adapter.clone(),
-                })
+                ToyModel { base: e.node.base.clone(), adapter: e.node.adapter.clone() }
             };
-            match g.turn(&mut model, &user, now_ts()) {
+
+            let reply = turn_model(st, &mut g, &user, replica);
+            match reply {
                 Ok((answer, ctx)) => {
                     let n = ctx.len();
                     drop(g);
@@ -312,9 +349,14 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             respond(out, "200 OK", "text/plain", if ok { "забыто" } else { "нет такого id" });
         }
         ("GET", "/api/stats") => {
-            let (turns, pairs, mem) = {
+            let (turns, pairs, mem, model_name) = {
                 let g = st.session.lock().expect("session lock");
-                (g.turns().len(), g.pending_pairs(), g.memory_count())
+                (
+                    g.turns().len(),
+                    g.pending_pairs(),
+                    g.memory_count(),
+                    g.model_name().to_string(),
+                )
             };
             let e = st.era.lock().expect("era lock");
             let eval = honesty_batch(96, 424_242);
@@ -327,7 +369,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model=toy-v0",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -343,13 +385,27 @@ fn main() {
     let dir = args.next().unwrap_or_else(|| "./dinet-web-mem".to_string());
     let mut port = 8080u16;
     let mut every = 4u32;
+    #[cfg(feature = "llama")]
+    let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(8080),
             "--every" => every = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
+            #[cfg(feature = "llama")]
+            "--model" => model_path = args.next(),
             _ => {}
         }
     }
+    #[cfg(feature = "llama")]
+    let llama_slot: Option<Mutex<Box<dyn dinet_chat::ChatModel + Send>>> = match &model_path {
+        Some(p) => {
+            use dinet_llama::{LlamaChatModel, LlamaOptions};
+            let bridge = LlamaChatModel::spawn_worker(std::path::PathBuf::from(p), LlamaOptions::default());
+            println!("llama.cpp: {p} поднят в worker-потоке (свободные ходы — ГГМ, микроязык — рой)");
+            Some(Mutex::new(Box::new(bridge) as Box<dyn dinet_chat::ChatModel + Send>))
+        }
+        None => None,
+    };
     let session = match ChatSession::open(std::path::Path::new(&dir)) {
         Ok(s) => s,
         Err(e) => {
@@ -400,6 +456,8 @@ fn main() {
         session: Mutex::new(session),
         era: Arc::new(Mutex::new(era)),
         every,
+        #[cfg(feature = "llama")]
+        llama: llama_slot,
     });
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -502,5 +560,26 @@ mod tests {
     #[test]
     fn form_plus_is_space() {
         assert_eq!(form_decode("a+b%2Bc"), "a b+c");
+    }
+}
+
+/// Дым webchat-моста: worker llama.cpp отвечает через трейт ChatModel.
+/// Прогоняется ТОЛЬКО при --features llama и DI_NET_GGUF (модель локально);
+/// обычные тесты идут без модели — факт сборки и FFI уже в dinet-llama.
+#[cfg(all(test, feature = "llama"))]
+mod llama_tests {
+    #[test]
+    fn webchat_llama_worker_bridge_responds() {
+        use dinet_chat::ChatModel;
+        let Some(path) = std::env::var("DI_NET_GGUF").ok() else {
+            return;
+        };
+        let mut m = dinet_llama::LlamaChatModel::spawn_worker(
+            std::path::PathBuf::from(path),
+            dinet_llama::LlamaOptions { max_tokens: 6, ..dinet_llama::LlamaOptions::default() },
+        );
+        let reply = m.respond("Скажи: привет", &[]);
+        assert!(!reply.trim().is_empty(), "мост llama.cpp вернул пустоту");
+        assert_eq!(m.name(), "llama.cpp(GGUF)");
     }
 }
