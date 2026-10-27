@@ -16,21 +16,9 @@
 
 use dinet_fl::toy_llm::{Sample, CTX, V};
 
-/// Микроязык чата: слово i = токен i (v1: натуральные токены llama.cpp).
-pub const LEX: [&str; V] = ["ай", "би", "ви", "ги", "ди", "ей", "жи", "зи"];
-
-/// Текст (пробелы-разделённые слова микроязыка) → токены.
-/// Неизвестное слово → None (в v1 — натуральный токенизатор,词条 не выкидываем).
-pub fn lex_to_tokens(text: &str) -> Option<Vec<u8>> {
-    let mut t = Vec::new();
-    for w in text.split_whitespace() {
-        match LEX.iter().position(|l| *l == w) {
-            Some(i) => t.push(i as u8),
-            None => return None,
-        }
-    }
-    if t.is_empty() { None } else { Some(t) }
-}
+/// Микроязык чата: слово i = токен i (канон в `dinet_fl::toy_llm`; v1:
+/// натуральные токены llama.cpp — клиент НЕ держит собственную копию).
+pub use dinet_fl::toy_llm::{lex_to_tokens, LEX};
 
 /// Пара диалога → обучающий sample:
 /// ctx = первые 4 токена prompt, chosen = СЛОВО-ответ учителя (клиента),
