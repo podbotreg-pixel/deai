@@ -10,6 +10,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinet-client"
+version = "0.1.0"
+dependencies = [
+ "dinet-crypto",
+ "dinet-fl",
+ "dinet-node",
+]
+
+[[package]]
 name = "dinet-core"
 version = "0.1.0"
 

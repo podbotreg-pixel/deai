@@ -55,6 +55,11 @@ rm -rf /tmp/swarm && \
 cargo run -p dinet-node --bin spoolswarm -- /tmp/swarm --pid 0 --procs 2 --nodes 4 --eras 4 &
 cargo run -p dinet-node --bin spoolswarm -- /tmp/swarm --pid 1 --procs 2 --nodes 4 --eras 4
                              # оба процесса сходятся к одним чек-пойнтам
+# РАСПРЕДЕЛЁННОЕ ОБУЧЕНИЕ: клиенты чата = учители роя, каждый учится на СВОИХ диалогах:
+rm -rf /tmp/opencode/clients && \
+cargo run -p dinet-client --bin clientswarm -- /tmp/opencode/clients --pid 0 --procs 2 --clients 4 --eras 8 &
+cargo run -p dinet-client --bin clientswarm -- /tmp/opencode/clients --pid 1 --procs 2 --clients 4 --eras 8
+                             # юзер говорит → локальный fit → вклад в эру → чек-пойнт 0.08→0.85
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem

@@ -1,0 +1,15 @@
+[package]
+name = "dinet-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Клиент DI-NET: чат → speak→learn → локальный fit → подписанный вклад в рой"
+
+[dependencies]
+dinet-crypto = { path = "../dinet-crypto" }
+dinet-fl = { path = "../dinet-fl" }
+dinet-node = { path = "../dinet-node" }
+
+[[bin]]
+name = "clientswarm"
+path = "src/bin/clientswarm.rs"

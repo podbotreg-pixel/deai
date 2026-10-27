@@ -79,6 +79,10 @@ pub struct Node {
     pub rejected_frames: u32,
     /// sim-метка отравителя
     pub byz: bool,
+    /// РЕАЛЬНЫЕ данные клиента (диалоги чата, dtype `Sample`): Some —
+    /// local_batch отдаёт их вместо sim-честного/отравленного батча.
+    /// Точка прикрепления клиента-пользователя: dinet-client::pair_to_sample.
+    pub batch_override: Option<Vec<Sample>>,
 }
 
 impl Node {
@@ -94,10 +98,14 @@ impl Node {
             last_cp: [0u8; 32],
             rejected_frames: 0,
             byz,
+            batch_override: None,
         }
     }
 
     fn local_batch(&self, n: u32) -> Vec<Sample> {
+        if let Some(real) = &self.batch_override {
+            return real.clone();
+        }
         if self.byz {
             byz_batch(n, 9_001 + self.id as u64)
         } else {
@@ -923,6 +931,23 @@ mod tests {
             assert_eq!(a[i].adapter.as_vec(), nodes_full[i].adapter.as_vec(), "узел {i}");
             assert_eq!(b[i].adapter.as_vec(), nodes_full[i + 3].adapter.as_vec(), "узел {}", i + 3);
         }
+    }
+
+    #[test]
+    fn client_data_replaces_sim_batch() {
+        // batch_override — точка прикрепления dinet-client: реальный диалог
+        // клиента должен ВЫТЕСНЯТЬ sim-батч честного узла
+        let mut n = Node::new(0, 7, false);
+        assert_eq!(n.local_batch(8).len(), 8, "sim-батч honest");
+        n.batch_override = Some(vec![dinet_fl::toy_llm::Sample {
+            tokens: [1, 2, 3, 4],
+            chosen: 5,
+            rejected: Some(0),
+        }]);
+        let b = n.local_batch(8);
+        assert_eq!(b.len(), 1, "только данные клиента");
+        assert_eq!(b[0].tokens, [1, 2, 3, 4]);
+        assert_eq!(b[0].chosen, 5);
     }
 
     #[test]
