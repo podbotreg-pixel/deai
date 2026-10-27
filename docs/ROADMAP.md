@@ -47,8 +47,13 @@
       loopback своих публикаций); 4 узла × 2 эры (masked+REVEAL) по фазам
       publish→collect/vote→tally на одном TCP-стеке — реплики БИТ-В-БИТ равны
       in-memory симуляции (mean acc 0.542, детерминизм роя цел). Осталось
-      надстроить QUIC/WS, Kademlia DHT, mDNS, PEX, 5 источников bootstrap и
-      порвать с sim-выводом ключей (настоящий клиент генерирует и шлёт pubkey)
+      надстроить QUIC/WS, Kademlia DHT, mDNS, PEX, 5 источников bootstrap
+- [x] v1-идентичность клиента: `dinet-crypto::random_seed` (getrandom),
+      `Ed25519Signer::generate()` — СВЕЖАЯ пара от энтропии ОС, вместо sim-вывода
+      ключей из id; хранитель seed `load_or_create_seed` (32 байта, 0600 unix,
+      битый файл = честная ошибка) — участник переживает рестарт с тем же DID;
+      `spawn_node_generated()` в dinet-p2p поднимает сетевой узел на такой паре.
+      Осталось: обмен pubkey в Hello/PEX и подпись эр webchat-клиента
 - [x] Transport v0 в симуляции: обмен РЕАЛЬНЫМИ подписанными wire-кадрами dinet-proto
       (in-memory mesh + файловый спул между процессами; подделка payload → отбраковка по подписи)
 - [x] Рой в разных ОС-процессах (`spoolswarm`): процесс владеет частью узлов,

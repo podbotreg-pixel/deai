@@ -125,6 +125,16 @@ pub struct NodeHandle {
     pub peer_id: PeerId,
 }
 
+/// v1-идентичность: поднять узел со СВЕЖЕЙ парой от энтропии ОС
+/// (в отличие от `spawn_node(seed)` сим-артефакта). Возвращает (handle, seed):
+/// seed стоит хранить (рестарт с тем же seed = тот же участник роя и тот же
+/// DID; `dinet_crypto::load_or_create_seed` делает это за один вызов).
+pub async fn spawn_node_generated() -> Result<(NodeHandle, [u8; 32]), String> {
+    let seed = dinet_crypto::random_seed()?;
+    let h = spawn_node(seed).await?;
+    Ok((h, seed))
+}
+
 /// Запустить сетевую задачу узла (tokio-рантайм должен быть снаружи).
 pub async fn spawn_node(seed: [u8; 32]) -> Result<NodeHandle, String> {
     let (mut swarm, peer_id) = build_swarm(seed)?;

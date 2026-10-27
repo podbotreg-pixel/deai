@@ -296,13 +296,21 @@ pub struct Ed25519Signer {
 }
 
 impl Ed25519Signer {
-    /// Ключевая пара из 32-байт seed (детерминированная; для реального роя —
-    /// сгенерированная и хранимая клиентом состояние).
+    /// Ключевая пара из 32-байт seed (детерминированная; для симуляций и
+    /// воспроизводимых тестов — `from_seed`; реальный клиент ходит через
+    /// `generate()` и хранит seed на диске).
     pub fn from_seed(seed: &[u8; ED25519_PUB_LEN]) -> Self {
         let sk = ed25519_dalek::SigningKey::from_bytes(seed);
         let pub_bytes = sk.verifying_key().to_bytes();
         let did = did_key(&pub_bytes);
         Ed25519Signer { sk, pub_bytes, did }
+    }
+
+    /// СВЕЖАЯ ключевая пара от энтропии ОС (v1: клиент генерирует ключи сам, а
+    /// не выводит их из id). Seed стоит сохранить (`seed::save`) — после
+    /// рестарта это тот же участник роя с тем же DID.
+    pub fn generate() -> Result<Self, String> {
+        Ok(Self::from_seed(&random_seed()?))
     }
 
     /// Публичный ключ (то, что уходит в wire-кадр как sender).
@@ -338,6 +346,53 @@ impl Signer for Ed25519Signer {
         use ::signature::Signer as _; // trait из signature 3 (крейт-деп)
         self.sk.sign(msg).to_bytes()
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1-идентичность: энтропия ОС + хранитель seed на диске.
+// ---------------------------------------------------------------------------
+// Реальный клиент ГЕНЕРИРУЕТ ключи сам и ПЕРЕНОСИТ их через рестарты:
+// 32-байт seed сохраняется в файл с правами 0600 (unix), откуда грузится
+// при каждом запуске. Симуляционный `from_seed([id;32])` остаётся только
+// для воспроизводимых тестов.
+
+/// 32 байта энтропии от ОС (getrandom: getrandom(2)/getentropy).
+pub fn random_seed() -> Result<[u8; ED25519_PUB_LEN], String> {
+    let mut s = [0u8; ED25519_PUB_LEN];
+    getrandom::getrandom(&mut s).map_err(|e| format!("энтропия ОС: {e}"))?;
+    Ok(s)
+}
+
+/// Открыть (или создать) файл хранителя seed: 32 сырых байта.
+/// Созданный объект занимает права 0600 (unix-only), чтобы секрет
+/// не читался соседями по машине.
+pub fn load_or_create_seed(path: &std::path::Path) -> Result<[u8; ED25519_PUB_LEN], String> {
+    if path.exists() {
+        let raw = std::fs::read(path).map_err(|e| format!("seed-файл: {e}"))?;
+        if raw.len() != ED25519_PUB_LEN {
+            return Err(format!(
+                "seed-файл {} повреждён: {} байт вместо {ED25519_PUB_LEN}",
+                path.display(),
+                raw.len()
+            ));
+        }
+        let mut s = [0u8; ED25519_PUB_LEN];
+        s.copy_from_slice(&raw);
+        return Ok(s);
+    }
+    let seed = random_seed()?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("seed-каталог: {e}"))?;
+        }
+    }
+    std::fs::write(path, &seed).map_err(|e| format!("seed-запись: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(seed)
 }
 
 /// ВерификаторPeerBook: только публичный ключ, никакого секрета.
@@ -544,6 +599,41 @@ mod tests {
     fn did_round_shape() {
         let did = did_key(&[7u8; 32]);
         assert!(did.starts_with("did:key:z"));
+    }
+
+    /// v1-идентичность: сгенерированная пара подписывает/проверяется,
+    /// две генерации различаются (2^-256 коллизия ≠ случайности теста).
+    #[test]
+    fn generated_keys_sign_and_differ() {
+        let a = Ed25519Signer::generate().expect("генерация ОС");
+        let b = Ed25519Signer::generate().expect("генерация ОС");
+        assert_ne!(a.pubkey(), b.pubkey(), "две генерации совпали?!");
+        let msg = b"v1 identity: client owns its keys";
+        let sig = Signer::sign(&a, msg);
+        assert!(a.verify(msg, &sig), "сгенерированная пара не проверяется");
+        assert!(!b.verify(msg, &sig), "чужая подпись прошла");
+    }
+
+    /// Хранитель seed: первый вызов создаёт (0600 unix), второй возвращает
+    /// ТОТ ЖЕ seed — участник переживает рестарт; битый файл ловится.
+    #[test]
+    fn seed_store_roundtrip_and_corrupt_reject() {
+        let dir = std::env::temp_dir().join(format!("dinet-seed-{}", std::process::id()));
+        let path = dir.join("id.key");
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1 = load_or_create_seed(&path).expect("создание");
+        let s2 = load_or_create_seed(&path).expect("загрузка");
+        assert_eq!(s1, s2, "рестарт сменил идентичность!");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "права seed-файла не 0600");
+        }
+        // битый файл — честная ошибка, не молчаливый сброс идентичности
+        std::fs::write(&path, b"it").unwrap();
+        assert!(load_or_create_seed(&path).is_err(), "битый seed-файл принят");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn hex(b: &[u8]) -> String {
