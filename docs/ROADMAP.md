@@ -31,8 +31,12 @@
 
 ## M1 — Рой (6 недель)
 
-- [ ] libp2p: QUIC+WS, gossipsub, Kademlia DHT, mDNS, PEX, 5 источников bootstrap
-      (точка прикрепления: трейт `transport::Transport` — тот же wire-набор 0x11/0x22/0x30/0x31)
+- [x] libp2p прикреплён (`dinet-p2p`): РЕАЛЬНАЯ сеть TCP+Noise+Yamux+gossipsub на
+      localhost — `p2pmesh` поднимает N узлов, полный меш, каждый публикует
+      ПОДПИСАННЫЙ wire-кадр dinet-proto (ed25519 did:key), приёмники проверяют
+      подписи; сетевой тест хранит 3-узловой обмен зелёным (1.5 с). Осталось
+      надстроить QUIC/WS, Kademlia DHT, mDNS, PEX, 5 источников bootstrap и
+      мост в трейт `Transport` (тот же wire-набор 0x11/0x22/0x30/0x31)
 - [x] Transport v0 в симуляции: обмен РЕАЛЬНЫМИ подписанными wire-кадрами dinet-proto
       (in-memory mesh + файловый спул между процессами; подделка payload → отбраковка по подписи)
 - [x] Рой в разных ОС-процессах (`spoolswarm`): процесс владеет частью узлов,

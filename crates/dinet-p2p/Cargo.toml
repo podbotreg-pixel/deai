@@ -1,0 +1,16 @@
+[package]
+name = "dinet-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Реальная p2p-сеть DI-NET: libp2p (TCP+Noise+Yamux+gossipsub) под wire-кадрами dinet-proto"
+
+[dependencies]
+dinet-crypto = { path = "../dinet-crypto" }
+dinet-proto = { path = "../dinet-proto" }
+
+libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+futures = "0.3"
+
+[dev-dependencies]
