@@ -13,6 +13,7 @@ dependencies = [
 name = "dinet-client"
 version = "0.1.0"
 dependencies = [
+ "dinet-chat",
  "dinet-crypto",
  "dinet-fl",
  "dinet-node",

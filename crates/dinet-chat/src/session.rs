@@ -174,6 +174,18 @@ impl ChatSession {
         Ok((answer, ctx))
     }
 
+    /// Обучающая пара ОТ УЧИТЕЛЯ: юзер сам даёт правильный ответ
+    /// (speak→learn без хода модели). Возвращает индекс пары; пара и оба
+    /// текста уходят в память (RAG-контекст учителя тоже находит).
+    pub fn teach(&mut self, prompt: &str, answer: &str, ts: u64) -> std::io::Result<u64> {
+        let pair_idx = next_counter(&mut self.store, P_PAIR_NEXT)?;
+        let pair = LearnPair { ts, prompt: prompt.to_string(), answer: answer.to_string() };
+        self.store.put(&format!("{P_PAIR}{pair_idx:020}"), &encode_pair(&pair))?;
+        let _ = store_doc(&mut self.store, prompt, ts)?;
+        let _ = store_doc(&mut self.store, answer, ts)?;
+        Ok(pair_idx)
+    }
+
     /// Вся история (в порядке накопления).
     pub fn turns(&self) -> Vec<Turn> {
         self.store
@@ -309,6 +321,22 @@ mod tests {
         assert_eq!(top.len(), 1);
         assert!(top[0].1.contains("Саратов"), "{:?}", top);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn teacher_pair_persists_without_model_turn() {
+        let dir = tmpdir("teach");
+        let mut s = ChatSession::open(&dir.join("session.dlog")).expect("open");
+        let now = 1_700_000_000;
+        let idx = s.teach("ай ви ди би", "ви", now).expect("teach");
+        assert_eq!(idx, 1);
+        assert_eq!(s.pending_pairs(), 1);
+        let p = &s.pairs()[0];
+        assert_eq!(p.prompt, "ай ви ди би");
+        assert_eq!(p.answer, "ви");
+        assert_eq!(p.ts, now);
+        // учительские тексты тоже в памяти RAG
+        assert!(!s.ask_memory("правильный ответ ви", 5).is_empty());
     }
 
     #[test]

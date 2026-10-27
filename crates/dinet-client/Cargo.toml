@@ -7,6 +7,7 @@ description = "Клиент DI-NET: чат → speak→learn → локальн�
 
 [dependencies]
 dinet-crypto = { path = "../dinet-crypto" }
+dinet-chat = { path = "../dinet-chat" }
 dinet-fl = { path = "../dinet-fl" }
 dinet-node = { path = "../dinet-node" }
 

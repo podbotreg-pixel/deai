@@ -60,6 +60,10 @@ rm -rf /tmp/opencode/clients && \
 cargo run -p dinet-client --bin clientswarm -- /tmp/opencode/clients --pid 0 --procs 2 --clients 4 --eras 8 &
 cargo run -p dinet-client --bin clientswarm -- /tmp/opencode/clients --pid 1 --procs 2 --clients 4 --eras 8
                              # юзер говорит → локальный fit → вклад в эру → чек-пойнт 0.08→0.85
+# ГРАФИЧЕСКАЯ ОБОЛОЧКА: чат в браузере + вклад клиента в рой с живого ввода:
+cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
+                             # открой http://localhost:8080 (std-only, страница вшита в бинарник;
+                             # Tauri 2 позже завернёт ЭТУ ЖЕ страницу в окно без переписывания)
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
