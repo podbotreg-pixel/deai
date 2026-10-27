@@ -27,7 +27,7 @@ fn main() {
     };
     println!("DI-NET чат: {path:?} ({} ходов, {} фактов)", sess.turns().len(), sess.memory_count());
     println!("{USAGE}");
-    let mut model = ToyChatModel;
+    let mut model = ToyChatModel::default();
     let stdin = std::io::stdin();
     let mut clock: u64 = 1;
     loop {

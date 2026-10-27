@@ -24,6 +24,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,7 @@ use dinet_chat::{ChatSession, Role, ToyChatModel};
 use dinet_client::pairs_to_batch;
 use dinet_fl::toy_llm::toy_world::honesty_batch;
 use dinet_fl::toy_llm::ToyModel;
+use dinet_memory::kv::KvStore;
 use dinet_node::swarm::{accuracy, run_era_partition, Node, SimConfig};
 use dinet_node::transport::MeshTransport;
 
@@ -142,6 +144,8 @@ struct EraNode {
     valid: Vec<(String, String)>, // валидные учителя пары (микроязык)
     eras: u32,
     cps: u32,
+    /// persist-хранилище роя: последний чек-пойнт (адаптер + счётчики)
+    kv: KvStore,
 }
 
 struct ChatState {
@@ -174,8 +178,20 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
     match r.checkpoint_id {
         Some(_) => {
             e.cps += 1;
+            // ЧЕК-ПАЙНТ В ЖИЗНЬ КЛИЕНТА: реплика роя теперь отвечает в чате
+            // и переживает рестарт (append-only KV: tmp+rename атомарен)
+            let cps = u64::from(e.cps);
+            let eras = u64::from(e.eras);
+            let ab: Vec<u8> = e.node.adapter.as_vec().iter().fold(Vec::new(), |mut v, x| {
+                v.extend_from_slice(&x.to_le_bytes());
+                v
+            });
+            let kv = &mut e.kv;
+            let _ = kv.put("roй:adapter", &ab);
+            let _ = kv.put("roй:cps", &cps.to_le_bytes());
+            let _ = kv.put("roй:eras", &eras.to_le_bytes());
             println!(
-                "[эра {}] REVEAL: вклад {} пар, acc {:.3}→{:.3}, чек-пойнт принят ({}-й)",
+                "[эра {}] REVEAL: вклад {} пар, acc {:.3}→{:.3}, чек-пойнт {}-й ПРИМЕНЁН К ЧАТУ",
                 r.era, e.valid.len(), r.accuracy_before, r.accuracy_after, e.cps
             );
         }
@@ -201,7 +217,14 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 return;
             }
             let mut g = st.session.lock().expect("session lock");
-            let mut model = ToyChatModel;
+            // чат отвечает РЕПЛИКОЙ РОЯ: последний принятый чек-пойнт
+            let mut model = {
+                let e = st.era.lock().expect("era lock");
+                ToyChatModel::trained(ToyModel {
+                    base: e.node.base.clone(),
+                    adapter: e.node.adapter.clone(),
+                })
+            };
             match g.turn(&mut model, &user, now_ts()) {
                 Ok((answer, ctx)) => {
                     let n = ctx.len();
@@ -334,11 +357,44 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // рой-KV чек-пойнтов: последний принятый адаптер переживает рестарт
+    let roi_path = Path::new(&dir).with_extension("roi");
+    let kv = match KvStore::open(&roi_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("рой-KV {roi_path:?} не открылся: {e}");
+            std::process::exit(1);
+        }
+    };
+    let kver = |k: &str| -> u64 {
+        kv.get(k)
+            .map(|b| {
+                let mut a = [0u8; 8];
+                let n = b.len().min(8);
+                a[..n].copy_from_slice(&b[..n]);
+                u64::from_le_bytes(a)
+            })
+            .unwrap_or(0)
+    };
+    let eras = u32::try_from(kver("roй:eras")).unwrap_or(0).min(u32::MAX - 1);
+    let cps = u32::try_from(kver("roй:cps")).unwrap_or(0).min(u32::MAX - 1);
+    let mut node = Node::new(0, 7, false);
+    if let Some(ab) = kv.get("roй:adapter") {
+        let vals: Vec<f32> = ab
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        if vals.len() == dinet_fl::toy_llm::LoRAAdapter::num_params() {
+            node.adapter = dinet_fl::toy_llm::LoRAAdapter::from_vec(&vals);
+            println!("RESTORE рой-реплика из {roi_path:?}: эр {eras}, чек-пойнтов {cps}");
+        }
+    }
     let era = EraNode {
-        node: Node::new(0, 7, false),
+        node,
         valid: Vec::new(),
-        eras: 0,
-        cps: 0,
+        eras,
+        cps,
+        kv,
     };
     let st = Arc::new(ChatState {
         session: Mutex::new(session),

@@ -272,7 +272,7 @@ mod tests {
         let dir = tmpdir("flow");
         let path = dir.join("session.dlog");
         let mut s = ChatSession::open(&path).unwrap();
-        let mut m = ToyChatModel;
+        let mut m = ToyChatModel::default();
         let (a1, _) = s.turn(&mut m, "я люблю борщ со сметаной", 100).unwrap();
         assert!(a1.contains("память пуста"), "первый ход без памяти: {a1}");
         let (a2, _) = s.turn(&mut m, "что я люблю?", 101).unwrap();
@@ -310,7 +310,7 @@ mod tests {
         let path = dir.join("session.dlog");
         {
             let mut s = ChatSession::open(&path).unwrap();
-            let mut m = ToyChatModel;
+            let mut m = ToyChatModel::default();
             s.turn(&mut m, "город — Саратов", 5).unwrap();
         }
         let s = ChatSession::open(&path).unwrap();
@@ -344,7 +344,7 @@ mod tests {
         let dir = tmpdir("pair");
         let path = dir.join("session.dlog");
         let mut s = ChatSession::open(&path).unwrap();
-        let mut m = ToyChatModel;
+        let mut m = ToyChatModel::default();
         s.turn(&mut m, "промпт с кириллицей и «длинной» — репой", 7).unwrap();
         let p = s.pairs();
         assert_eq!(p.len(), 1);

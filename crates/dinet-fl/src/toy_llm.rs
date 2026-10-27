@@ -114,6 +114,7 @@ impl LoRAAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ToyModel {
     pub base: ToyBase,
     pub adapter: LoRAAdapter,
@@ -301,6 +302,25 @@ impl LoRAAdapter {
         v.extend(b_delta);
         v
     }
+}
+
+// ---------------------------------------------------------------------------
+// Микроязык чата v0: слово i = токен i. Точки прикрепления llama.cpp:
+// v1 заменит lex_to_tokens на натуральный токенизатор реальных текстов.
+// ---------------------------------------------------------------------------
+
+pub const LEX: [&str; V] = ["ай", "би", "ви", "ги", "ди", "ей", "жи", "зи"];
+
+/// Текст (пробелы-разделённые слова микроязыка) → токены; неизвестное слово → None.
+pub fn lex_to_tokens(text: &str) -> Option<Vec<u8>> {
+    let mut t = Vec::new();
+    for w in text.split_whitespace() {
+        match LEX.iter().position(|l| *l == w) {
+            Some(i) => t.push(i as u8),
+            None => return None,
+        }
+    }
+    if t.is_empty() { None } else { Some(t) }
 }
 
 /// Тест-хелпер: «правильный» локальный язык семьи (легко выучить);

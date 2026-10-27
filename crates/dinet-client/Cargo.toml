@@ -9,6 +9,7 @@ description = "Клиент DI-NET: чат → speak→learn → локальн�
 dinet-crypto = { path = "../dinet-crypto" }
 dinet-chat = { path = "../dinet-chat" }
 dinet-fl = { path = "../dinet-fl" }
+dinet-memory = { path = "../dinet-memory" }
 dinet-node = { path = "../dinet-node" }
 
 [[bin]]

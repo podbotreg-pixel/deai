@@ -6,6 +6,7 @@ version = 4
 name = "dinet-chat"
 version = "0.1.0"
 dependencies = [
+ "dinet-fl",
  "dinet-memory",
 ]
 
@@ -16,6 +17,7 @@ dependencies = [
  "dinet-chat",
  "dinet-crypto",
  "dinet-fl",
+ "dinet-memory",
  "dinet-node",
 ]
 

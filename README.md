@@ -64,6 +64,9 @@ cargo run -p dinet-client --bin clientswarm -- /tmp/opencode/clients --pid 1 --p
 cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
                              # открой http://localhost:8080 (std-only, страница вшита в бинарник;
                              # Tauri 2 позже завернёт ЭТУ ЖЕ страницу в окно без переписывания)
+                             # кнопка «Учить» = пара учителя → каждые 4 пары локальная эра роя
+                             # → REVEAL-эра принимает чек-пойнт → ЧАТ ОТВЕЧАЕТ ОБУЧЕННОЙ РЕПЛИКОЙ
+                             # (реплика переживает рестарт: ./dinet-web-mem.roi)
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
