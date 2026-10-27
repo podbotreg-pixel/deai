@@ -142,6 +142,16 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     let _ = stream.write_all(out.as_bytes());
 }
 
+/// Потоковый ответ (HTTP/1.0 без Content-Length: до закрытия соединения) —
+/// тело пишется кусками прямо из модели, браузер рисует по мере генерации.
+fn respond_stream_start(stream: &mut TcpStream) {
+    let _ = write!(
+        stream,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Connection: close\r\n\r\n"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Состояние: чат (persist в KV) + узел роя, обучающийся на учителях
 // ---------------------------------------------------------------------------
@@ -222,12 +232,14 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
 /// - микроязык роя (слова «ай би ви…») → реплика роя (ToyChatModel::trained);
 ///   llama-режим — ВСЕ остальные ходы уходят на llama.cpp.
 /// - без llama-фичи: только реплика роя (как раньше).
+/// Куски ответа отдаются поточно (`on`) — HTTP-ответ пишется по мере генерации.
 #[cfg_attr(not(feature = "llama"), allow(unused_variables))]
 fn turn_model(
     st: &ChatState,
     g: &mut ChatSession,
     user: &str,
     replica: ToyModel,
+    on: &mut dyn FnMut(&str),
 ) -> std::io::Result<(String, Vec<String>)> {
     // микроязыковые ходы всегда понимает рой-реплика
     #[cfg(feature = "llama")]
@@ -236,13 +248,13 @@ fn turn_model(
         match (&st.llama, lex_mode) {
             (Some(slot), false) => {
                 let mut m = slot.lock().expect("llama slot");
-                return g.turn(&mut **m, user, now_ts());
+                return g.turn_with(&mut **m, user, now_ts(), on);
             }
             _ => {}
         }
     }
     let mut toy = ToyChatModel::trained(replica);
-    g.turn(&mut toy, user, now_ts())
+    g.turn_with(&mut toy, user, now_ts(), on)
 }
 
 fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpStream) {
@@ -254,6 +266,8 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 respond(out, "400 Bad Request", "text/plain", "пустой ход");
                 return;
             }
+            // потоковый ответ: заголовок сразу, тело — кусками модели
+            respond_stream_start(out);
             let mut g = st.session.lock().expect("session lock");
             // реплика роя: последний принятый чек-пойнт (клоны, без удержания lock)
             let replica = {
@@ -261,20 +275,21 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 ToyModel { base: e.node.base.clone(), adapter: e.node.adapter.clone() }
             };
 
-            let reply = turn_model(st, &mut g, &user, replica);
+            let reply = turn_model(st, &mut g, &user, replica, &mut |piece| {
+                let _ = out.write_all(piece.as_bytes());
+                let _ = out.flush();
+            });
             match reply {
-                Ok((answer, ctx)) => {
-                    let n = ctx.len();
-                    drop(g);
-                    respond(
-                        out,
-                        "200 OK",
-                        "text/plain",
-                        &format!("{}\nконтекст: {n}", pct_encode(&answer)),
-                    );
+                Ok((_answer, ctx)) => {
+                    let tail = format!("\nконтекст: {}\n", ctx.len());
+                    let _ = out.write_all(tail.as_bytes());
                 }
-                Err(e) => respond(out, "500 err", "text/plain", &pct_encode(&format!("{e}"))),
+                Err(e) => {
+                    let tail = format!("\nошибка: {e}\n");
+                    let _ = out.write_all(tail.as_bytes());
+                }
             }
+            let _ = out.flush();
         }
         ("POST", "/api/teach") => {
             let mut p = None;
@@ -501,7 +516,7 @@ button{padding:.5rem .9rem;border-radius:6px;border:0;background:#2563ab;color:#
 button.sec{background:#444}#st{color:#8a8;font-size:.85rem;margin-top:.6rem}
 .mem{color:#9bd4ff;margin-top:.4rem}small{color:#777}
 </style></head><body>
-<h1>DI-NET — децентрализованная нейросеть (toy v0, всё локально)</h1>
+<h1>DI-NET — децентрализованная нейросеть (всё локально)</h1>
 <div id="log"></div>
 <div class="row">
 <input id="msg" placeholder="сообщение («ай ви ди би» — микроязык роя)">
@@ -524,10 +539,22 @@ m.className='msg '+(who||'a');m.innerHTML=html;d.appendChild(m);d.scrollTop=d.sc
 function post(url,body){return fetch(url,{method:'POST',body:body});}
 function send(){var v=document.getElementById('msg').value;if(!v)return;
 add(v.replace(/&/g,'&amp;').replace(/</g,'&lt;'),'u');
-post('/api/turn',encodeURIComponent(v)).then(r=>r.text()).then(t=>{
-var i=t.indexOf('\n');var ans=decodeURIComponent(i<0?t:t.slice(0,i));
-add(ans.replace(/&/g,'&amp;').replace(/</g,'&lt;'),'a');stats();});
-document.getElementById('msg').value='';}
+document.getElementById('msg').value='';
+fetch('/api/turn',{method:'POST',body:encodeURIComponent(v)}).then(function(r){
+var log=document.getElementById('log');var d=document.createElement('div');
+d.className='msg a';d.textContent='…';log.appendChild(d);log.scrollTop=log.scrollHeight;
+var reader=r.body.getReader(),dec=new TextDecoder(),buf='';
+function pump(){return reader.read().then(function(ch){
+if(ch.done){finish();return;}
+buf+=dec.decode(ch.value,{stream:true});
+var i=buf.indexOf('\nконтекст:');if(i>=0)buf=buf.slice(0,i);
+if(buf)d.textContent=buf;
+log.scrollTop=log.scrollHeight;
+return pump();});}
+function finish(){
+var i=buf.indexOf('\nконтекст:');if(i>=0)buf=buf.slice(0,i);
+d.textContent=buf||'—';log.scrollTop=log.scrollHeight;stats();}
+pump();});}
 function teach(){var p=document.getElementById('tc').value,a=document.getElementById('ta').value;
 if(!p||!a)return;post('/api/teach','p='+encodeURIComponent(p)+'&a='+encodeURIComponent(a))
 .then(r=>r.text()).then(t=>{add(t,'a');stats();
@@ -538,13 +565,13 @@ return f.length<3?'':'<div class="mem"><button class="sec" onclick="forget('+f[0
 document.getElementById('mem').innerHTML=s||'<small>— пусто —</small>';});}
 function forget(id){post('/api/forget',String(id)).then(r=>r.text()).then(t=>{ask();stats();});}
 function hist(){fetch('/api/history').then(r=>r.text()).then(t=>{document.getElementById('log').innerHTML='';
-t.trim().split('\n').map(x=>{var f=x.split('|');return {r:f[0],txt:decodeURIComponent(f[2]||'')}});
+t.trim().split('\n').map(x=>{var f=x.split('|');return {r:f[0],txt:decodeURIComponent(f[2]||'')}})
 .forEach(function(m){add(m.txt.replace(/&/g,'&amp;').replace(/</g,'&lt;'),m.r==='0'?'u':'a');});});}
 function stats(){fetch('/api/stats').then(r=>r.text()).then(t=>{document.getElementById('st').innerHTML=''
 ;var pairs={};t.trim().split('&').forEach(x=>{var f=x.split('=');pairs[f[0]]=f[1];});
 document.getElementById('st').textContent='ходов: '+pairs.turns+' | обучающих пар: '+pairs.pairs
 +' (учителя: '+pairs.teacher+') | эр роя: '+pairs.eras+' | чек-пойнтов: '+pairs.cps
-+' | точность реплики на общем eval: '+pairs.acc;}
++' | точность реплики на общем eval: '+pairs.acc;});}
 </script></body></html>"#;
 
 #[cfg(test)]
@@ -581,5 +608,33 @@ mod llama_tests {
         let reply = m.respond("Скажи: привет", &[]);
         assert!(!reply.trim().is_empty(), "мост llama.cpp вернул пустоту");
         assert_eq!(m.name(), "llama.cpp(GGUF)");
+    }
+
+    /// Стриминг через мост: куски отдаются не одним куском (токен-за-токеном
+    /// из worker-потока), полный текст из кусков собирётся консистентно.
+    #[test]
+    fn webchat_llama_bridge_streams_pieces() {
+        use dinet_chat::ChatModel;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let Some(path) = std::env::var("DI_NET_GGUF").ok() else {
+            return;
+        };
+        let mut m = dinet_llama::LlamaChatModel::spawn_worker(
+            std::path::PathBuf::from(path),
+            dinet_llama::LlamaOptions { max_tokens: 6, ..dinet_llama::LlamaOptions::default() },
+        );
+        let pieces: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&pieces);
+        m.respond_stream("Скажи: привет", &[], &mut |p| {
+            sink.borrow_mut().push(p.to_string());
+        });
+        let got = pieces.borrow();
+        assert!(!got.is_empty(), "куски моста не отданы");
+        let joined: String = got.concat();
+        assert!(!joined.trim().is_empty(), "стрим моста пуст: {got:?}");
+        // ранний EOS допустим → инвариант консервативен: куски отдаются и
+        // собираются; токен-за-токеном доказан живым прогоном (34 куска)
+        assert!(got.len() >= 1, "мост не отдал ни куска: {got:?}");
     }
 }

@@ -12,6 +12,15 @@ use dinet_fl::toy_llm::{lex_to_tokens, LEX, CTX, ToyModel};
 pub trait ChatModel {
     /// Ответ ассистента на ход пользователя с учётом контекста памяти.
     fn respond(&mut self, user: &str, context: &[String]) -> String;
+
+    /// Потоковое отвечание: куски отдаются немедленно по мере генерации
+    /// (llama.cpp — токен за токеном; GUI рисует текст пока модель думает).
+    /// Базовая реализация — весь ответ одним куском.
+    fn respond_stream(&mut self, user: &str, context: &[String], on: &mut dyn FnMut(&str)) {
+        let s = self.respond(user, context);
+        on(&s);
+    }
+
     /// Короткое имя модели (для статистики/журнала сессии).
     fn name(&self) -> &'static str;
 }

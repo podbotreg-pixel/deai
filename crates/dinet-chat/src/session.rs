@@ -149,13 +149,29 @@ impl ChatSession {
         user: &str,
         ts: u64,
     ) -> std::io::Result<(String, Vec<String>)> {
+        self.turn_with(model, user, ts, &mut |_| {})
+    }
+
+    /// Тот же ход со СТРИМИНГОМ кусков ответа наружу (GUI рисует текст
+    /// по мере генерации). persist идентичен `turn`.
+    pub fn turn_with(
+        &mut self,
+        model: &mut dyn ChatModel,
+        user: &str,
+        ts: u64,
+        on: &mut dyn FnMut(&str),
+    ) -> std::io::Result<(String, Vec<String>)> {
         // 1. RAG-контекст из памяти
         let ctx: Vec<String> = search_store(&self.store, user, 3)
             .into_iter()
             .map(|(d, _)| d.text)
             .collect();
-        // 2. модель
-        let answer = model.respond(user, &ctx);
+        // 2. модель (куски — сразу наружу и в накопитель ответа)
+        let mut answer = String::new();
+        model.respond_stream(user, &ctx, &mut |piece| {
+            answer.push_str(piece);
+            on(piece);
+        });
         // 3. persist: ходы (два отдельных id), память, пара обучения
         let user_idx = next_counter(&mut self.store, P_TURN_NEXT)?;
         let reply_idx = next_counter(&mut self.store, P_TURN_NEXT)?;
@@ -301,6 +317,34 @@ mod tests {
             "RAG-контекст донёс факт: {:?}",
             spy.contexts[1]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turn_streams_pieces_and_persists_same_as_turn() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tmpdir("stream");
+        let path = dir.join("session.dlog");
+        let mut s = ChatSession::open(&path).unwrap();
+        let mut m = ToyChatModel::default();
+        let pieces: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&pieces);
+        let (answer, ctx_len) = s
+            .turn_with(&mut m, "привет, рой", 7, &mut |p| {
+                sink.borrow_mut().push(p.to_string());
+            })
+            .unwrap();
+        // базовый ChatModel::respond_stream отдаёт ВЕСЬ ответ одним куском;
+        // полный текст == ответ turn
+        let got = pieces.borrow();
+        assert!(got.len() >= 1, "куски потока не отданы: {}", got.len());
+        assert_eq!(got.concat(), answer);
+        // persist идентичен turn: ходы/пара/память на месте, счётчик контекста честный
+        assert!(ctx_len.is_empty(), "первый ход без памяти");
+        assert_eq!(s.turns().len(), 2, "user+assistant ходы записаны");
+        assert_eq!(s.pending_pairs(), 1, "пара speak→learn записана");
+        assert_eq!(s.model_name(), "toy-v0");
         let _ = fs::remove_dir_all(&dir);
     }
 
