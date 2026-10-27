@@ -1,0 +1,10 @@
+[package]
+name = "dinet-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Точка прикрепления llama.cpp (GGUF Q4): ChatModel поверх llama-cpp-2 для DI-NET"
+
+[dependencies]
+dinet-chat = { path = "../dinet-chat" }
+llama-cpp-2 = "0.1"

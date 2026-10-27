@@ -75,6 +75,11 @@ cargo run -p dinet-p2p --bin p2pmesh -- 6
 cargo run -p dinet-p2p --bin p2pswarm -- 4 2
                              # 4 узла × 2 эры: реплики БИТ-В-БИТ равны in-memory симуляции —
                              # сетевой транспорт не меняет математику роя (mean acc 0.542)
+# РЕАЛЬНАЯ НЕЙРОСЕТЬ llama.cpp (GGUF): настоящая генерация на CPU:
+cargo run -p dinet-llama --bin llamachat -- /tmp/opencode/gemma270m.gguf "Привет! 2+2=?"
+                             # gemma-3-270m Q8 (реальный llama.cpp, — модель качается с HuggingFace);
+                             # LlamaChatModel реализует ТОТ ЖЕ трейт ChatModel, что и
+                             # микроязыковая сеть роя (webchat/Tauri подложит её флагом)
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem

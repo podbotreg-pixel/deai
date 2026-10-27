@@ -11,6 +11,7 @@ members = [
     "crates/dinet-chat",
     "crates/dinet-client",
     "crates/dinet-p2p",
+    "crates/dinet-llama",
 ]
 
 [workspace.package]

@@ -12,7 +12,14 @@
       PeerBook хранит ТОЛЬКО публичные ключи (Verifer/Signer-сплит), tamper-тест
       криптографичен; v1 — ключи, генерируемые клиентом, вместо sim-вывода из id
       (`dinet-crypto::Ed25519Signer/Ed25519Verifier`)
-- [ ] llama.cpp binding, GGUF Q4, стриминг токенов (точка прикрепления: LocalTrainer-интерфейс в dinet-fl)
+- [x] llama.cpp прикреплён (`dinet-llama`): llama-cpp-sys-2 собирает настоящий
+      llama.cpp из github (cmake, ~2 мин); `LlamaChatModel` — ChatModel на
+      GGUF (загрузка, реальные токенизация/decode/сэмплинг/детокенизация,
+      жадная или temp-генерация); проверен на живой SmolLM/Gemma-270M Q8 —
+      0.56 с/ход CPU; demo `llamachat` (GGUF подаётся путём; без файла —
+      копей-сборка)
+- [ ] Стриминг токенов в чат-UI + дообучение (train-cpp): точки прикрепления
+      `ChatModel::respond` (готов) и LocalTrainer (интерфейс в dinet-fl)
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp
