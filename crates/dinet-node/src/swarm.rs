@@ -138,7 +138,7 @@ fn peer_book(nodes: &[Node]) -> PeerBook {
 
 /// PeerBook по известным id роя (sim: ключи выводятся ДЕТЕРМЕНИРОВАНО из id;
 /// настоящий клиент обменивается реальными pubkey при handshake).
-fn peer_book_ids(ids: &[NodeId]) -> PeerBook {
+pub(crate) fn peer_book_ids(ids: &[NodeId]) -> PeerBook {
     let mut b = PeerBook {
         verifiers: BTreeMap::new(),
         nid_by_sender: BTreeMap::new(),
@@ -196,13 +196,13 @@ pub fn accuracy(model: &ToyModel, eval: &[Sample]) -> f32 {
 // Wire: сборка и проверка кадров
 // ---------------------------------------------------------------------------
 
-fn era_hash32(era: u32) -> [u8; 32] {
+pub(crate) fn era_hash32(era: u32) -> [u8; 32] {
     let mut b = b"dinet-era|".to_vec();
     b.extend_from_slice(&era.to_le_bytes());
     sha256(&b)
 }
 
-fn cand_hash32(era: u32, agg_delta: &[f32]) -> [u8; 32] {
+pub(crate) fn cand_hash32(era: u32, agg_delta: &[f32]) -> [u8; 32] {
     let mut b = b"dinet-cand|".to_vec();
     b.extend_from_slice(&era.to_le_bytes());
     for v in agg_delta {
@@ -221,7 +221,7 @@ fn bytes_to_fx(b: &[u8]) -> Vec<i64> {
         .collect()
 }
 
-fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> {
+pub(crate) fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> {
     let sender = node.signer.pubkey();
     let frame = Frame { msg_type: mt, sender, sig: [0u8; 64], payload };
     let body = frame.encode_payload().expect("payload помещается в лимит");
@@ -231,7 +231,7 @@ fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> {
 
 /// Разобрать входящие кадры: verify → Payload. Подделка = отбраковка.
 /// Возвращает (NodeId, payload); reject учитывается в me.rejected_frames.
-fn decode_frames(
+pub(crate) fn decode_frames(
     me: &mut Node,
     book: &PeerBook,
     wire: Vec<Vec<u8>>,

@@ -5,3 +5,6 @@ pub mod swarm;
 
 /// Транспорт wire-кадров (in-memory mesh + файловый спул; libp2p — точка прикрепления).
 pub mod transport;
+
+/// ФАЗА F нотариев: печать чек-пойнтов в append-only реестр роя.
+pub mod registry_phase;

@@ -10,6 +10,7 @@ dinet-crypto = { path = "../dinet-crypto" }
 dinet-proto = { path = "../dinet-proto" }
 dinet-core = { path = "../dinet-core" }
 dinet-fl = { path = "../dinet-fl" }
+dinet-registry = { path = "../dinet-registry" }
 
 [[bin]]
 name = "dinet-node"

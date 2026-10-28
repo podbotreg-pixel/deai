@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 pub const CH_SHARES: u8 = 0;
 pub const CH_VOTES: u8 = 1;
 pub const CH_ANNOUNCE: u8 = 2;
+/// Нотарные печати реестра чек-пойнтов (фаза F, после tally).
+pub const CH_NOTARY: u8 = 3;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

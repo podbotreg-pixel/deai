@@ -13,6 +13,8 @@ pub const SENDER_LEN: usize = 32;
 pub const SIG_LEN: usize = 64;
 pub const MAX_UPD_SHARE_PAYLOAD: usize = 24 * 1024 * 1024;
 pub const MAX_SKILL_SHARE_PAYLOAD: usize = 256 * 1024;
+/// Канон записи реестра: seq+3 id + acc + seals — порядок сотен байт.
+pub const MAX_SEAL_ENTRY: usize = 1024;
 pub const DEFAULT_FRAME_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,9 @@ const T_PATK: u8 = 27;
 const T_SHASH: u8 = 28;
 const T_ABI: u8 = 29;
 const T_BODY: u8 = 30;
+const T_SEAL_ENTRY: u8 = 31;
+const T_SEAL_PUB: u8 = 32;
+const T_SEAL_SIG: u8 = 33;
 const T_DELTA: u8 = 31;
 const T_NORM: u8 = 32;
 
@@ -81,6 +86,9 @@ pub enum MsgType {
     LazyAudit = 0x23,
     CheckpointAnnounce = 0x30,
     EvalVote = 0x31,
+    /// Нотарная печать реестра: канонические байты entry + подпись
+    /// нотариуса ПОВЕРХ канона (frame-подпись — отдельная, Transport-слой).
+    NotarySeal = 0x32,
     SkillShare = 0x40,
 }
 
@@ -100,6 +108,7 @@ impl MsgType {
             0x23 => MsgType::LazyAudit,
             0x30 => MsgType::CheckpointAnnounce,
             0x31 => MsgType::EvalVote,
+            0x32 => MsgType::NotarySeal,
             0x40 => MsgType::SkillShare,
             _ => return None,
         })
@@ -131,6 +140,9 @@ pub enum Payload {
     LazyAudit { auditor_id: [u8; 32], checkpoint_id: [u8; 32], ppl_before: f32, ppl_after: f32, verdict: bool },
     CheckpointAnnounce { id: [u8; 32], parent_id: [u8; 32], era_id: [u8; 32], merge_recipe_hash: [u8; 32], ppl: f32, pass_at_k: u8 },
     EvalVote { checkpoint_id: [u8; 32], ppl: f32, pass_at_k: u8 },
+    /// Печать нотариуса реестра чек-пойнтов: канон записи (dinet-registry
+    /// `RegistryEntry::encode()`), pubkey и подпись поверх канона.
+    NotarySeal { entry_bytes: Vec<u8>, seal_pubkey: Vec<u8>, seal_sig: Vec<u8> },
     SkillShare { skill_hash: [u8; 32], abi_version: u16, body: Vec<u8> },
 }
 
@@ -247,6 +259,11 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.b32(T_CPID, checkpoint_id);
             e.f32(T_PPL, *ppl);
             e.num(T_PATK, *pass_at_k as u32);
+        }
+        Payload::NotarySeal { entry_bytes, seal_pubkey, seal_sig } => {
+            e.bytes(T_SEAL_ENTRY, entry_bytes);
+            e.bytes(T_SEAL_PUB, seal_pubkey);
+            e.bytes(T_SEAL_SIG, seal_sig);
         }
         Payload::SkillShare { skill_hash, abi_version, body } => {
             e.b32(T_SHASH, skill_hash);
@@ -467,6 +484,11 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             checkpoint_id: d.b32(T_CPID)?,
             ppl: d.f32(T_PPL)?,
             pass_at_k: d.u8(T_PATK)?,
+        }),
+        MsgType::NotarySeal => Ok(Payload::NotarySeal {
+            entry_bytes: d.bytes(T_SEAL_ENTRY, MAX_SEAL_ENTRY)?,
+            seal_pubkey: d.bytes(T_SEAL_PUB, 64)?,
+            seal_sig: d.bytes(T_SEAL_SIG, 64)?,
         }),
         MsgType::SkillShare => Ok(Payload::SkillShare {
             skill_hash: d.b32(T_SHASH)?,

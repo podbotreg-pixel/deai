@@ -6,6 +6,7 @@ members = [
     "crates/dinet-core",
     "crates/dinet-fl",
     "crates/dinet-net",
+    "crates/dinet-registry",
     "crates/dinet-node",
     "crates/dinet-memory",
     "crates/dinet-chat",

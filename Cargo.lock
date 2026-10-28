@@ -727,6 +727,7 @@ dependencies = [
  "dinet-crypto",
  "dinet-fl",
  "dinet-proto",
+ "dinet-registry",
 ]
 
 [[package]]
@@ -744,6 +745,13 @@ dependencies = [
 
 [[package]]
 name = "dinet-proto"
+version = "0.1.0"
+dependencies = [
+ "dinet-crypto",
+]
+
+[[package]]
+name = "dinet-registry"
 version = "0.1.0"
 dependencies = [
  "dinet-crypto",

@@ -1,0 +1,9 @@
+[package]
+name = "dinet-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Реестр чек-пойнтов DI-NET: append-only лог с нотарными печатями + кусочная репликация дельт (std-only)"
+
+[dependencies]
+dinet-crypto = { path = "../dinet-crypto" }
