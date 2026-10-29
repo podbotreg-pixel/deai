@@ -19,6 +19,9 @@ pub const MAX_SEAL_ENTRY: usize = 1024;
 pub const MAX_BLOB_CANON: usize = 4 * 1024 * 1024;
 /// Кусок блоба: DEFAULT_CHUNK_LEN с запасом (крупные куски допустимы).
 pub const MAX_BLOB_CHUNK: usize = 1024 * 1024;
+/// Оффер реестра: пачка сетевых записей (реестр растёт линейно, но
+/// разные узлы могут отставать на сотни эр) — 4 МиБ с запасом.
+pub const MAX_REG_OFFER: usize = 4 * 1024 * 1024;
 pub const DEFAULT_FRAME_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +79,8 @@ const T_BLOB_ID: u8 = 34;
 const T_BLOB_CANON: u8 = 35;
 const T_BLOB_IDX: u8 = 36;
 const T_BLOB_BYTES: u8 = 37;
+const T_REG_HAVE: u8 = 38;
+const T_REG_REC: u8 = 39;
 const T_DELTA: u8 = 31;
 const T_NORM: u8 = 32;
 
@@ -106,6 +111,10 @@ pub enum MsgType {
     BlobChunkReq = 0x52,
     /// ответ куском: (manifest_id, idx, байты).
     BlobChunk = 0x53,
+    /// синхронизация реестра: «у меня столько записей, дай хвост».
+    RegAsk = 0x54,
+    /// ответ: сетевые байты записей после head просившего.
+    RegOffer = 0x55,
 }
 
 impl MsgType {
@@ -130,6 +139,8 @@ impl MsgType {
             0x51 => MsgType::BlobHave,
             0x52 => MsgType::BlobChunkReq,
             0x53 => MsgType::BlobChunk,
+            0x54 => MsgType::RegAsk,
+            0x55 => MsgType::RegOffer,
             _ => return None,
         })
     }
@@ -139,6 +150,7 @@ impl MsgType {
             MsgType::SkillShare => MAX_SKILL_SHARE_PAYLOAD,
             MsgType::BlobHave => MAX_BLOB_CANON,
             MsgType::BlobChunk => MAX_BLOB_CHUNK,
+            MsgType::RegOffer => MAX_REG_OFFER,
             _ => DEFAULT_FRAME_LIMIT,
         }
     }
@@ -173,6 +185,10 @@ pub enum Payload {
     BlobChunkReq { manifest_id: [u8; 32], idx: u32 },
     /// torrent: ответ куском (байты верифицируются хэшем манифеста).
     BlobChunk { manifest_id: [u8; 32], idx: u32, bytes: Vec<u8> },
+    /// синхронизация реестра: «у меня столько записей, дай хвост».
+    RegAsk { have: u32 },
+    /// хвост чужого реестра: пачка сетевых байтов записей (encode_record).
+    RegOffer { records: Vec<Vec<u8>> },
     SkillShare { skill_hash: [u8; 32], abi_version: u16, body: Vec<u8> },
 }
 
@@ -311,6 +327,14 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.num(T_BLOB_IDX, *idx);
             e.bytes(T_BLOB_BYTES, bytes);
         }
+        Payload::RegAsk { have } => {
+            e.num(T_REG_HAVE, *have);
+        }
+        Payload::RegOffer { records } => {
+            for r in records {
+                e.bytes(T_REG_REC, r);
+            }
+        }
         Payload::SkillShare { skill_hash, abi_version, body } => {
             e.b32(T_SHASH, skill_hash);
             e.num(T_ABI, *abi_version as u32);
@@ -344,6 +368,10 @@ struct Dec<'a> {
 }
 
 impl<'a> Dec<'a> {
+    /// Сколько байтов ещё не прочитано (для пачек полей переменной длины).
+    fn remain(&self) -> usize {
+        self.b.len().saturating_sub(self.pos)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], ProtoError> {
         if self.pos + n > self.b.len() {
             return Err(ProtoError::TooShort);
@@ -552,6 +580,17 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             idx: d.u32(T_BLOB_IDX)?,
             bytes: d.bytes(T_BLOB_BYTES, MAX_BLOB_CHUNK)?,
         }),
+        MsgType::RegAsk => Ok(Payload::RegAsk {
+            have: d.u32(T_REG_HAVE)?,
+        }),
+        MsgType::RegOffer => {
+            // пачка: T_REG_REC-поля друг за другом до конца кадра
+            let mut records = Vec::new();
+            while d.remain() > 0 {
+                records.push(d.bytes(T_REG_REC, MAX_REG_OFFER / 2)?);
+            }
+            Ok(Payload::RegOffer { records })
+        }
         MsgType::SkillShare => Ok(Payload::SkillShare {
             skill_hash: d.b32(T_SHASH)?,
             abi_version: d.u16(T_ABI)?,
@@ -742,5 +781,36 @@ mod tests {
     #[test]
     fn unknown_type_rejected() {
         assert!(MsgType::from_code(0x99).is_none());
+    }
+}
+
+#[cfg(test)]
+mod blobreg_tests {
+    use super::*;
+
+    #[test]
+    fn reg_frame_roundtrip() {
+        let recs = vec![vec![1u8, 2, 3], vec![9u8; 40]];
+        let f = Frame {
+            msg_type: MsgType::RegOffer,
+            sender: [5u8; 32],
+            sig: [6u8; 64],
+            payload: Payload::RegOffer { records: recs.clone() },
+        };
+        let wire = f.encode_with_sender_sig(&[5u8; 32], &[6u8; 64]).expect("enc");
+        let dec = Frame::decode(&wire).expect("dec");
+        match dec.payload {
+            Payload::RegOffer { records } => assert_eq!(records, recs),
+            other => panic!("не RegOffer: {other:?}"),
+        }
+        let f2 = Frame {
+            msg_type: MsgType::RegAsk,
+            sender: [5u8; 32],
+            sig: [6u8; 64],
+            payload: Payload::RegAsk { have: 7 },
+        };
+        let dec2 = Frame::decode(&f2.encode_with_sender_sig(&[5u8; 32], &[7u8; 64]).expect("enc2"))
+            .expect("dec2");
+        assert_eq!(dec2.payload, Payload::RegAsk { have: 7 });
     }
 }

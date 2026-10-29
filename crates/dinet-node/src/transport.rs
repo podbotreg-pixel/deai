@@ -23,6 +23,8 @@ pub const CH_ANNOUNCE: u8 = 2;
 pub const CH_NOTARY: u8 = 3;
 /// torrent чек-пойнтов: need/have/chunk (фаза G).
 pub const CH_BLOB: u8 = 4;
+/// Синхронизация реестра: ask/offer (фаза H — новичок догоняет append-only лог).
+pub const CH_REG: u8 = 5;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

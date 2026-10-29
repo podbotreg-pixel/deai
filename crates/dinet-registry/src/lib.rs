@@ -416,26 +416,65 @@ impl RegistryLog {
 }
 
 // ---------------------------------------------------------------------------
-// Файловая репрезентация: [len u32][entry][count u32]{[pub 32][sig 64]}
+// Сетево-файловая репрезентация записи: [len u32][entry][count u32]{[pub][sig]}
 // ---------------------------------------------------------------------------
 
+/// ОДНА запись в сетевом формате (с len-префиксом). Тот же формат, что
+/// хвост append-only файла: синхронизация между пирами и persist не
+/// расходятся ни байтом.
+pub fn encode_record(rec: &Accepted) -> Vec<u8> {
+    let body = record_body(rec);
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Обратная и распаковка: сетевые байты записи → Accepted.
+pub fn decode_record(bytes: &[u8]) -> Result<Accepted, String> {
+    if bytes.len() < 4 {
+        return Err("запись оборвана на длине".to_string());
+    }
+    let n = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    if bytes.len() < 4 + n {
+        return Err("запись оборвана в теле".to_string());
+    }
+    parse_record_body(&bytes[4..4 + n])
+}
+
+fn record_body(rec: &Accepted) -> Vec<u8> {
+    let mut e = Enc::default();
+    e.put_bytes(&rec.entry.encode());
+    e.put_u32(rec.seals.len() as u32);
+    for s in &rec.seals {
+        e.put32(&s.pubkey);
+        e.buf.extend_from_slice(&s.sig);
+    }
+    e.bytes().to_vec()
+}
+
+fn parse_record_body(body: &[u8]) -> Result<Accepted, String> {
+    let mut d = Dec::new(body);
+    let entry = RegistryEntry::decode(&d.bytes()?)?;
+    let count = d.u32()? as usize;
+    if count > 1 << 16 {
+        return Err(format!("печатей распухло: {count}"));
+    }
+    let mut seals = Vec::with_capacity(count);
+    for _ in 0..count {
+        let pubkey = d.arr32()?;
+        let sig = d
+            .take(ED25519_SIG_LEN)?
+            .try_into()
+            .map_err(|_| "сигнатура не 64 байта".to_string())?;
+        seals.push(Seal { pubkey, sig });
+    }
+    d.done()?;
+    Ok(Accepted { entry, seals })
+}
+
 fn write_records(recs: &[Accepted]) -> Vec<Vec<u8>> {
-    recs.iter()
-        .map(|a| {
-            let mut e = Enc::default();
-            e.put_bytes(&a.entry.encode());
-            e.put_u32(a.seals.len() as u32);
-            for s in &a.seals {
-                e.put32(&s.pubkey);
-                e.buf.extend_from_slice(&s.sig);
-            }
-            let body = e.bytes().to_vec();
-            let mut out = Vec::with_capacity(4 + body.len());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&body);
-            out
-        })
-        .collect()
+    recs.iter().map(encode_record).collect()
 }
 
 fn read_records(raw: &[u8]) -> Result<Vec<Accepted>, String> {
@@ -450,25 +489,8 @@ fn read_records(raw: &[u8]) -> Result<Vec<Accepted>, String> {
         if raw.len() - pos < n {
             return Err("лог оборван в теле записи".to_string());
         }
-        let body = &raw[pos..pos + n];
+        out.push(parse_record_body(&raw[pos..pos + n])?);
         pos += n;
-        let mut d = Dec::new(body);
-        let entry = RegistryEntry::decode(&d.bytes()?)?;
-        let count = d.u32()? as usize;
-        if count > 1 << 16 {
-            return Err(format!("печатей распухло: {count}"));
-        }
-        let mut seals = Vec::with_capacity(count);
-        for _ in 0..count {
-            let pubkey = d.arr32()?;
-            let sig = d
-                .take(ED25519_SIG_LEN)?
-                .try_into()
-                .map_err(|_| "сигнатура не 64 байта".to_string())?;
-            seals.push(Seal { pubkey, sig });
-        }
-        d.done()?;
-        out.push(Accepted { entry, seals });
     }
     Ok(out)
 }
