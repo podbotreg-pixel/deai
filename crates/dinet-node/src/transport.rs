@@ -21,6 +21,8 @@ pub const CH_VOTES: u8 = 1;
 pub const CH_ANNOUNCE: u8 = 2;
 /// Нотарные печати реестра чек-пойнтов (фаза F, после tally).
 pub const CH_NOTARY: u8 = 3;
+/// torrent чек-пойнтов: need/have/chunk (фаза G).
+pub const CH_BLOB: u8 = 4;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

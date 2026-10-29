@@ -15,6 +15,10 @@ pub const MAX_UPD_SHARE_PAYLOAD: usize = 24 * 1024 * 1024;
 pub const MAX_SKILL_SHARE_PAYLOAD: usize = 256 * 1024;
 /// Канон записи реестра: seq+3 id + acc + seals — порядок сотен байт.
 pub const MAX_SEAL_ENTRY: usize = 1024;
+/// Канон манифеста блоба: 291МБ/8КиБ ≈ 37k хэшей ≈ 1.2 МБ — берём с запасом.
+pub const MAX_BLOB_CANON: usize = 4 * 1024 * 1024;
+/// Кусок блоба: DEFAULT_CHUNK_LEN с запасом (крупные куски допустимы).
+pub const MAX_BLOB_CHUNK: usize = 1024 * 1024;
 pub const DEFAULT_FRAME_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +72,10 @@ const T_BODY: u8 = 30;
 const T_SEAL_ENTRY: u8 = 31;
 const T_SEAL_PUB: u8 = 32;
 const T_SEAL_SIG: u8 = 33;
+const T_BLOB_ID: u8 = 34;
+const T_BLOB_CANON: u8 = 35;
+const T_BLOB_IDX: u8 = 36;
+const T_BLOB_BYTES: u8 = 37;
 const T_DELTA: u8 = 31;
 const T_NORM: u8 = 32;
 
@@ -90,6 +98,14 @@ pub enum MsgType {
     /// нотариуса ПОВЕРХ канона (frame-подпись — отдельная, Transport-слой).
     NotarySeal = 0x32,
     SkillShare = 0x40,
+    /// torrent чек-пойнтов: «прошу блоб» (manifest_id) — broadcast.
+    BlobNeed = 0x50,
+    /// «есть такой блоб»: манифест-канон (sha256(канон) == manifest_id).
+    BlobHave = 0x51,
+    /// точечный запрос куска: (manifest_id, idx).
+    BlobChunkReq = 0x52,
+    /// ответ куском: (manifest_id, idx, байты).
+    BlobChunk = 0x53,
 }
 
 impl MsgType {
@@ -110,6 +126,10 @@ impl MsgType {
             0x31 => MsgType::EvalVote,
             0x32 => MsgType::NotarySeal,
             0x40 => MsgType::SkillShare,
+            0x50 => MsgType::BlobNeed,
+            0x51 => MsgType::BlobHave,
+            0x52 => MsgType::BlobChunkReq,
+            0x53 => MsgType::BlobChunk,
             _ => return None,
         })
     }
@@ -117,6 +137,8 @@ impl MsgType {
         match self {
             MsgType::UpdShare => MAX_UPD_SHARE_PAYLOAD,
             MsgType::SkillShare => MAX_SKILL_SHARE_PAYLOAD,
+            MsgType::BlobHave => MAX_BLOB_CANON,
+            MsgType::BlobChunk => MAX_BLOB_CHUNK,
             _ => DEFAULT_FRAME_LIMIT,
         }
     }
@@ -143,6 +165,14 @@ pub enum Payload {
     /// Печать нотариуса реестра чек-пойнтов: канон записи (dinet-registry
     /// `RegistryEntry::encode()`), pubkey и подпись поверх канона.
     NotarySeal { entry_bytes: Vec<u8>, seal_pubkey: Vec<u8>, seal_sig: Vec<u8> },
+    /// torrent: «ищу блоб с таким манифестом» (broadcast).
+    BlobNeed { manifest_id: [u8; 32] },
+    /// torrent: «блоб есть»; канон манифеста проверяется sha256 == id.
+    BlobHave { manifest_id: [u8; 32], manifest_canon: Vec<u8> },
+    /// torrent: точечный запрос куска.
+    BlobChunkReq { manifest_id: [u8; 32], idx: u32 },
+    /// torrent: ответ куском (байты верифицируются хэшем манифеста).
+    BlobChunk { manifest_id: [u8; 32], idx: u32, bytes: Vec<u8> },
     SkillShare { skill_hash: [u8; 32], abi_version: u16, body: Vec<u8> },
 }
 
@@ -264,6 +294,22 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.bytes(T_SEAL_ENTRY, entry_bytes);
             e.bytes(T_SEAL_PUB, seal_pubkey);
             e.bytes(T_SEAL_SIG, seal_sig);
+        }
+        Payload::BlobNeed { manifest_id } => {
+            e.b32(T_BLOB_ID, manifest_id);
+        }
+        Payload::BlobHave { manifest_id, manifest_canon } => {
+            e.b32(T_BLOB_ID, manifest_id);
+            e.bytes(T_BLOB_CANON, manifest_canon);
+        }
+        Payload::BlobChunkReq { manifest_id, idx } => {
+            e.b32(T_BLOB_ID, manifest_id);
+            e.num(T_BLOB_IDX, *idx);
+        }
+        Payload::BlobChunk { manifest_id, idx, bytes } => {
+            e.b32(T_BLOB_ID, manifest_id);
+            e.num(T_BLOB_IDX, *idx);
+            e.bytes(T_BLOB_BYTES, bytes);
         }
         Payload::SkillShare { skill_hash, abi_version, body } => {
             e.b32(T_SHASH, skill_hash);
@@ -489,6 +535,22 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             entry_bytes: d.bytes(T_SEAL_ENTRY, MAX_SEAL_ENTRY)?,
             seal_pubkey: d.bytes(T_SEAL_PUB, 64)?,
             seal_sig: d.bytes(T_SEAL_SIG, 64)?,
+        }),
+        MsgType::BlobNeed => Ok(Payload::BlobNeed {
+            manifest_id: d.b32(T_BLOB_ID)?,
+        }),
+        MsgType::BlobHave => Ok(Payload::BlobHave {
+            manifest_id: d.b32(T_BLOB_ID)?,
+            manifest_canon: d.bytes(T_BLOB_CANON, MAX_BLOB_CANON)?,
+        }),
+        MsgType::BlobChunkReq => Ok(Payload::BlobChunkReq {
+            manifest_id: d.b32(T_BLOB_ID)?,
+            idx: d.u32(T_BLOB_IDX)?,
+        }),
+        MsgType::BlobChunk => Ok(Payload::BlobChunk {
+            manifest_id: d.b32(T_BLOB_ID)?,
+            idx: d.u32(T_BLOB_IDX)?,
+            bytes: d.bytes(T_BLOB_BYTES, MAX_BLOB_CHUNK)?,
         }),
         MsgType::SkillShare => Ok(Payload::SkillShare {
             skill_hash: d.b32(T_SHASH)?,

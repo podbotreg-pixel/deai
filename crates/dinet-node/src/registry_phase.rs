@@ -14,11 +14,14 @@
 //! - честные реестры после эр бит-в-бит равны (entry + печати);
 //! - византийский канон и подделка печати не пролезают.
 
-use crate::swarm::{decode_frames, era_hash32, peer_book_ids, sign_frame, MidNode, Node, NodeId};
+use crate::blob_torrent::delta_f32_id;
+use crate::swarm::{
+    decode_frames, era_hash32, peer_book_ids, sign_frame, MidNode, Node, NodeId, SimConfig,
+};
 use crate::transport::{CH_NOTARY, Transport};
 use dinet_crypto::Verifier;
 use dinet_proto::{MsgType, Payload};
-use dinet_registry::{Accepted, DeltaManifest, RegistryEntry, RegistryLog, Seal};
+use dinet_registry::{Accepted, RegistryEntry, RegistryLog, Seal};
 
 /// Минимум печатей: ceil(2N/3) от полного состава роя (тот же принцип,
 /// что accepts*3 >= votes*2; молчащий нотариус = отказ).
@@ -35,17 +38,13 @@ pub struct NotaryReport {
     pub seals: usize,
 }
 
-/// Канонический манифест дельты: f32 LE (тот же выбор байтов, что в wire).
-pub fn delta_f32_manifest(delta: &[f32]) -> DeltaManifest {
-    let mut bytes = Vec::with_capacity(delta.len() * 4);
-    for v in delta {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    DeltaManifest::pack(&bytes, dinet_registry::DEFAULT_CHUNK_LEN).0
-}
-
 /// Канон записи узла для этой эры (с учётом head ЕГО реестра).
-fn expected_entry(reg: &RegistryLog, era: u32, mid: &MidNode) -> Option<RegistryEntry> {
+fn expected_entry(
+    reg: &RegistryLog,
+    era: u32,
+    mid: &MidNode,
+    chunk_len: u32,
+) -> Option<RegistryEntry> {
     let v = mid.vote.as_ref()?;
     let (seq, parent) = match reg.head() {
         None => (0u64, dinet_registry::GENESIS),
@@ -56,18 +55,21 @@ fn expected_entry(reg: &RegistryLog, era: u32, mid: &MidNode) -> Option<Registry
         checkpoint_id: v.candhash,
         parent_id: parent,
         era_id: era_hash32(era),
-        manifest_id: delta_f32_manifest(&v.agg_delta).id(),
+        manifest_id: delta_f32_id(&v.agg_delta, chunk_len),
         accuracy: v.cand_acc,
         contributors: mid.contributors as u16,
     })
 }
 
 /// ФАЗА F: печать реестра (после `era_tally`, тот же mids, тот же transport).
+/// Параллельно узел, дописавший реестр, кладёт САМ БЛОБ дельты в свой
+/// склад (`Node::blobs`) — с этих пор он полноценный сид для torrent-фазы G.
 pub fn era_notary(
     mine: &mut [Node],
     all_ids: &[NodeId],
     transport: &mut dyn Transport,
     era: u32,
+    cfg: &SimConfig,
     mids: &[MidNode],
     regs: &mut [RegistryLog],
 ) -> Vec<NotaryReport> {
@@ -78,7 +80,10 @@ pub fn era_notary(
         if !was_reveal {
             continue;
         }
-        let Some(entry) = expected_entry(&regs[idx], era, &mids[idx]) else { continue };
+        let Some(entry) = expected_entry(&regs[idx], era, &mids[idx], cfg.blob_chunk_len)
+        else {
+            continue;
+        };
         let canon = entry.encode();
         let seal_sig = mine[idx].signer.sign(&canon);
         let pub_bytes = mine[idx].signer.pubkey();
@@ -101,7 +106,9 @@ pub fn era_notary(
             reports.push(NotaryReport { accepted: false, seals: 0 });
             continue;
         }
-        let Some(my_entry) = expected_entry(&regs[idx], era, &mids[idx]) else {
+        let Some(my_entry) =
+            expected_entry(&regs[idx], era, &mids[idx], cfg.blob_chunk_len)
+        else {
             reports.push(NotaryReport { accepted: false, seals: 0 });
             continue;
         };
@@ -150,6 +157,12 @@ pub fn era_notary(
             regs[idx]
                 .append(Accepted { entry: my_entry.clone(), seals })
                 .unwrap_or_else(|e| panic!("канон валиден: append не может падать: {e}"));
+            // бLOB дельты — в склад узла: узел становится сидом для фазы G
+            if let Some(v) = &mids[idx].vote {
+                let (m, chunks) =
+                    crate::blob_torrent::delta_f32_packed(&v.agg_delta, cfg.blob_chunk_len);
+                mine[idx].blobs.put(m, chunks);
+            }
             reports.push(NotaryReport { accepted: true, seals: regs[idx].len() });
         } else {
             reports.push(NotaryReport { accepted: false, seals: seals.len() });
@@ -192,7 +205,7 @@ mod tests {
         let truths = era_publish(nodes, ids, t, era, cfg, 7);
         let mids = era_collect_and_vote(nodes, ids, t, era, cfg, Some((&truths, ids[0])));
         let _reps = era_tally(nodes, ids, t, era, cfg, mids.clone());
-        era_notary(nodes, ids, t, era, &mids, regs)
+        era_notary(nodes, ids, t, era, cfg, &mids, regs)
     }
 
     /// Четыре узла (1 byz), эры masked/masked/REVEAL: реестр растёт ТОЛЬКО

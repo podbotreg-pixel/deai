@@ -46,6 +46,8 @@ pub struct SimConfig {
     /// порог Krum-консенсуса: drop при distance > ratio × медианы
     pub krum_ratio: f32,
     pub eval_size: u32,
+    /// кусок блоба чек-пойнта для torrent-репликации (байтов).
+    pub blob_chunk_len: u32,
 }
 
 impl Default for SimConfig {
@@ -61,6 +63,7 @@ impl Default for SimConfig {
             norm_max: 3.0,
             krum_ratio: 2.5,
             eval_size: 96,
+            blob_chunk_len: 8192,
         }
     }
 }
@@ -78,6 +81,8 @@ pub struct Node {
     pub rejected_frames: u32,
     /// sim-метка отравителя
     pub byz: bool,
+    /// склад кусков чек-пойнтов (torrent): manifest_id → (манифест, куски).
+    pub blobs: crate::blob_torrent::BlobStore,
     /// РЕАЛЬНЫЕ данные клиента (диалоги чата, dtype `Sample`): Some —
     /// local_batch отдаёт их вместо sim-честного/отравленного батча.
     /// Точка прикрепления клиента-пользователя: dinet-client::pair_to_sample.
@@ -99,6 +104,7 @@ impl Node {
             last_cp: [0u8; 32],
             rejected_frames: 0,
             byz,
+            blobs: crate::blob_torrent::BlobStore::default(),
             batch_override: None,
         }
     }

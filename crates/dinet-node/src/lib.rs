@@ -8,3 +8,6 @@ pub mod transport;
 
 /// ФАЗА F нотариев: печать чек-пойнтов в append-only реестр роя.
 pub mod registry_phase;
+
+/// ФАЗА G torrent: репликация весовых блобов чек-пойнтов между пирами.
+pub mod blob_torrent;
