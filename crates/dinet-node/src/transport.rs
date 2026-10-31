@@ -58,6 +58,16 @@ impl MeshTransport {
         }
         MeshTransport { inboxes }
     }
+
+    /// Mesh с произвольными id узлов (v1-ключи: id из первых байт pubkey,
+    /// не 0..N — клиенты с настоящими ключами не обязаны быть смежными).
+    pub fn with_ids(ids: &[NodeId]) -> MeshTransport {
+        let mut inboxes = BTreeMap::new();
+        for &i in ids {
+            inboxes.insert(i, Vec::new());
+        }
+        MeshTransport { inboxes }
+    }
 }
 
 impl Transport for MeshTransport {
@@ -209,6 +219,17 @@ mod tests {
             vec![b"hello-all".to_vec(), b"hello-2".to_vec()]
         );
         assert!(m.collect(CH_SHARES, 1).is_empty(), "drain после collect");
+    }
+
+    #[test]
+    fn mesh_with_ids_arbitrary_node_keys() {
+        // v1-ключи: id = из pubkey, например 17 005 и 42 000
+        let mut m = MeshTransport::with_ids(&[17_005, 42_000]);
+        m.send(CH_SHARES, 17_005, None, b"sync");
+        m.send(CH_SHARES, 17_005, Some(42_000), b"direct");
+        assert_eq!(m.collect(CH_SHARES, 42_000), vec![b"sync".to_vec(), b"direct".to_vec()]);
+        assert_eq!(m.collect(CH_SHARES, 17_005), vec![b"sync".to_vec()]);
+        assert!(m.collect(CH_SHARES, 4242).is_empty(), "чужого inboxa нет");
     }
 
     #[test]

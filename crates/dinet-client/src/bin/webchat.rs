@@ -239,12 +239,15 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
         return;
     }
     let cfg = SimConfig::default();
-    let mut node = std::mem::replace(&mut e.node, Node::new(0, 7, false));
+    // заполнитель заменится реальным узлом ниже (id — только до возврата)
+    let nid = e.node.id;
+    let mut node = std::mem::replace(&mut e.node, Node::new(nid, 7, false));
     node.batch_override = Some(pairs_to_batch(&e.valid));
-    let mut mesh = MeshTransport::new(1);
+    let mut mesh = MeshTransport::with_ids(&[node.id]);
     let mut mine = vec![node];
     let era_num = e.eras;
-    let reports = run_era_partition(&mut mine, &[0u16], &mut mesh, era_num, &cfg, 2026);
+    let eid = mine[0].id;
+    let reports = run_era_partition(&mut mine, &[eid], &mut mesh, era_num, &cfg, 2026);
     let r = &reports[0];
     e.node = mine.remove(0);
     e.eras += 1;
@@ -288,8 +291,8 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
 ///      учила, попадают в очередь учителей (в т.ч. после рестарта);
 ///   3) ЭРА: при новом материале прокручивается та же era_tick —
 ///      дообучение роя без единого хода пользователя.
-fn bg_trainer(st: Arc<ChatState>) {
-    let bg_sgn = Ed25519Signer::from_seed(&[0u8; 32]); // личный ключ узла 0 роя
+fn bg_trainer(st: Arc<ChatState>, node_seed: [u8; 32]) {
+    let bg_sgn = Ed25519Signer::from_seed(&node_seed); // v1: личный ключ узла
     loop {
         std::thread::sleep(Duration::from_secs(st.bg_secs.max(1)));
 
@@ -435,7 +438,7 @@ fn web_snippets(html: &str, max: usize) -> Vec<String> {
 fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
     if st.web_secs == 0 {
         return; // --web 0 = выкл
-    }
+    } // подписант передаётся снаружи (тот же v1-ключ узла)
     let mut turn_n = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(st.web_secs.max(1)));
@@ -740,7 +743,7 @@ fn main() {
     };
     // рой-KV чек-пойнтов: последний принятый адаптер переживает рестарт
     let roi_path = Path::new(&dir).with_extension("roi");
-    let kv = match KvStore::open(&roi_path) {
+    let mut kv = match KvStore::open(&roi_path) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("рой-KV {roi_path:?} не открылся: {e}");
@@ -759,7 +762,31 @@ fn main() {
     };
     let eras = u32::try_from(kver("roй:eras")).unwrap_or(0).min(u32::MAX - 1);
     let cps = u32::try_from(kver("roй:cps")).unwrap_or(0).min(u32::MAX - 1);
-    let mut node = Node::new(0, 7, false);
+    // v1-ЛИЧНЫЙ КЛЮЧ УЗЛА (не сим-вывод [id;32]): генерируется при первом
+    // старте и хранится в рой-KV; id = первые два байта pubkey (как в
+    // GossipBridge). Несистемная подпись → записи/эры клиента проверяемы
+    // чужими узлами, сам узел различим среди других.
+    let node_seed: [u8; 32] = match kv.get("node:seed") {
+        Some(b) if b.len() == 32 => {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&b);
+            s
+        }
+        _ => {
+            let s = dinet_crypto::random_seed().expect("random_seed");
+            let _ = kv.put("node:seed", &s);
+            s
+        }
+    };
+    let node_key = Ed25519Signer::from_seed(&node_seed);
+    let node_pub = node_key.pubkey();
+    let node_id = u16::from_be_bytes([node_pub[0], node_pub[1]]);
+    println!(
+        "v1-ключ узла: id={node_id}, pub={:02x}{:02x}{:02x}{:02x}… (seed в рой-KV)",
+        node_pub[0], node_pub[1], node_pub[2], node_pub[3]
+    );
+    let mut node = Node::new(node_id, 7, false);
+    node.signer = Box::new(node_key); // v1: личный ключ вместо сим-вывода
     if let Some(ab) = kv.get("roй:adapter") {
         let vals: Vec<f32> = ab
             .chunks_exact(4)
@@ -807,11 +834,11 @@ fn main() {
     });
     // ФОН (M2-1): дообучение по таймеру — поток живёт, пока жив клиент.
     let st_bg = Arc::clone(&st);
-    std::thread::spawn(move || bg_trainer(st_bg));
+    std::thread::spawn(move || bg_trainer(st_bg, node_seed));
     // WEB-ФИД (M2-2): факты из сети → инфосфера (0 = выкл).
     if web_secs > 0 {
         let st_web = Arc::clone(&st);
-        let web_sgn = Ed25519Signer::from_seed(&[0u8; 32]);
+        let web_sgn = Ed25519Signer::from_seed(&node_seed);
         std::thread::spawn(move || web_feed(st_web, web_sgn));
         println!("web-фид: раз в {web_secs} сек, тема → факты → инфосфера");
     }
