@@ -225,6 +225,8 @@ struct ChatState {
     web_secs: u64,
     /// Удачных web-тикеров (для /api/stats).
     web_hits: AtomicU64,
+    /// Чужих записей инфосферы принял p2p-обмен (для /api/stats).
+    p2p_took: AtomicU64,
 }
 
 fn now_ts() -> u64 {
@@ -468,6 +470,57 @@ fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
 }
 
 // ---------------------------------------------------------------------------
+// P2P: обмен инфосферой с реальными узлами (фича p2p)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "p2p")]
+fn p2p_info_thread(st: Arc<ChatState>, node_seed: [u8; 32], dial: Option<String>) {
+    use dinet_client::infosync::{info_exchange_tick, InfoExchangeState};
+    use dinet_p2p::GossipBridge;
+
+    let key = Ed25519Signer::from_seed(&node_seed);
+    let my_pub = key.pubkey();
+    let me_id = u16::from_be_bytes([my_pub[0], my_pub[1]]);
+    // мост libp2p: ТОТ ЖЕ личный ключ — кадры подписываются узлом как есть
+    let mut bridge = match GossipBridge::spawn(me_id, node_seed) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[p2p] мост не поднялся: {e}");
+            return;
+        }
+    };
+    if let Some(addr) = &bridge.addr {
+        println!(
+            "[p2p] мост узла {me_id} слушает {addr}{}",
+            dial.as_ref().map(|d| format!(", dial {d}")).unwrap_or_default()
+        );
+    }
+    if let Some(d) = dial {
+        match d.parse() {
+            Ok(a) => bridge.dial(a),
+            Err(e) => eprintln!("[p2p] dial некорректен: {e}"),
+        }
+    }
+    let mut state = InfoExchangeState::new();
+    let mut tick_n = 0u64;
+    loop {
+        std::thread::sleep(Duration::from_secs(st.bg_secs.max(1)));
+        tick_n += 1;
+        let taken = {
+            let mut info = st.info.lock().expect("info lock");
+            info_exchange_tick(&key, me_id, &my_pub, &mut info, &mut state, &mut bridge).taken
+        };
+        if taken > 0 {
+            st.p2p_took.fetch_add(u64::from(taken), Ordering::Relaxed);
+        }
+        if taken > 0 || tick_n == 1 {
+            let info_n = st.info.lock().expect("info lock").len();
+            println!("[p2p #{tick_n}] узел {me_id}: принял записей {taken}, всего {info_n}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP-обработчики
 // ---------------------------------------------------------------------------
 
@@ -679,6 +732,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             let e = st.era.lock().expect("era lock");
             let bg_ticks = st.bg_ticks.load(Ordering::Relaxed);
             let web_hits = st.web_hits.load(Ordering::Relaxed);
+            let p2p_took = st.p2p_took.load(Ordering::Relaxed);
             let (info_n, rules_n) = {
                 let info = st.info.lock().expect("info lock");
                 (info.len(), info.instructions().len())
@@ -693,7 +747,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&p2p={p2p_took}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -711,6 +765,8 @@ fn main() {
     let mut every = 4u32;
     let mut bg_secs = 20u64;
     let mut web_secs = 0u64;
+    let mut p2p_on = false;
+    let mut dial_addr: Option<String> = None;
     #[cfg(feature = "llama")]
     let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
@@ -719,6 +775,8 @@ fn main() {
             "--every" => every = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
             "--bg" => bg_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
             "--web" => web_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--p2p" => p2p_on = true,
+            "--dial" => dial_addr = args.next(),
             #[cfg(feature = "llama")]
             "--model" => model_path = args.next(),
             _ => {}
@@ -829,6 +887,7 @@ fn main() {
         info: Mutex::new(st_info),
         web_secs,
         web_hits: AtomicU64::new(0),
+        p2p_took: AtomicU64::new(0),
         #[cfg(feature = "llama")]
         llama: llama_slot,
     });
@@ -842,6 +901,20 @@ fn main() {
         std::thread::spawn(move || web_feed(st_web, web_sgn));
         println!("web-фид: раз в {web_secs} сек, тема → факты → инфосфера");
     }
+    // P2P-ОБМЕН ИНФОСФЕРОЙ (M2-3): --p2p — поднять мост; --dial <multiaddr>
+    // — прийти к уже запущенному узлу. Раз в bg-период: анонсы своих
+    // записей, аски отсутствующих, тела, приём с проверкой автора.
+    #[cfg(feature = "p2p")]
+    if p2p_on {
+        let st_p2p = Arc::clone(&st);
+        let dial = dial_addr.clone();
+        std::thread::Builder::new()
+            .name("info-p2p".into())
+            .spawn(move || p2p_info_thread(st_p2p, node_seed, dial))
+            .expect("p2p thread");
+    }
+    #[cfg(not(feature = "p2p"))]
+    let _ = (p2p_on, dial_addr);
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -943,7 +1016,7 @@ document.getElementById('st').textContent='ходов: '+pairs.turns+' | обу�
 +' | фон: '+pairs.bg+' тиков (эры самообучения по таймеру)'
 +' | инфосфера: '+pairs.info+' записей'
 +' | web-фид: '+pairs.web+' тем (факты из сети)'
-+' | правил роя: '+pairs.rules;});}
++' | правил роя: '+pairs.rules+' | p2p-обмен: '+pairs.p2p+' принятых записей';});}
 </script></body></html>"#;
 
 #[cfg(test)]

@@ -534,7 +534,7 @@ pub struct GossipBridge {
     pub addr: Option<Multiaddr>,
 }
 
-const CH_N: usize = 3; // SHARES / VOTES / ANNOUNCE
+const CH_N: usize = 9; // SHARES..CH_INFO (0..8): мост маршрутизирует все каналы
 const TOPIC_BASE: &str = "dinet/v0";
 
 impl GossipBridge {
@@ -673,7 +673,9 @@ impl dinet_node::transport::Transport for GossipBridge {
     fn send(&mut self, ch: u8, _from: u16, to: Option<u16>, frame: &[u8]) {
         // loopback: собственное окно всегда видит свою публикацию
         if let Some(f) = verify_frame(frame, self.peer) {
-            self.queues[usize::from(ch)].lock().expect("queue").push(f);
+            if let Some(q) = self.queues.get(usize::from(ch)) {
+                q.lock().expect("queue").push(f);
+            }
         }
         self.send_frame(ch, to, frame.to_vec());
     }

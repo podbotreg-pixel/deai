@@ -11,11 +11,15 @@ dinet-chat = { path = "../dinet-chat" }
 dinet-fl = { path = "../dinet-fl" }
 dinet-memory = { path = "../dinet-memory" }
 dinet-node = { path = "../dinet-node" }
+dinet-proto = { path = "../dinet-proto" }
 # llama.cpp для GUI-чата: фича llama + --model (сборка настоящей LLM в webchat)
 dinet-llama = { path = "../dinet-llama", optional = true }
+# реальная сеть (libp2p-мост) для обмена инфосферой: фича p2p + --p2p
+dinet-p2p = { path = "../dinet-p2p", optional = true }
 
 [features]
 llama = ["dep:dinet-llama"]
+p2p = ["dep:dinet-p2p"]
 
 [[bin]]
 name = "clientswarm"
