@@ -54,18 +54,26 @@
 //! Каждые `--every` учительских пар клиент проводит ЛОКАЛЬНУЮ эру роя:
 //! fit ТОЛЬКО на своих диалогах → DP-дельта → кворум → чек-пойнт
 //! (эпохи — тот же код, что в spoolswarm/clientswarm).
+//!
+//! ФОН (M2): клиент тренируется САМ, пока жив: поток bg_trainer раз в
+//! `--bg` сек пишет опыт диалога в ИНФОСФЕРУ (файл `<dir>.info`,
+//! переживает рестарт), подставляет неучённые пары памяти реплике и
+//! гонит эру роя по таймеру — без единого хода пользователя.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dinet_chat::{ChatSession, Role, ToyChatModel};
+use dinet_chat::{ChatSession, LearnPair, Role, ToyChatModel};
 use dinet_client::pairs_to_batch;
+use dinet_crypto::Ed25519Signer;
 use dinet_fl::toy_llm::toy_world::honesty_batch;
 use dinet_fl::toy_llm::ToyModel;
 use dinet_memory::kv::KvStore;
+use dinet_node::infosphere::{craft_entry, InfoStore, KIND_EXPERIENCE, KIND_INSTRUCTION};
 use dinet_node::swarm::{accuracy, run_era_partition, Node, SimConfig};
 use dinet_node::transport::MeshTransport;
 
@@ -199,6 +207,14 @@ struct ChatState {
     /// `dyn + Send`: мост держит только mpsc-канал — сам llama.cpp не покидает поток.
     #[cfg(feature = "llama")]
     llama: Option<Mutex<Box<dyn dinet_chat::ChatModel + Send>>>,
+    /// ФОН (M2-требование 1): клиент тренируется САМ, пока запущен —
+    /// период фоновых тиков (сек); эра идёт, когда есть новый материал.
+    bg_secs: u64,
+    /// Сколько фоновых тиков прошло (живой счётчик /api/stats).
+    bg_ticks: AtomicU64,
+    /// ИНФОСФЕРА (M2-требования 4–5): общая распределённая память роя —
+    /// единицы опыта (диалоги) + инструкции; файл переживает рестарт.
+    info: Mutex<InfoStore>,
 }
 
 fn now_ts() -> u64 {
@@ -247,6 +263,66 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
             r.era,
             e.valid.len()
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ФОНОВОЕ ОБУЧЕНИЕ (M2): сеть тренируется сама, пока клиент жив
+// ---------------------------------------------------------------------------
+
+/// Фоновый поток: раз в `bg_secs` секунд (не по ходам диалога — по таймеру):
+///   1) ОПЫТ → инфосфера: все хранимые пары диалога пишутся записями
+///      KIND_EXPERIENCE (content-addressed → повторы не плодят записи;
+///      подпись — личный ключ узла 0, id = sha256(canon));
+///   2) МАТЕРИАЛ: микроязыковые пары из памяти, которых реплика ещё не
+///      учила, попадают в очередь учителей (в т.ч. после рестарта);
+///   3) ЭРА: при новом материале прокручивается та же era_tick —
+///      дообучение роя без единого хода пользователя.
+fn bg_trainer(st: Arc<ChatState>) {
+    let bg_sgn = Ed25519Signer::from_seed(&[0u8; 32]); // личный ключ узла 0 роя
+    loop {
+        std::thread::sleep(Duration::from_secs(st.bg_secs.max(1)));
+
+        // 1) опыт диалога → инфосфера (дедуп по id беспл. честно)
+        let pairs: Vec<LearnPair> = {
+            let g = st.session.lock().expect("session lock");
+            g.pairs()
+        };
+        let mut new_exp = 0usize;
+        {
+            let mut info = st.info.lock().expect("info lock");
+            for p in &pairs {
+                let txt = format!("опыт диалога: {} → {}", p.prompt, p.answer);
+                let rec = craft_entry(&bg_sgn, KIND_EXPERIENCE, p.ts as u32, txt.as_bytes());
+                if info.put(rec) {
+                    new_exp += 1;
+                }
+            }
+        }
+
+        // 2) материал роя: неучённые пары памяти — в очередь учителей
+        let fresh = {
+            let mut e = st.era.lock().expect("era lock");
+            let before = e.valid.len();
+            for p in &pairs {
+                if !e.valid.iter().any(|(q, a)| *q == p.prompt && *a == p.answer) {
+                    e.valid.push((p.prompt.clone(), p.answer.clone()));
+                }
+            }
+            e.valid.len() - before
+        };
+
+        // 3) эра по таймеру (без пользователя)
+        let ticks = st.bg_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        if fresh > 0 {
+            era_tick(&st.era);
+        }
+        if new_exp > 0 || fresh > 0 {
+            let info_n = st.info.lock().expect("info lock").len();
+            println!(
+                "[фон #{ticks}] опыт +{new_exp} → инфосфера {info_n}; пар реплике +{fresh} → эра роя",
+            );
+        }
     }
 }
 
@@ -400,6 +476,8 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 )
             };
             let e = st.era.lock().expect("era lock");
+            let bg_ticks = st.bg_ticks.load(Ordering::Relaxed);
+            let info_n = st.info.lock().expect("info lock").len();
             let eval = honesty_batch(96, 424_242);
             let acc = accuracy(
                 &ToyModel { base: e.node.base.clone(), adapter: e.node.adapter.clone() },
@@ -410,7 +488,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -426,12 +504,14 @@ fn main() {
     let dir = args.next().unwrap_or_else(|| "./dinet-web-mem".to_string());
     let mut port = 8080u16;
     let mut every = 4u32;
+    let mut bg_secs = 20u64;
     #[cfg(feature = "llama")]
     let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(8080),
             "--every" => every = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
+            "--bg" => bg_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
             #[cfg(feature = "llama")]
             "--model" => model_path = args.next(),
             _ => {}
@@ -493,13 +573,35 @@ fn main() {
         cps,
         kv,
     };
+    // ИНФОСФЕРА (M2): файл-сиблинг "<dir>.info" переживает рестарт; пустое
+    // хранилище засевается ИНСТРУКЦИЕЙ роя (как учиться и общаться).
+    let mut st_info = InfoStore::open(Path::new(&dir).with_extension("info"));
+    if st_info.is_empty() {
+        let sgn = Ed25519Signer::from_seed(&[0u8; 32]);
+        let ins = String::from(
+            "Инструкция роя: учись вежливо на опыте диалогов и поиске в сети; \
+             в сомнении говори «не знаю»; указывай источники; не выдумывай факты.",
+        );
+        let rec = craft_entry(&sgn, KIND_INSTRUCTION, now_ts() as u32, ins.as_bytes());
+        if st_info.put(rec) {
+            println!("инфосфера: засеяна инструкцией роя ({} записей)", st_info.len());
+        }
+    } else {
+        println!("инфосфера: в файле {} записей", st_info.len());
+    }
     let st = Arc::new(ChatState {
         session: Mutex::new(session),
         era: Arc::new(Mutex::new(era)),
         every,
+        bg_secs,
+        bg_ticks: AtomicU64::new(0),
+        info: Mutex::new(st_info),
         #[cfg(feature = "llama")]
         llama: llama_slot,
     });
+    // ФОН (M2-1): дообучение по таймеру — поток живёт, пока жив клиент.
+    let st_bg = Arc::clone(&st);
+    std::thread::spawn(move || bg_trainer(st_bg));
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -597,7 +699,9 @@ function stats(){fetch('/api/stats').then(r=>r.text()).then(t=>{document.getElem
 ;var pairs={};t.trim().split('&').forEach(x=>{var f=x.split('=');pairs[f[0]]=f[1];});
 document.getElementById('st').textContent='ходов: '+pairs.turns+' | обучающих пар: '+pairs.pairs
 +' (учителя: '+pairs.teacher+') | эр роя: '+pairs.eras+' | чек-пойнтов: '+pairs.cps
-+' | точность реплики на общем eval: '+pairs.acc;});}
++' | точность реплики на общем eval: '+pairs.acc
++' | фон: '+pairs.bg+' тиков (эры самообучения по таймеру)'
++' | инфосфера: '+pairs.info+' записей';});}
 </script></body></html>"#;
 
 #[cfg(test)]
