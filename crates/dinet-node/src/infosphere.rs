@@ -69,19 +69,65 @@ pub struct InfoSeal {
 
 /// Хранилище узла: content-addressed, append-only по сути своей; файл
 /// (опция) — лог [len][rec] коротких записей, дружит с переоткрытием.
+///
+/// ВЫБОРочные ДЕРЖАТЕЛИ (v1): узел не «зеркалит» всю инфосферу до
+/// бесконечности. Чужие записи фактов/опыта сверх кепки вида ОТКЛО-
+/// НЯЮТСЯ (правда никогда не бывает полной копией у одного узла —
+/// пока другие держатели есть). ИНСТРУКЦИИ не капируются: правила
+/// роя обязаны знать все. Автор ВСЕГДА держит свои записи (иначе
+/// некому отвечать на аск о них).
 pub struct InfoStore {
     path: Option<std::path::PathBuf>,
     recs: std::collections::BTreeMap<[u8; 32], InfoRec>,
+    /// автор записей, которых я не отказываюсь держать (своя память)
+    owner: Option<[u8; 32]>,
+    /// кепка по kind: [опыт, факт, инструкция] (v1-выборочность)
+    caps: [usize; 3],
 }
 
 impl InfoStore {
     pub fn new() -> InfoStore {
-        InfoStore { path: None, recs: std::collections::BTreeMap::new() }
+        InfoStore {
+            path: None,
+            recs: std::collections::BTreeMap::new(),
+            owner: None,
+            caps: [400, 800, usize::MAX],
+        }
     }
 
+    /// Кто «я» в этом хранилище (свои записи держим всегда).
+    pub fn set_owner(&mut self, pubkey: [u8; 32]) {
+        self.owner = Some(pubkey);
+    }
+
+    /// Кепка данного вида записей (для тестов можно ужать).
+    pub fn set_cap(&mut self, kind: u8, cap: usize) {
+        self.caps[cap_index(kind)] = cap;
+    }
+
+    /// Сколько записей данного вида.
+    pub fn count_kind(&self, kind: u8) -> usize {
+        self.recs.values().filter(|r| r.kind == kind).count()
+    }
+}
+
+fn cap_index(kind: u8) -> usize {
+    match kind {
+        KIND_EXPERIENCE => 0,
+        KIND_FACT => 1,
+        _ => 2, // инструкции — не кепируем
+    }
+}
+
+impl InfoStore {
     /// Хранилище с файлом (существующий лог подхватывается).
     pub fn open(path: std::path::PathBuf) -> InfoStore {
-        let mut s = InfoStore { path: Some(path.clone()), recs: std::collections::BTreeMap::new() };
+        let mut s = InfoStore {
+            path: Some(path.clone()),
+            recs: std::collections::BTreeMap::new(),
+            owner: None,
+            caps: [400, 800, usize::MAX],
+        };
         if let Ok(raw) = std::fs::read(&path) {
             let mut pos = 0usize;
             while pos < raw.len() {
@@ -157,11 +203,27 @@ impl InfoStore {
             return false;
         }
         let fresh = !self.recs.contains_key(&rec.info_id);
+        if fresh && !self.i_am_holder(&rec) {
+            // Выборочность: чужих сверх кепки вида не держим (автор —
+            // всегда). Запись всё же услышим: рой распределён, чей-то
+            // рефрен донесёт до держателя. Инструкции не кепируются.
+            return false;
+        }
         if fresh {
             self.persist(&rec);
         }
         self.recs.insert(rec.info_id, rec);
         fresh
+    }
+
+    /// Держу ли ЭТУ запись по политике узла (v1-выборочность):
+    /// свои всегда; инструкции всегда; чужие факты/опыт — по кепке.
+    fn i_am_holder(&self, rec: &InfoRec) -> bool {
+        if self.owner.map(|o| o == rec.author).unwrap_or(false) {
+            return true; // собств. записи не отказываюсь держать
+        }
+        let cap = self.caps[cap_index(rec.kind)];
+        self.count_kind(rec.kind) < cap
     }
 
     /// Есть ли запись.
@@ -575,6 +637,49 @@ mod tests {
         assert_eq!(reopened.quorum_count(&ins.info_id), 2, "файл печати потерялся");
         assert!(reopened.quorum_of(&ins.info_id, 2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Выборочные держатели (v1): свои записи — всегда; инструкции —
+    /// всегда; чужие факты/опыт — только пока не исчерпана кепка вида.
+    /// Уже-хранящиеся записи кепку не волнует (дубли идут мимо).
+    #[test]
+    fn selective_holders_own_always_and_foreign_capped() {
+        let a = Ed25519Signer::from_seed(&[81u8; 32]);
+        let b = Ed25519Signer::from_seed(&[82u8; 32]);
+        let mut s = InfoStore::new();
+        s.set_owner(b.pubkey());
+        s.set_cap(KIND_FACT, 2);
+
+        // чужие факты: два прошло кепка, третье ОТКЛОНЕНО
+        let f = |n: u32| craft_entry(&a, KIND_FACT, n, format!("fact {n} body").as_bytes());
+        assert!(s.put(f(1)));
+        assert!(s.put(f(2)));
+        assert!(!s.put(f(3)), "чужой факт сверх кепки принял — полная репликация");
+        assert_eq!(s.count_kind(KIND_FACT), 2);
+
+        // свой факт — держим всегда, кепка не мешает
+        let own = craft_entry(&b, KIND_FACT, 99, b"my own web fact");
+        assert!(s.put(own), "автор обязан держать свои записи");
+        assert_eq!(s.count_kind(KIND_FACT), 3);
+
+        // инструкции не кепируются вообще
+        for n in 10..16 {
+            let ins = craft_entry(&a, KIND_INSTRUCTION, n, format!("royal rule {n}").as_bytes());
+            assert!(s.put(ins), "инструкция отброшена — правила обязаны знать все");
+        }
+        assert_eq!(s.count_kind(KIND_INSTRUCTION), 6);
+
+        // уже-хранящиеся кепку не волнует: дубликат чужого факта 1
+        // (принятого раньше кепки) не «новая» запись — put false
+        assert!(!s.put(f(1)), "дубликат не нов");
+        assert_eq!(s.count_kind(KIND_FACT), 3);
+
+        // чужой опыт — отдельная кепка (не смешивается с фактами)
+        s.set_cap(KIND_EXPERIENCE, 1);
+        let e = |n: u32| craft_entry(&a, KIND_EXPERIENCE, n, format!("exp {n} body").as_bytes());
+        assert!(s.put(e(1)));
+        assert!(!s.put(e(2)), "кепки видов перепутались");
+        assert_eq!(s.count_kind(KIND_EXPERIENCE), 1);
     }
 
     /// Подделки не хранятся: чужая подпись и подменённое id/тело.

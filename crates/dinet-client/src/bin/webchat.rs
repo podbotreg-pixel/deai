@@ -920,6 +920,7 @@ fn main() {
         node_pub[0], node_pub[1], node_pub[2], node_pub[3]
     );
     let mut node = Node::new(node_id, 7, false);
+    let node_pub = node_key.pubkey();
     node.signer = Box::new(node_key); // v1: личный ключ вместо сим-вывода
     if let Some(ab) = kv.get("roй:adapter") {
         let vals: Vec<f32> = ab
@@ -954,6 +955,9 @@ fn main() {
     } else {
         println!("инфосфера: в файле {} записей", st_info.len());
     }
+    // Выборочные держатели (v1): узел держит свои записи всегда,
+    // чужие факты/опыт — по кепке вида (400 опыт / 800 факт).
+    st_info.set_owner(node_pub);
     let st = Arc::new(ChatState {
         session: Mutex::new(session),
         era: Arc::new(Mutex::new(era)),
