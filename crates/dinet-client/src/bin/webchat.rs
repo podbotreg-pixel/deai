@@ -59,6 +59,9 @@
 //! `--bg` сек пишет опыт диалога в ИНФОСФЕРУ (файл `<dir>.info`,
 //! переживает рестарт), подставляет неучённые пары памяти реплике и
 //! гонит эру роя по таймеру — без единого хода пользователя.
+//! WEB-ФИД (M2): при `--web <сек>` фоновый коннектор (DuckDuckGo HTML
+//! через curl — бесплатный, без ключей/телеметрии) приносит факты по
+//! вращающимся темам → записи kind=факт в инфосферу.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -73,7 +76,9 @@ use dinet_crypto::Ed25519Signer;
 use dinet_fl::toy_llm::toy_world::honesty_batch;
 use dinet_fl::toy_llm::ToyModel;
 use dinet_memory::kv::KvStore;
-use dinet_node::infosphere::{craft_entry, InfoStore, KIND_EXPERIENCE, KIND_INSTRUCTION};
+use dinet_node::infosphere::{
+    craft_entry, InfoStore, KIND_EXPERIENCE, KIND_FACT, KIND_INSTRUCTION,
+};
 use dinet_node::swarm::{accuracy, run_era_partition, Node, SimConfig};
 use dinet_node::transport::MeshTransport;
 
@@ -215,6 +220,11 @@ struct ChatState {
     /// ИНФОСФЕРА (M2-требования 4–5): общая распределённая память роя —
     /// единицы опыта (диалоги) + инструкции; файл переживает рестарт.
     info: Mutex<InfoStore>,
+    /// WEB-ФИД (M2-требование 2): период, сек (0 = выкл); факты из сети
+    /// → инфосфера. Бесплатный коннектор: DuckDuckGo HTML через curl.
+    web_secs: u64,
+    /// Удачных web-тикеров (для /api/stats).
+    web_hits: AtomicU64,
 }
 
 fn now_ts() -> u64 {
@@ -323,6 +333,134 @@ fn bg_trainer(st: Arc<ChatState>) {
                 "[фон #{ticks}] опыт +{new_exp} → инфосфера {info_n}; пар реплике +{fresh} → эра роя",
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WEB-ФИД (M2): поиск в интернете — второй источник опыта
+// ---------------------------------------------------------------------------
+
+/// Темы «любопытства» v0: рой крутит общий список (v1 — ключевые слова
+/// из диалога и из чужого опыта инфосферы).
+const WEB_TOPICS: [&str; 8] = [
+    "как работает спинтроника",
+    "история мореплавания полинезийцев",
+    "нейросети для распознавания птиц по голосу",
+    "почему светлячки светятся по-разному",
+    "как устроен квантовый точечный процессор",
+    "ферментация продуктов: химия и практика",
+    "архитектура древних иранских ветряных мельниц",
+    "какой рекорд глубины у дайверов без акваланга",
+];
+
+/// curl → страница; бесплатный коннектор без ключей/аккаунтов/телеметрии.
+fn web_fetch(url: &str) -> Option<String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-m",
+            "25",
+            "-A",
+            "DI-NET/0.1 (свободная федеративная сеть; вежливый фон)",
+            "--compressed",
+            url,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+/// Сниппеты результатов (DuckDuckGo html/lite): после маркера берём
+/// текст до первого закрывающего родителя, внутренние теги срезаем,
+/// минимальные сущности разжимаем.
+fn web_snippets(html: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for marker in ["result__snippet", "result-snippet"] {
+        let mut from = 0usize;
+        while let Some(pos) = html[from..].find(marker) {
+            let rest = &html[from + pos..];
+            let after = match rest.find('>') {
+                Some(i) => &rest[i + 1..],
+                None => break,
+            };
+            let raw_end = after.find("</td>").or_else(|| after.find("</a>")).unwrap_or(0);
+            let end = after.find("</div>").or_else(|| after.find("</span>")).unwrap_or(raw_end);
+            let chunk = if end > 0 { &after[..end] } else { "" };
+            let mut text = String::new();
+            let mut depth = 0usize;
+            let mut it = chunk.chars().peekable();
+            while let Some(c) = it.next() {
+                match c {
+                    '<' => depth += 1,
+                    '>' => depth = depth.saturating_sub(1),
+                    _ if depth == 0 => text.push(c),
+                    _ => {}
+                }
+            }
+            let clean = text
+                .replace("&amp;", "&")
+                .replace("&quot;", "\"")
+                .replace("&#x27;", "'")
+                .replace("&#39;", "'")
+                .replace("&nbsp;", " ")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .trim()
+                .to_string();
+            if clean.len() > 40 && !out.iter().any(|s: &String| *s == clean) {
+                out.push(clean);
+                if out.len() >= max {
+                    return out;
+                }
+            }
+            from += pos + marker.len() + 1;
+            if from >= html.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Фоновый поток: раз в `web_secs` (0 = выкл) один запрос → факты →
+/// инфосфера. Вежливо: один запрос за раз, пауза между тиками.
+fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
+    if st.web_secs == 0 {
+        return; // --web 0 = выкл
+    }
+    let mut turn_n = 0u64;
+    loop {
+        std::thread::sleep(Duration::from_secs(st.web_secs.max(1)));
+        turn_n += 1;
+        let topic = WEB_TOPICS[(turn_n - 1) as usize % WEB_TOPICS.len()];
+        let q = pct_encode(topic);
+        let url = format!("https://html.duckduckgo.com/html/?q={q}");
+        let Some(html) = web_fetch(&url) else {
+            println!("[web #{turn_n}] сеть не ответила по теме «{topic}» — ждём дальше");
+            continue;
+        };
+        let mut facts = 0usize;
+        {
+            let mut info = st.info.lock().expect("info lock");
+            for snippet in web_snippets(&html, 3) {
+                let txt = format!("факт из сети ({topic}): {snippet}");
+                let rec = craft_entry(&web_sgn, KIND_FACT, now_ts() as u32, txt.as_bytes());
+                if info.put(rec) {
+                    facts += 1;
+                }
+            }
+        }
+        let info_n = st.info.lock().expect("info lock").len();
+        st.web_hits.fetch_add(1, Ordering::Relaxed);
+        println!("[web #{turn_n}] «{topic}» → фактов +{facts}, инфосфера {info_n}");
     }
 }
 
@@ -477,6 +615,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             };
             let e = st.era.lock().expect("era lock");
             let bg_ticks = st.bg_ticks.load(Ordering::Relaxed);
+            let web_hits = st.web_hits.load(Ordering::Relaxed);
             let info_n = st.info.lock().expect("info lock").len();
             let eval = honesty_batch(96, 424_242);
             let acc = accuracy(
@@ -488,7 +627,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -505,6 +644,7 @@ fn main() {
     let mut port = 8080u16;
     let mut every = 4u32;
     let mut bg_secs = 20u64;
+    let mut web_secs = 0u64;
     #[cfg(feature = "llama")]
     let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
@@ -512,6 +652,7 @@ fn main() {
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(8080),
             "--every" => every = args.next().and_then(|v| v.parse().ok()).unwrap_or(4),
             "--bg" => bg_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
+            "--web" => web_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             #[cfg(feature = "llama")]
             "--model" => model_path = args.next(),
             _ => {}
@@ -596,12 +737,21 @@ fn main() {
         bg_secs,
         bg_ticks: AtomicU64::new(0),
         info: Mutex::new(st_info),
+        web_secs,
+        web_hits: AtomicU64::new(0),
         #[cfg(feature = "llama")]
         llama: llama_slot,
     });
     // ФОН (M2-1): дообучение по таймеру — поток живёт, пока жив клиент.
     let st_bg = Arc::clone(&st);
     std::thread::spawn(move || bg_trainer(st_bg));
+    // WEB-ФИД (M2-2): факты из сети → инфосфера (0 = выкл).
+    if web_secs > 0 {
+        let st_web = Arc::clone(&st);
+        let web_sgn = Ed25519Signer::from_seed(&[0u8; 32]);
+        std::thread::spawn(move || web_feed(st_web, web_sgn));
+        println!("web-фид: раз в {web_secs} сек, тема → факты → инфосфера");
+    }
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -701,12 +851,39 @@ document.getElementById('st').textContent='ходов: '+pairs.turns+' | обу�
 +' (учителя: '+pairs.teacher+') | эр роя: '+pairs.eras+' | чек-пойнтов: '+pairs.cps
 +' | точность реплики на общем eval: '+pairs.acc
 +' | фон: '+pairs.bg+' тиков (эры самообучения по таймеру)'
-+' | инфосфера: '+pairs.info+' записей';});}
++' | инфосфера: '+pairs.info+' записей'
++' | web-фид: '+pairs.web+' тем (факты из сети)';});}
 </script></body></html>"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_snippets_extract_and_clean() {
+        // fixture «DuckDuckGo html»: вложенные теги + сущности
+        let html = r#"<html><body>
+<div class="results">
+<a class="result__a">Spintronics — Wikipedia</a>
+<a class="result__snippet" data-l="1">Spintronics uses <b>electron spin</b> &amp; charge — not only current &#39;much&#39; fun &lt;long&gt;</a>
+<a class="result__snippet" data-l="2">Второй результат: спин электрона несёт половинку момента количества движения</a>
+<span class="result-snippet">Lite-формат тоже парсится (result-snippet) точками</span>
+</div></body></html>"#;
+        let s = web_snippets(html, 3);
+        assert_eq!(s.len(), 3, "сниппеты: {s:?}");
+        assert!(s[0].contains("electron spin"));
+        assert!(s[0].contains("&"), "сущность не разжата: {}", s[0]);
+        assert!(s[0].contains("'much'"), "одинарные кавычки: {}", s[0]);
+        assert!(s[0].contains("<long>"), "двойные сущности: {}", s[0]);
+        assert!(!s[0].contains('<') || s[0].contains("<long>"), "тег срезан: {}", s[0]);
+        assert!(s[1].starts_with("Второй результат"), "{:?}", s[1]);
+        assert!(s[2].contains("Lite-формат"), "{:?}", s[2]);
+    }
+
+    #[test]
+    fn web_snippets_no_results_is_empty() {
+        assert!(web_snippets("<html>ничего нет</html>", 3).is_empty());
+    }
 
     #[test]
     fn pct_roundtrip_utf8() {
