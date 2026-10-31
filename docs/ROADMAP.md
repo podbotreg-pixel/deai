@@ -70,6 +70,18 @@
       (std-only HTTP, страница вшита в бинарник), RAG-память (/ask//forget),
       пара учителя через UI `обучающая пара` → локальная эра роя от каждых
       N пар; та же страница потом станет окном Tauri 2 без переписывания
+- [x] GUI-стиль из СИСТЕМНОГО пакета (libjs-bootstrap, «всё локально»):
+      роут `GET /bs/<файл>` отдаёт whitelisted файлы из
+      /usr/share/javascript/bootstrap (css/bootstrap(.min).css + шрифты
+      glyphicons; БЕЗ CDN и внешних запросов; нет пакета → 404);
+      страница внизу проверяет, что stylesheet реально загрузился
+      (`l.sheet`), и переключает `no-bs → has-bs`: пакет есть —
+      Bootstrap ведёт кнопки/поля (`btn btn-primary/default`,
+      `form-control`), нет — работает прежняя тёмная тема целиком
+      (правила ввода/кнопок под селектором `.no-bs`,_LAYOUT-классы
+      свободны от коллизий: `.row` → `.line`). Скриншот живой страницы
+      и тест serve_bs_whitelist_and_traversal (без "../", вне списка —
+      404) зелёные.
 - [x] GUI + НАСТОЯЩАЯ LLM: `webchat --features llama --model путь.gguf` —
       `LlamaWorkerBridge` (модель в выделенном потоке, наружу канал + трейт
       `ChatModel`): свободные ходы отвечает llama.cpp, микроязык роя —

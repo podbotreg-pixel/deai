@@ -172,6 +172,44 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
     Some((method, path, body))
 }
 
+/// Бинарный ответ (шрифты/CSS из системных каталогов).
+fn respond_bytes(out: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.0 {status}\r\nContent-Type: {ctype}; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = out.write_all(head.as_bytes());
+    let _ = out.write_all(body);
+}
+
+/// СИСТЕМНЫЙ Bootstrap (пакет libjs-bootstrap; «всё локально»): отдаём
+/// ТОЛЬКО whitelisted файлы из /usr/share/javascript/bootstrap — ни CDN,
+/// ни внешних запросов. Пакета нет → 404: страница продолжает жить на
+/// собственной <style> (graceful degradation, тот же вид, что и раньше).
+const BS_BASE: &str = "/usr/share/javascript/bootstrap";
+
+/// Отдача файла по БЕЛОМУ списку (без "../" и прочих хитростей пути).
+fn serve_bs(rel: &str) -> Option<(Vec<u8>, &'static str)> {
+    if rel.contains("..") || rel.contains('\\') || rel.contains("\x00") {
+        return None;
+    }
+    const ALLOWED: &[(&str, &str)] = &[
+        ("css/bootstrap.min.css", "text/css"),
+        ("css/bootstrap.css", "text/css"),
+        ("css/bootstrap-theme.min.css", "text/css"),
+        ("fonts/glyphicons-halflings-regular.woff2", "font/woff2"),
+        ("fonts/glyphicons-halflings-regular.woff", "font/woff"),
+        ("fonts/glyphicons-halflings-regular.ttf", "font/ttf"),
+        ("fonts/glyphicons-halflings-regular.eot", "application/vnd.ms-fontobject"),
+        ("fonts/glyphicons-halflings-regular.svg", "image/svg+xml"),
+    ];
+    let (file, ctype) = ALLOWED.iter().find(|(f, _)| *f == rel)?;
+    std::fs::read(std::path::Path::new(BS_BASE).join(file))
+        .ok()
+        .map(|b| (b, *ctype))
+}
+
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     let out = format!(
         "HTTP/1.0 {status}\r\nContent-Type: {ctype}; charset=utf-8\r\n\
@@ -673,6 +711,17 @@ fn turn_model(
 }
 
 fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpStream) {
+    // локальные стат-ассеты: GET /bs/<файл> (system libjs-bootstrap)
+    if method == "GET" {
+        if let Some(rel) = path.strip_prefix("/bs/") {
+            return match serve_bs(rel) {
+                Some((bytes, ctype)) => respond_bytes(out, "200 OK", ctype, &bytes),
+                None => {
+                    respond(out, "404 Not Found", "text/plain", "нет файла (libjs-bootstrap не установлен)")
+                }
+            };
+        }
+    }
     match (method, path) {
         ("GET", "/") => respond(out, "200 OK", "text/html", PAGE),
         ("POST", "/api/turn") => {
@@ -1026,31 +1075,34 @@ fn main() {
 const PAGE: &str = r#"<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <title>DI-NET — чат</title>
+<link id="bslink" rel="stylesheet" href="/bs/css/bootstrap.min.css">
 <style>
 body{font-family:sans-serif;max-width:820px;margin:2rem auto;background:#101418;color:#ddd}
 h1{font-size:1.2rem;color:#7fd}#log{min-height:300px;border:1px solid #333;background:#161b22;padding:1rem;border-radius:8px}
 .msg{margin:.5rem 0;padding:.4rem .7rem;border-radius:8px;max-width:85%}
 .u{background:#1f3a5f;align-self:flex-start}.a{background:#2b2740}
-.row{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.8rem}
-input{flex:1;min-width:200px;padding:.5rem;border-radius:6px;border:1px solid #444;background:#0c1015;color:#ddd}
-button{padding:.5rem .9rem;border-radius:6px;border:0;background:#2563ab;color:#fff;cursor:pointer}
-button.sec{background:#444}#st{color:#8a8;font-size:.85rem;margin-top:.6rem}
+.line{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.8rem}
+.no-bs input{flex:1;min-width:200px;padding:.5rem;border-radius:6px;border:1px solid #444;background:#0c1015;color:#ddd}
+.no-bs button{padding:.5rem .9rem;border-radius:6px;border:0;background:#2563ab;color:#fff;cursor:pointer}
+.no-bs button.sec{background:#444}
+.line .form-control{width:auto;flex:1;min-width:200px}
+#st{color:#8a8;font-size:.85rem;margin-top:.6rem}
 .mem{color:#9bd4ff;margin-top:.4rem}small{color:#777}
 </style></head><body>
 <h1>DI-NET — децентрализованная нейросеть (всё локально)</h1>
 <div id="log"></div>
-<div class="row">
-<input id="msg" placeholder="сообщение («ай ви ди би» — микроязык роя)">
-<button onclick="send()">Отправить</button>
+<div class="line">
+<input id="msg" placeholder="сообщение («ай ви ди би» — микроязык роя)" class="form-control">
+<button class="btn btn-primary" onclick="send()">Отправить</button>
 </div>
-<div class="row">
-<input id="tc" placeholder="контекст: ай ви ди би"><input id="ta" style="max-width:140px" placeholder="ответ: следующее слово (+1), зи→ай">
-<button class="sec" onclick="teach()">Учить (пара учителя)</button>
+<div class="line">
+<input id="tc" placeholder="контекст: ай ви ди би" class="form-control"><input id="ta" style="max-width:140px" placeholder="ответ: следующее слово (+1), зи→ай" class="form-control">
+<button class="btn btn-default" onclick="teach()">Учить (пара учителя)</button>
 </div>
-<div class="row">
-<input id="q" placeholder="поиск в памяти"><button class="sec" onclick="ask()">Память</button>
-<button class="sec" onclick="hist()">История</button>
-<button class="sec" onclick="stats()">Статистика</button>
+<div class="line">
+<input id="q" placeholder="поиск в памяти" class="form-control"><button class="btn btn-default" onclick="ask()">Память</button>
+<button class="btn btn-default" onclick="hist()">История</button>
+<button class="btn btn-default" onclick="stats()">Статистика</button>
 </div>
 <div id="mem"></div>
 <div id="st">…</div>
@@ -1098,6 +1150,14 @@ document.getElementById('st').textContent='ходов: '+pairs.turns+' | обу�
 +' | web-фид: '+pairs.web+' тем (факты из сети)'
 +' | правил роя: '+pairs.rules+' (кворумных: '+pairs.qrs+')'
 +' | p2p-обмен: '+pairs.p2p+' принятых записей';});}
+/* системный Bootstrap: реально загрузился? нет — живём на собственной
+   теме (no-bs), есть — пусть управляет кнопками/полями (has-bs). */
+(function(){
+var l=document.getElementById('bslink');
+if(l && l.sheet && l.sheet.cssRules && l.sheet.cssRules.length){
+    document.body.classList.replace('no-bs','has-bs');
+}
+})();
 </script></body></html>"#;
 
 #[cfg(test)]
@@ -1176,6 +1236,22 @@ mod tests {
     fn form_plus_is_space() {
         assert_eq!(form_decode("a+b%2Bc"), "a b+c");
     }
+    /// /bs/: строгое whitelisting-ядро, никакого "../" traversal, файл
+    /// system-libjs-bootstrap отдаётся когда пакет установлен.
+    #[test]
+    fn serve_bs_whitelist_and_traversal() {
+        assert!(serve_bs("../../etc/passwd").is_none(), "обход пути");
+        assert!(serve_bs("css/../../etc/group").is_none(), "обход через css");
+        assert!(serve_bs("js/bootstrap.min.js").is_none(), "вне whitelist");
+        assert!(serve_bs("less/bootstrap.less").is_none(), "исходники не отдаём");
+        let css = std::path::Path::new("/usr/share/javascript/bootstrap/css/bootstrap.min.css");
+        if css.exists() {
+            let (b, t) = serve_bs("css/bootstrap.min.css").expect("файл отдаётся");
+            assert!(b.len() > 1000, "empty css? bytes={}", b.len());
+            assert_eq!(t, "text/css");
+        }
+    }
+
     /// Ключевые слова: короткие и служебные выпали, содержательные —
     /// нижним регистром, без повторов.
     #[test]
