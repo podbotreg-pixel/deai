@@ -17,3 +17,6 @@ pub mod reg_sync;
 
 /// ФАЗА I: внешние якоря (кольцо свидетелей, анти-откат).
 pub mod anchors;
+
+/// ФАЗА J: Hello/PEX знакомство новичка (TOFU).
+pub mod join;

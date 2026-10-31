@@ -27,6 +27,8 @@ pub const CH_BLOB: u8 = 4;
 pub const CH_REG: u8 = 5;
 /// Внешние анкоры: штамп/вопрос/ответ (фаза I — анти-откат).
 pub const CH_ANCHOR: u8 = 6;
+/// Знакомство новичка: Hello/HelloAck (фаза J, TOFU + PEX).
+pub const CH_HELLO: u8 = 7;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

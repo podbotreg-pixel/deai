@@ -133,6 +133,49 @@ impl PeerBook {
     pub fn dids(&self) -> Vec<String> {
         self.verifiers.values().map(|v| v.did()).collect()
     }
+
+    /// Пустая книга (для старта новичка).
+    pub fn empty() -> PeerBook {
+        PeerBook {
+            verifiers: BTreeMap::new(),
+            nid_by_sender: BTreeMap::new(),
+        }
+    }
+
+    /// Занести верификатор ключа. `nid` — роевой адрес, если он известен
+    /// (иначе разбирается рутинг позже:belongsTo §Hello/PEX фаза J).
+    pub fn enroll(&mut self, sender: [u8; 32], nid: Option<NodeId>) {
+        if let Some(v) = dinet_crypto::Ed25519Verifier::new(sender) {
+            self.verifiers.insert(sender, Box::new(v));
+        }
+        if let Some(id) = nid {
+            self.nid_by_sender.insert(sender, id);
+        }
+    }
+
+    /// Ключ уже в книге?
+    pub fn knows(&self, sender: &[u8; 32]) -> bool {
+        self.verifiers.contains_key(sender)
+    }
+
+    /// Занесённые ключи (дид-идентификаторы 32 байта).
+    pub fn senders(&self) -> Vec<[u8; 32]> {
+        self.verifiers.keys().copied().collect()
+    }
+
+    /// Верификатор конкретного ключа (если занесён).
+    pub fn verifier(&self, sender: &[u8; 32]) -> Option<&dyn Verifier> {
+        self.verifiers.get(sender).map(|b| b.as_ref())
+    }
+
+    /// Число занесённых ключей.
+    pub fn len(&self) -> usize {
+        self.verifiers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.verifiers.is_empty()
+    }
 }
 
 /// PeerBook по узлам этого процесса (тесты).
