@@ -124,9 +124,9 @@ impl Node {
 /// PeerBook: sender (публичный ключ kadра) → проверка подписи.
 /// Только публичные ключи — чужих секретов узел не знает никогда.
 pub struct PeerBook {
-    verifiers: BTreeMap<[u8; SENDER_LEN], Box<dyn Verifier>>,
+    pub(crate) verifiers: BTreeMap<[u8; SENDER_LEN], Box<dyn Verifier>>,
     /// sim-привязка pubkey → NodeId (v1: NodeId сам выводит из DID/DHT)
-    nid_by_sender: BTreeMap<[u8; SENDER_LEN], NodeId>,
+    pub(crate) nid_by_sender: BTreeMap<[u8; SENDER_LEN], NodeId>,
 }
 
 impl PeerBook {

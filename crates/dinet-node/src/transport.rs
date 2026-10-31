@@ -25,6 +25,8 @@ pub const CH_NOTARY: u8 = 3;
 pub const CH_BLOB: u8 = 4;
 /// Синхронизация реестра: ask/offer (фаза H — новичок догоняет append-only лог).
 pub const CH_REG: u8 = 5;
+/// Внешние анкоры: штамп/вопрос/ответ (фаза I — анти-откат).
+pub const CH_ANCHOR: u8 = 6;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

@@ -81,6 +81,8 @@ const T_BLOB_IDX: u8 = 36;
 const T_BLOB_BYTES: u8 = 37;
 const T_REG_HAVE: u8 = 38;
 const T_REG_REC: u8 = 39;
+const T_ANC_SEQ: u8 = 40;
+const T_ANC_ID: u8 = 41;
 const T_DELTA: u8 = 31;
 const T_NORM: u8 = 32;
 
@@ -115,6 +117,12 @@ pub enum MsgType {
     RegAsk = 0x54,
     /// ответ: сетевые байты записей после head просившего.
     RegOffer = 0x55,
+    /// анкор: штамп головы реестра от роя (подпись минёра).
+    AnchorStamp = 0x56,
+    /// анкор: «что подкреплено?» (от узла рестарта).
+    AnchorAsk = 0x57,
+    /// анкор: подкреплённая голова (ответ кольца).
+    AnchorTell = 0x58,
 }
 
 impl MsgType {
@@ -141,6 +149,9 @@ impl MsgType {
             0x53 => MsgType::BlobChunk,
             0x54 => MsgType::RegAsk,
             0x55 => MsgType::RegOffer,
+            0x56 => MsgType::AnchorStamp,
+            0x57 => MsgType::AnchorAsk,
+            0x58 => MsgType::AnchorTell,
             _ => return None,
         })
     }
@@ -189,6 +200,12 @@ pub enum Payload {
     RegAsk { have: u32 },
     /// хвост чужого реестра: пачка сетевых байтов записей (encode_record).
     RegOffer { records: Vec<Vec<u8>> },
+    /// штамп внешнему анкору: «голова реестра — (seq, id)» (подпись роя).
+    AnchorStamp { head_seq: u32, head_id: [u8; 32] },
+    /// узел рестарта спрашивает кольцо анкоров: «что подкреплено?»
+    AnchorAsk,
+    /// ответ анкора: последняя закоммиченная голова.
+    AnchorTell { head_seq: u32, head_id: [u8; 32] },
     SkillShare { skill_hash: [u8; 32], abi_version: u16, body: Vec<u8> },
 }
 
@@ -335,6 +352,11 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
                 e.bytes(T_REG_REC, r);
             }
         }
+        Payload::AnchorStamp { head_seq, head_id } | Payload::AnchorTell { head_seq, head_id } => {
+            e.num(T_ANC_SEQ, *head_seq);
+            e.b32(T_ANC_ID, head_id);
+        }
+        Payload::AnchorAsk => {}
         Payload::SkillShare { skill_hash, abi_version, body } => {
             e.b32(T_SHASH, skill_hash);
             e.num(T_ABI, *abi_version as u32);
@@ -591,6 +613,15 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             }
             Ok(Payload::RegOffer { records })
         }
+        MsgType::AnchorStamp => Ok(Payload::AnchorStamp {
+            head_seq: d.u32(T_ANC_SEQ)?,
+            head_id: d.b32(T_ANC_ID)?,
+        }),
+        MsgType::AnchorAsk => Ok(Payload::AnchorAsk),
+        MsgType::AnchorTell => Ok(Payload::AnchorTell {
+            head_seq: d.u32(T_ANC_SEQ)?,
+            head_id: d.b32(T_ANC_ID)?,
+        }),
         MsgType::SkillShare => Ok(Payload::SkillShare {
             skill_hash: d.b32(T_SHASH)?,
             abi_version: d.u16(T_ABI)?,
