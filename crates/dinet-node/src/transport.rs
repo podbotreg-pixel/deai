@@ -29,6 +29,8 @@ pub const CH_REG: u8 = 5;
 pub const CH_ANCHOR: u8 = 6;
 /// Знакомство новичка: Hello/HelloAck (фаза J, TOFU + PEX).
 pub const CH_HELLO: u8 = 7;
+/// Инфосфера: анонс/ask/body записей (фаза K — общая память роя).
+pub const CH_INFO: u8 = 8;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).
