@@ -474,6 +474,41 @@ fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
 /// - без llama-фичи: только реплика роя (как раньше).
 /// Куски ответа отдаются поточно (`on`) — HTTP-ответ пишется по мере генерации.
 #[cfg_attr(not(feature = "llama"), allow(unused_variables))]
+// ---------------------------------------------------------------------------
+// ПОДГРУЗКА ИНСТРУКЦИЙ РОЯ В ЧАТ (M2): правила сети видит каждая модель
+// ---------------------------------------------------------------------------
+
+/// Контекст = СНАЧАЛА сетевые правила роя, потом память (RAG).
+fn rules_ctx(rules: &[String], context: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = rules.iter().map(|r| format!("правило роя: {r}")).collect();
+    out.extend(context.iter().cloned());
+    out
+}
+
+/// Обёртка модели: до всякого API протаскивает в контекст инструкции
+/// роя (kind=инструкция из инфосферы) — и реплика, и llama.cpp читают
+/// одни и те же сетевые правила.
+struct RulesWrap<'m> {
+    inner: &'m mut dyn dinet_chat::ChatModel,
+    rules: Vec<String>,
+}
+
+impl dinet_chat::ChatModel for RulesWrap<'_> {
+    fn respond(&mut self, user: &str, context: &[String]) -> String {
+        let ctx = rules_ctx(&self.rules, context);
+        self.inner.respond(user, &ctx)
+    }
+
+    fn respond_stream(&mut self, user: &str, context: &[String], on: &mut dyn FnMut(&str)) {
+        let ctx = rules_ctx(&self.rules, context);
+        self.inner.respond_stream(user, &ctx, on)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+}
+
 fn turn_model(
     st: &ChatState,
     g: &mut ChatSession,
@@ -481,6 +516,15 @@ fn turn_model(
     replica: ToyModel,
     on: &mut dyn FnMut(&str),
 ) -> std::io::Result<(String, Vec<String>)> {
+    // инструкции роя на этот ход (короткая блокировка, без вложенностей)
+    let rules: Vec<String> = {
+        let info = st.info.lock().expect("info lock");
+        info.instructions()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.value).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
     // микроязыковые ходы всегда понимает рой-реплика
     #[cfg(feature = "llama")]
     {
@@ -488,13 +532,18 @@ fn turn_model(
         match (&st.llama, lex_mode) {
             (Some(slot), false) => {
                 let mut m = slot.lock().expect("llama slot");
-                return g.turn_with(&mut **m, user, now_ts(), on);
+                let mut w = RulesWrap {
+                    inner: &mut **m,
+                    rules,
+                };
+                return g.turn_with(&mut w, user, now_ts(), on);
             }
             _ => {}
         }
     }
     let mut toy = ToyChatModel::trained(replica);
-    g.turn_with(&mut toy, user, now_ts(), on)
+    let mut w = RulesWrap { inner: &mut toy, rules };
+    g.turn_with(&mut w, user, now_ts(), on)
 }
 
 fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpStream) {
@@ -578,6 +627,17 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 Err(err) => respond(out, "500 err", "text/plain", &pct_encode(&format!("{err}"))),
             }
         }
+        ("GET", "/api/rules") => {
+            // СЕТЕВЫЕ правила: инструкции роя из инфосферы (снимок на вызов).
+            let info = st.info.lock().expect("info lock");
+            let mut lines = String::new();
+            for r in info.instructions() {
+                let text = String::from_utf8_lossy(&r.value);
+                lines.push_str(&pct_encode(&text));
+                lines.push('\n');
+            }
+            respond(out, "200 OK", "text/plain", &lines);
+        }
         ("GET", "/api/history") => {
             let g = st.session.lock().expect("session lock");
             let mut lines = String::new();
@@ -616,7 +676,10 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             let e = st.era.lock().expect("era lock");
             let bg_ticks = st.bg_ticks.load(Ordering::Relaxed);
             let web_hits = st.web_hits.load(Ordering::Relaxed);
-            let info_n = st.info.lock().expect("info lock").len();
+            let (info_n, rules_n) = {
+                let info = st.info.lock().expect("info lock");
+                (info.len(), info.instructions().len())
+            };
             let eval = honesty_batch(96, 424_242);
             let acc = accuracy(
                 &ToyModel { base: e.node.base.clone(), adapter: e.node.adapter.clone() },
@@ -627,7 +690,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -852,12 +915,49 @@ document.getElementById('st').textContent='ходов: '+pairs.turns+' | обу�
 +' | точность реплики на общем eval: '+pairs.acc
 +' | фон: '+pairs.bg+' тиков (эры самообучения по таймеру)'
 +' | инфосфера: '+pairs.info+' записей'
-+' | web-фид: '+pairs.web+' тем (факты из сети)';});}
++' | web-фид: '+pairs.web+' тем (факты из сети)'
++' | правил роя: '+pairs.rules;});}
 </script></body></html>"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_wrap_propagates_royal_rules() {
+        use dinet_chat::ChatModel;
+        struct CtxTaker {
+            seen: Vec<String>,
+        }
+        impl ChatModel for CtxTaker {
+            fn respond(&mut self, _user: &str, context: &[String]) -> String {
+                self.seen = context.to_vec();
+                "ок".to_string()
+            }
+            fn name(&self) -> &'static str {
+                "ctx-taker"
+            }
+        }
+        let mut inner = CtxTaker { seen: Vec::new() };
+        let mut w = RulesWrap {
+            inner: &mut inner,
+            rules: vec!["в сомнении говори «не знаю»".to_string()],
+        };
+        let ans = w.respond("привет", &["факт памяти".to_string()]);
+        assert_eq!(ans, "ок");
+        assert_eq!(inner.seen[0], "правило роя: в сомнении говори «не знаю»");
+        assert!(inner.seen.contains(&"факт памяти".to_string()), "память потерялась");
+    }
+
+    #[test]
+    fn rules_ctx_rules_before_memory() {
+        let ctx = rules_ctx(&["ис1".to_string()], &["факт1".to_string(), "факт2".to_string()]);
+        assert_eq!(ctx, vec![
+            "правило роя: ис1".to_string(),
+            "факт1".to_string(),
+            "факт2".to_string()
+        ]);
+    }
 
     #[test]
     fn web_snippets_extract_and_clean() {
