@@ -55,6 +55,16 @@ pub struct InfoRec {
     pub author: [u8; 32],
     pub sig: Vec<u8>,
     pub value: Vec<u8>,
+    /// КВОРУМНАЯ ПЕЧАТЬ: со-подписи ДРУГИХ узлов поверх того же canon
+    /// (инструкции роя получают признание «не только автор сказал»).
+    pub seals: Vec<InfoSeal>,
+}
+
+/// Со-подпись записи: sig = подпись УЗЛА sealer поверх canon записи.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfoSeal {
+    pub sealer: [u8; 32],
+    pub sig: [u8; 64],
 }
 
 /// Хранилище узла: content-addressed, append-only по сути своей; файл
@@ -108,7 +118,34 @@ impl InfoStore {
                     author,
                     sig,
                     value,
+                    seals: Vec::new(),
                 });
+            }
+        }
+        // со-подписи: отдельный append-only лог [len][id 32][sealer 32][sig 64],
+        // подгружаем к записям поверх основного лога
+        if let Some(seals_path) = s.seals_path() {
+            if let Ok(raw) = std::fs::read(&seals_path) {
+                let mut pos = 0usize;
+                while raw.len() - pos >= 4 {
+                    let n = u32::from_le_bytes(raw[pos..pos + 4].try_into().expect("4б")) as usize;
+                    pos += 4;
+                    if n != 128 || raw.len() - pos < n {
+                        break; // не наш формат / оборван хвост
+                    }
+                    let mut id = [0u8; 32];
+                    let mut sealer = [0u8; 32];
+                    let mut sig = [0u8; 64];
+                    id.copy_from_slice(&raw[pos..pos + 32]);
+                    sealer.copy_from_slice(&raw[pos + 32..pos + 64]);
+                    sig.copy_from_slice(&raw[pos + 64..pos + 128]);
+                    pos += n;
+                    if let Some(rec) = s.recs.get_mut(&id) {
+                        if !rec.seals.iter().any(|x| x.sealer == sealer) {
+                            rec.seals.push(InfoSeal { sealer, sig });
+                        }
+                    }
+                }
             }
         }
         s
@@ -150,6 +187,15 @@ impl InfoStore {
             .collect()
     }
 
+    /// Сколько инструкций достигли кворума `need` подписей
+    /// (обычный призыв: 2 = автор + один узел признания).
+    pub fn quorum_rules(&self, need: usize) -> usize {
+        self.recs
+            .values()
+            .filter(|r| r.kind == KIND_INSTRUCTION && self.quorum_of(&r.info_id, need))
+            .count()
+    }
+
     /// Число записей.
     pub fn len(&self) -> usize {
         self.recs.len()
@@ -176,6 +222,62 @@ impl InfoStore {
             let _ = f.write_all(&out);
             let _ = f.flush();
         }
+    }
+
+    /// Кворумная печать: со-подпись записи другим узлом. sig проверяется
+    /// ПОВЕРХ canon записи; повтор печати тем же узлом Iterable игнорится.
+    /// Возврат true — свежая со-подпись добавлена (false — был/плохая).
+    pub fn seal(&mut self, id: &[u8; 32], sealer: &[u8; 32], sig: &[u8; 64]) -> bool {
+        let Some(rec) = self.recs.get_mut(id) else { return false };
+        if rec.seals.iter().any(|s| &s.sealer == sealer) {
+            return false; // этот узел уже печатал
+        }
+        let canon = canon(rec.kind, rec.ts, &rec.author, &rec.value);
+        let ok = dinet_crypto::Ed25519Verifier::new(*sealer)
+            .map(|v| v.verify(&canon, sig))
+            .unwrap_or(false);
+        if !ok {
+            return false; // подпись печати не сходится с canon
+        }
+        rec.seals.push(InfoSeal { sealer: *sealer, sig: *sig });
+        self.persist_seal(id, sealer, sig);
+        true
+    }
+
+    /// Сколько узлов подпечатали запись (автор со своей подписью + seals).
+    pub fn quorum_count(&self, id: &[u8; 32]) -> usize {
+        self.recs.get(id).map(|r| 1 + r.seals.len()).unwrap_or(0)
+    }
+
+    /// Кворум достигнут? need = порог (клиент роя решает сам; v0 = 2).
+    pub fn quorum_of(&self, id: &[u8; 32], need: usize) -> bool {
+        self.quorum_count(id) >= need
+    }
+
+    /// Файл со-подписей: append-only лог [len][id 32][sealer 32][sig 64]
+    /// — подгружается при open (seals НЕ внутри основной записи-лога).
+    fn persist_seal(&self, id: &[u8; 32], sealer: &[u8; 32], sig: &[u8; 64]) {
+        let Some(p) = &self.seals_path() else { return };
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let mut body = Vec::with_capacity(32 + 32 + 64);
+            body.extend_from_slice(id);
+            body.extend_from_slice(sealer);
+            body.extend_from_slice(sig);
+            let mut out = Vec::with_capacity(4 + body.len());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            let _ = f.write_all(&out);
+            let _ = f.flush();
+        }
+    }
+
+    fn seals_path(&self) -> Option<std::path::PathBuf> {
+        self.path.as_ref().map(|p| {
+            let mut s = p.clone().into_os_string();
+            s.push(".seals");
+            std::path::PathBuf::from(s)
+        })
     }
 }
 
@@ -221,6 +323,7 @@ pub fn craft_entry(
         author,
         sig,
         value: value.to_vec(),
+        seals: Vec::new(),
     }
 }
 
@@ -350,6 +453,7 @@ pub fn infosphere_sync(
                     author,
                     sig,
                     value,
+                    seals: Vec::new(),
                 };
                 if stores[idx].put(rec) {
                     out[idx].learned += 1;
@@ -428,6 +532,48 @@ mod tests {
         assert_eq!(reopened.len(), 2);
         assert_eq!(reopened.get(&ins.info_id).expect("инструкция").value, ins.value);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Со-подписи (кворумная печать): валидные добавляются 1 шт/узел,
+    /// подделка и повтор отвергаются; seals-файл переживает переоткрытие.
+    #[test]
+    fn instructions_get_quorum_seals() {
+        let dir = tmpdir("seals");
+        let a = Ed25519Signer::from_seed(&[61u8; 32]);
+        let b = Ed25519Signer::from_seed(&[62u8; 32]);
+        let mut s = InfoStore::open(dir.join("i.info"));
+
+        // запись ЧУЖОГО автора (мы собираемся её признать)
+        let ins = craft_entry(&a, KIND_INSTRUCTION, 300, b"royal instruction: no fake facts");
+        assert!(s.put(ins.clone()));
+        assert_eq!(s.quorum_count(&ins.info_id), 1, "авторская подпись = 1");
+
+        // другой узел печатает запись поверх того же canon
+        let canon_b = canon(ins.kind, ins.ts, &ins.author, &ins.value);
+        let seal_b = b.sign(&canon_b);
+        assert!(s.seal(&ins.info_id, &b.pubkey(), &seal_b));
+        assert_eq!(s.quorum_count(&ins.info_id), 2);
+        assert!(s.quorum_of(&ins.info_id, 2), "кворум 2/2 достигнут");
+
+        // повтор печати тем же узлом — не нова
+        assert!(!s.seal(&ins.info_id, &b.pubkey(), &seal_b));
+        assert_eq!(s.quorum_count(&ins.info_id), 2);
+
+        // подделка: печать третьего узла ПОВЕРХ чужого canon — отвергнута
+        let c = Ed25519Signer::from_seed(&[63u8; 32]);
+        let fake = c.sign(&canon(ins.kind, 111, &ins.author, &ins.value)); // ts иной
+        assert!(!s.seal(&ins.info_id, &c.pubkey(), &fake), "подделка прошла");
+        assert_eq!(s.quorum_count(&ins.info_id), 2);
+
+        // печать отсутствующей записи — false
+        assert!(!s.seal(&[9u8; 32], &b.pubkey(), &seal_b));
+
+        // seals переживают переоткрытие вместе с записью
+        let reopened = InfoStore::open(dir.join("i.info"));
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.quorum_count(&ins.info_id), 2, "файл печати потерялся");
+        assert!(reopened.quorum_of(&ins.info_id, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

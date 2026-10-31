@@ -684,12 +684,14 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             }
         }
         ("GET", "/api/rules") => {
-            // СЕТЕВЫЕ правила: инструкции роя из инфосферы (снимок на вызов).
+            // СЕТЕВЫЕ правила: инструкции роя из инфосферы (снимок на
+            // вызов); рядом — со-подписи (автор + печати узлов).
             let info = st.info.lock().expect("info lock");
             let mut lines = String::new();
             for r in info.instructions() {
                 let text = String::from_utf8_lossy(&r.value);
-                lines.push_str(&pct_encode(&text));
+                let line = format!("{} [подписей: {}]", text, info.quorum_count(&r.info_id));
+                lines.push_str(&pct_encode(&line));
                 lines.push('\n');
             }
             respond(out, "200 OK", "text/plain", &lines);
@@ -733,9 +735,13 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             let bg_ticks = st.bg_ticks.load(Ordering::Relaxed);
             let web_hits = st.web_hits.load(Ordering::Relaxed);
             let p2p_took = st.p2p_took.load(Ordering::Relaxed);
-            let (info_n, rules_n) = {
+            let (info_n, rules_n, quorum_n) = {
                 let info = st.info.lock().expect("info lock");
-                (info.len(), info.instructions().len())
+                (
+                    info.len(),
+                    info.instructions().len(),
+                    info.quorum_rules(2),
+                )
             };
             let eval = honesty_batch(96, 424_242);
             let acc = accuracy(
@@ -747,7 +753,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&p2p={p2p_took}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -1016,7 +1022,8 @@ document.getElementById('st').textContent='ходов: '+pairs.turns+' | обу�
 +' | фон: '+pairs.bg+' тиков (эры самообучения по таймеру)'
 +' | инфосфера: '+pairs.info+' записей'
 +' | web-фид: '+pairs.web+' тем (факты из сети)'
-+' | правил роя: '+pairs.rules+' | p2p-обмен: '+pairs.p2p+' принятых записей';});}
++' | правил роя: '+pairs.rules+' (кворумных: '+pairs.qrs+')'
++' | p2p-обмен: '+pairs.p2p+' принятых записей';});}
 </script></body></html>"#;
 
 #[cfg(test)]

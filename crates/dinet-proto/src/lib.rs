@@ -119,6 +119,8 @@ const T_INFO_AUTHOR: u8 = 45;
 const T_INFO_SIG: u8 = 46;
 const T_INFO_VALUE: u8 = 47;
 const T_INFO_VLEN: u8 = 48;
+const T_INFO_SEALER: u8 = 49;
+const T_INFO_SEAL: u8 = 50;
 const T_DELTA: u8 = 31;
 const T_NORM: u8 = 32;
 
@@ -165,6 +167,8 @@ pub enum MsgType {
     InfoAsk = 0x5A,
     /// инфосфера: тело записи (canon-байты + автор-подпись).
     InfoBody = 0x5B,
+    /// инфосфера: со-подпись записи другим узлом (кворумная печать).
+    InfoSeal = 0x5C,
 }
 
 impl MsgType {
@@ -197,6 +201,7 @@ impl MsgType {
             0x59 => MsgType::InfoAnnounce,
             0x5A => MsgType::InfoAsk,
             0x5B => MsgType::InfoBody,
+            0x5C => MsgType::InfoSeal,
             _ => return None,
         })
     }
@@ -265,6 +270,8 @@ pub enum Payload {
         sig: Vec<u8>,
         value: Vec<u8>,
     },
+    /// инфосфера: со-подпись записи (кворумная печать инструкций).
+    InfoSeal { info_id: [u8; 32], sealer: [u8; 32], seal: Vec<u8> },
     SkillShare { skill_hash: [u8; 32], abi_version: u16, body: Vec<u8> },
 }
 
@@ -433,6 +440,11 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.b32(T_INFO_AUTHOR, author);
             e.bytes(T_INFO_SIG, sig);
             e.bytes(T_INFO_VALUE, value);
+        }
+        Payload::InfoSeal { info_id, sealer, seal } => {
+            e.b32(T_INFO_ID, info_id);
+            e.b32(T_INFO_SEALER, sealer);
+            e.bytes(T_INFO_SEAL, seal);
         }
         Payload::AnchorAsk => {}
         Payload::SkillShare { skill_hash, abi_version, body } => {
@@ -721,6 +733,11 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             author: d.b32(T_INFO_AUTHOR)?,
             sig: d.bytes(T_INFO_SIG, 64)?,
             value: d.bytes(T_INFO_VALUE, MAX_INFO_BODY)?,
+        }),
+        MsgType::InfoSeal => Ok(Payload::InfoSeal {
+            info_id: d.b32(T_INFO_ID)?,
+            sealer: d.b32(T_INFO_SEALER)?,
+            seal: d.bytes(T_INFO_SEAL, 64)?,
         }),
         MsgType::SkillShare => Ok(Payload::SkillShare {
             skill_hash: d.b32(T_SHASH)?,

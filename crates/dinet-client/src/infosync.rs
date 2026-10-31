@@ -3,19 +3,25 @@
 //!
 //! Поверх ЛЮБОГО Transport (мост libp2p с каналом CH_INFO, файл-спул,
 //! mesh) крутится одна фаза-тик:
-//!   1. collect чужого → анонсы / аски / тела;
-//!   2. push СВОИХ ещё не анонсированных записей (квота за тик —
-//!      вежливость, не заливаем сеть новостями целиком);
-//!   3. чужие аски → InfoBody своих записей (мы держатели);
-//!   4. чужие тела → InfoStore.put (put сам проверяет id/подпись
-//!      автора — подделка не сохранится);
-//!   5. чужие анонсы → InfoAsk отсутствующих id.
+//!   1. collect чужого → анонсы / аски / тела / печати;
+//!   2. пуш СВОИХ ещё не анонсированных записей (квота за тик —
+//!      вежливость) + relay ЧУЖИХ инструкций: правила роя доходят
+//!      всем даже без прямых связей «автор → все»;
+//!   3. чужие аски → InfoBody из своего хранилища (мы держатели,
+//!      кадр подписан нами, авторская подпись внутри payload);
+//!   4. чужие тела → InfoStore.put (id/подпись автора проверяет put
+//!      — подделка не сохранится); ЧУЖУЮ инструкцию печатаем своей
+//!      подписью (признание роя: «не только автор сказал»);
+//!   5. чужие печати → InfoStore.seal (проверка над canon, дедуп);
+//!   6. чужие анонсы → InfoAsk отсутствующих id.
 //! Сквозная верификация TOFU: в кадре sender = pubkey автора кадра,
 //! подпись поверх canon-байт — чекается у всех одинаково.
 //! За несколько тиков сходится к полным копиям (v0-репликация).
 
 use dinet_crypto::{Ed25519Verifier, Signer, Verifier};
-use dinet_node::infosphere::{craft_entry, InfoRec, InfoStore};
+use dinet_node::infosphere::{
+    canon as info_canon, craft_entry, InfoRec, InfoStore, KIND_INSTRUCTION,
+};
 use dinet_node::swarm::NodeId;
 use dinet_node::transport::{Transport, CH_INFO};
 use dinet_proto::{Frame, MsgType, Payload};
@@ -23,6 +29,9 @@ use std::collections::HashSet;
 
 /// Максимум НАШИХ анонсов за один тик (вежливая квота).
 pub const PUSH_QUOTA: usize = 8;
+/// Максимум ЧУЖИХ инструкций, ретранслируемых за один тик (правила роя
+/// должны доходить всем даже без прямых связей «автор → все»).
+pub const RELAY_QUOTA: usize = 4;
 /// Максимум id в одном InfoAsk.
 pub const ASK_QUOTA: usize = 16;
 /// Максимум InfoBody, отвечаемых за один чужой аск.
@@ -37,11 +46,17 @@ pub struct InfoExchangeState {
     shared: HashSet<[u8; 32]>,
     /// чужие id, на которые уже просили тела (не спамим асками).
     asked: HashSet<[u8; 32]>,
+    /// чужие инструкции, которые мы УЖЕ признали (печать выслана).
+    sealed: HashSet<[u8; 32]>,
 }
 
 impl InfoExchangeState {
     pub fn new() -> InfoExchangeState {
-        InfoExchangeState { shared: HashSet::new(), asked: HashSet::new() }
+        InfoExchangeState {
+            shared: HashSet::new(),
+            asked: HashSet::new(),
+            sealed: HashSet::new(),
+        }
     }
 }
 
@@ -82,6 +97,54 @@ pub struct InfoSinkReport {
     pub taken: u32,
     /// чужих асков выставили (по анонсам)
     pub asked_out: u32,
+    /// ЧУЖИХ инструкций ретранслировано (правила роя идут всем)
+    pub relayed: u32,
+    /// со-подписей выслали (признали чужие инструкции)
+    pub seals_out: u32,
+    /// печатей чужих приняли и проверили
+    pub seals_in: u32,
+}
+
+/// Печать ЧУЖОЙ инструкции одним узлом: раз за жизнь записи у клиента.
+/// Работает и если запись только пришла телом, и если она уже лежала
+/// (id content-addressed — тот же id, тот же canon). Печать
+/// подписывается ПОД canon и уходит в сеть; у себя тоже приложение.
+#[allow(clippy::too_many_arguments)]
+fn seal_foreign_instruction(
+    key: &dyn Signer,
+    me_pub: &[u8; 32],
+    me_id: NodeId,
+    info: &mut InfoStore,
+    state: &mut InfoExchangeState,
+    t: &mut dyn Transport,
+    rep: &mut InfoSinkReport,
+    rec: &InfoRec,
+) {
+    if rec.kind != KIND_INSTRUCTION || rec.author == *me_pub {
+        return;
+    }
+    if state.sealed.contains(&rec.info_id) {
+        return;
+    }
+    if state.sealed.len() > MEM_CAP {
+        state.sealed.clear();
+    }
+    let seal = key.sign(&info_canon(rec.kind, rec.ts, &rec.author, &rec.value));
+    let _ = info.seal(&rec.info_id, me_pub, &seal); // печать живёт и у нас
+    state.sealed.insert(rec.info_id);
+    let out = signed_payload_bytes(
+        key,
+        MsgType::InfoSeal,
+        Payload::InfoSeal {
+            info_id: rec.info_id,
+            sealer: *me_pub,
+            seal: seal.to_vec(),
+        },
+    );
+    if let Ok(bytes) = out {
+        t.send(CH_INFO, me_id, None, &bytes);
+        rep.seals_out += 1;
+    }
 }
 
 /// Один тик обмена поверх канала CH_INFO.
@@ -106,8 +169,17 @@ pub fn info_exchange_tick(
         }
         match frame.payload {
             Payload::InfoAnnounce { info_id, .. } => {
-                if !info.has(&info_id) && !state.asked.contains(&info_id) {
-                    new_ids.push(info_id);
+                if !info.has(&info_id) {
+                    if !state.asked.contains(&info_id) {
+                        new_ids.push(info_id);
+                    }
+                } else if let Some(r) = info.get(&info_id).cloned() {
+                    // запись уже у нас (например, с прошлого запуска, ещё
+                    // без печати) — признание можно выдать сейчас
+                    seal_foreign_instruction(
+                        key, me_pub, me_id, info, state, t, &mut rep,
+                        &r,
+                    );
                 }
             }
             Payload::InfoAsk { ids } => {
@@ -137,9 +209,34 @@ pub fn info_exchange_tick(
                 rep.answered += n;
             }
             Payload::InfoBody { info_id, kind, ts, author, sig, value } => {
-                let rec = InfoRec { info_id, kind, ts, author, sig, value };
-                if info.put(rec) {
+                let rec = InfoRec {
+                    info_id,
+                    kind,
+                    ts,
+                    author,
+                    sig,
+                    value,
+                    seals: Vec::new(),
+                };
+                let fresh = info.put(rec);
+                if fresh {
                     rep.taken += 1;
+                }
+                // ПРИЗНАНИЕ: чужую инструкцию печатаем своей подписью
+                if let Some(r) = info.get(&info_id).cloned() {
+                    seal_foreign_instruction(
+                        key, me_pub, me_id, info, state, t, &mut rep, &r,
+                    );
+                }
+            }
+            Payload::InfoSeal { info_id, sealer, seal } => {
+                // печать ПРОВЕРЯЕТСЯ внутри store (canon-подпись, дедуп)
+                let mut s = [0u8; 64];
+                if seal.len() == 64 {
+                    s.copy_from_slice(&seal);
+                    if info.seal(&info_id, &sealer, &s) {
+                        rep.seals_in += 1;
+                    }
                 }
             }
             _ => {}
@@ -169,6 +266,36 @@ pub fn info_exchange_tick(
             t.send(CH_INFO, me_id, None, &bytes);
             state.shared.insert(r.info_id);
             rep.pushed += 1;
+        }
+    }
+
+    // ретрансляция ЧУЖИХ ИНСТРУКЦИЙ: правила роя должны услышать все
+    // (свои аски/тела не форвардим — факты/опыт пусть берут у автора)
+    let foreign_rules: Vec<InfoRec> = info
+        .all()
+        .filter(|r| {
+            r.kind == KIND_INSTRUCTION
+                && r.author != *me_pub
+                && !state.shared.contains(&r.info_id)
+        })
+        .take(RELAY_QUOTA)
+        .cloned()
+        .collect();
+    for r in foreign_rules {
+        let out = signed_payload_bytes(
+            key,
+            MsgType::InfoAnnounce,
+            Payload::InfoAnnounce {
+                info_id: r.info_id,
+                kind: r.kind,
+                author: r.author,
+                value_len: r.value.len() as u32,
+            },
+        );
+        if let Ok(bytes) = out {
+            t.send(CH_INFO, me_id, None, &bytes);
+            state.shared.insert(r.info_id);
+            rep.relayed += 1;
         }
     }
 
@@ -234,8 +361,8 @@ mod tests {
     }
 
     /// Полная дисциплина обмена двоих клиентов: инфосферы сходятся к
-    /// полным копиям, каждый несёт СВОЮ запись ровно один раз, повторные
-    /// тики ничего не множат (дедуп по id).
+    /// полным копиям, каждый несёт СВОЮ запись ровно один раз, чужая
+    /// инструкция получает КВОРУМНУЮ печать (quorum 2/2 у обоих).
     #[test]
     fn bus_exchange_converges_and_dedups() {
         let a_key = Ed25519Signer::from_seed(&[11u8; 32]);
@@ -245,33 +372,73 @@ mod tests {
         let mut ib = InfoStore::new();
         let exp = craft_entry(&a_key, KIND_EXPERIENCE, 100, b"dialog experience A");
         let fact = craft_entry(&b_key, KIND_FACT, 200, b"web fact B");
+        let ins = craft_entry(&a_key, KIND_INSTRUCTION, 300, b"royal rule: no fake facts");
         ia.put(exp.clone());
         ib.put(fact.clone());
+        ia.put(ins.clone());
         let mut sa = InfoExchangeState::new();
         let mut sb = InfoExchangeState::new();
 
-        // регулярный обмен: 6 тиков попеременно (push → ask → тела)
+        // регулярный обмен: 8 тиков попеременно (push → ask → тела → печати)
         let mut pushes_a = 0u32;
         let mut pushes_b = 0u32;
-        for _ in 0..6 {
+        let mut seals_out_b = 0u32;
+        for _ in 0..8 {
             let ra = info_exchange_tick(&a_key, 17005, &a_key.pubkey(), &mut ia, &mut sa, &mut bus);
             let rb = info_exchange_tick(&b_key, 42000, &b_key.pubkey(), &mut ib, &mut sb, &mut bus);
+            eprintln!("A: {ra:?}");
+            eprintln!("B: {rb:?}");
             pushes_a += ra.pushed;
             pushes_b += rb.pushed;
+            seals_out_b += rb.seals_out;
         }
-        assert_eq!(pushes_a, 1, "своё A объявило ровно раз: {pushes_a}");
+        assert_eq!(pushes_a, 2, "своё A объявило ровно по разу: {pushes_a}");
         assert_eq!(pushes_b, 1, "своё B объявило ровно раз: {pushes_b}");
-        assert_eq!(ia.len(), 2, "у A обе записи");
-        assert_eq!(ib.len(), 2, "у B обе записи");
-        assert!(ia.has(&fact.info_id) && ib.has(&exp.info_id));
 
-        // дальнейшие тики ничего не добавляют (id = хэш канона)
+        // сходимость: у каждой стороны ВСЕ три записи
+        assert_eq!(ia.len(), 3, "у A три записи");
+        assert_eq!(ib.len(), 3, "у B три записи");
+        assert!(ia.has(&fact.info_id) && ib.has(&exp.info_id) && ib.has(&ins.info_id));
+
+        // КВОРУМНАЯ печать инструкции: B печатал чужую инструкцию,
+        // печать вернулась к A → кворум 2/2 у ОБОИХ
+        assert_eq!(seals_out_b, 1, "B единожды признал инструкцию: {seals_out_b}");
+        assert_eq!(ib.quorum_count(&ins.info_id), 2);
+        assert!(ib.quorum_of(&ins.info_id, 2));
+        assert_eq!(ia.quorum_count(&ins.info_id), 2, "печать не долетела до A");
+        assert!(ia.quorum_of(&ins.info_id, 2));
+
+        // повторные тики ничего не добавляют (id = хэш канона)
         for _ in 0..3 {
             let _ = info_exchange_tick(&a_key, 17005, &a_key.pubkey(), &mut ia, &mut sa, &mut bus);
             let rb = info_exchange_tick(&b_key, 42000, &b_key.pubkey(), &mut ib, &mut sb, &mut bus);
             assert_eq!(rb.taken, 0, "дубликаты отвергнуты");
-            assert_eq!(ib.len(), 2);
+            assert_eq!(ib.len(), 3);
         }
+    }
+
+    /// Запись уже была у B с прошлого запуска (БЕЗ со-подписи): правило
+    /// роя всё равно признаётся при получении анонса, печать ходит к автору.
+    #[test]
+    fn bus_seals_preexisting_instruction() {
+        let a_key = Ed25519Signer::from_seed(&[31u8; 32]);
+        let b_key = Ed25519Signer::from_seed(&[32u8; 32]);
+        let mut bus = BusBox::new();
+        let mut ia = InfoStore::new();
+        let mut ib = InfoStore::new();
+        let ins = craft_entry(&a_key, KIND_INSTRUCTION, 900, b"royal rule: cite sources");
+        ia.put(ins.clone());
+        ib.put(ins.clone()); // у B она есть, но непечатана
+        assert_eq!(ib.quorum_count(&ins.info_id), 1);
+        let mut sa = InfoExchangeState::new();
+        let mut sb = InfoExchangeState::new();
+
+        for _ in 0..4 {
+            let _ = info_exchange_tick(&a_key, 17005, &a_key.pubkey(), &mut ia, &mut sa, &mut bus);
+            let _ = info_exchange_tick(&b_key, 42000, &b_key.pubkey(), &mut ib, &mut sb, &mut bus);
+        }
+        assert_eq!(ib.quorum_count(&ins.info_id), 2, "B признал уже-имеющуюся");
+        assert_eq!(ia.quorum_count(&ins.info_id), 2, "печать долетела к автору");
     }
 
     /// Подделка кадра отвергается: мутация одного байта ломает подпись.
