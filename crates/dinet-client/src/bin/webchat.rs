@@ -77,7 +77,8 @@ use dinet_fl::toy_llm::toy_world::honesty_batch;
 use dinet_fl::toy_llm::ToyModel;
 use dinet_memory::kv::KvStore;
 use dinet_node::infosphere::{
-    craft_entry, InfoStore, KIND_EXPERIENCE, KIND_FACT, KIND_INSTRUCTION,
+    craft_entry, InfoRec, InfoStore, KIND_EXPERIENCE, KIND_FACT,
+    KIND_INSTRUCTION,
 };
 use dinet_node::swarm::{accuracy, run_era_partition, Node, SimConfig};
 use dinet_node::transport::MeshTransport;
@@ -358,6 +359,65 @@ const WEB_TOPICS: [&str; 8] = [
     "какой рекорд глубины у дайверов без акваланга",
 ];
 
+/// Служебные слова, не годящиеся в поисковую тему (длинные, чтобы
+/// не отсеивать содержательные короткие слова — там отсечка по длине).
+const WEB_STOP: [&str; 8] = [
+    "который",
+    "которых",
+    "чтобы",
+    "например",
+    "диалога",
+    "сказать",
+    "очень",
+    "вот",
+];
+
+/// Ключевые слова текста: слова >= 5 букв, без служебных, уникальные.
+/// Это МОСТ между двумя источниками опыта: слова диалога/опыта	events
+/// превращаются в «любопытство роя» — темы поиска в сети.
+fn keywords(text: &str, want: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split(|c: char| !(c.is_alphabetic() || c == '-')) {
+        let w = w.trim_matches('-');
+        if w.chars().count() < 5 {
+            continue;
+        }
+        let lw = w.to_lowercase();
+        if WEB_STOP.contains(&lw.as_str()) || out.iter().any(|s| *s == lw) {
+            continue;
+        }
+        out.push(lw);
+        if out.len() >= want {
+            break;
+        }
+    }
+    out
+}
+
+/// Тема web-фида из ОПЫТА инфосферы (требование «опыт роя» → любопытство):
+/// свежие единицы опыта диалога — свои и чужие (пришедшие по p2p) —
+/// задают, куда смотрит сеть. Список WEB_TOPICS остаётся фолбэком, когда
+/// опыта ещё нет или слова из него не интересные.
+fn web_topic(info: &InfoStore, turn_n: u64) -> Option<String> {
+    let mut exps: Vec<&InfoRec> = info
+        .all()
+        .filter(|r| r.kind == KIND_EXPERIENCE)
+        .collect();
+    exps.sort_by_key(|r| r.ts);
+    exps.reverse(); // свежие первыми
+    exps.truncate(12);
+    if exps.is_empty() {
+        return None;
+    }
+    let rec = exps[(turn_n as usize - 1) % exps.len()];
+    let kw = keywords(&String::from_utf8_lossy(&rec.value), 3);
+    if kw.len() >= 2 {
+        Some(kw.join(" "))
+    } else {
+        None
+    }
+}
+
 /// curl → страница; бесплатный коннектор без ключей/аккаунтов/телеметрии.
 fn web_fetch(url: &str) -> Option<String> {
     let out = std::process::Command::new("curl")
@@ -445,11 +505,21 @@ fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
     loop {
         std::thread::sleep(Duration::from_secs(st.web_secs.max(1)));
         turn_n += 1;
-        let topic = WEB_TOPICS[(turn_n - 1) as usize % WEB_TOPICS.len()];
-        let q = pct_encode(topic);
+        // тема: из опыта инфосферы (свой + чужой по p2p), фолбэк — общий список
+        let (topic, src) = {
+            let info = st.info.lock().expect("info lock");
+            match web_topic(&info, turn_n) {
+                Some(t) => (t, "опыт роя"),
+                None => (
+                    WEB_TOPICS[(turn_n - 1) as usize % WEB_TOPICS.len()].to_string(),
+                    "список роя",
+                ),
+            }
+        };
+        let q = pct_encode(&topic);
         let url = format!("https://html.duckduckgo.com/html/?q={q}");
         let Some(html) = web_fetch(&url) else {
-            println!("[web #{turn_n}] сеть не ответила по теме «{topic}» — ждём дальше");
+            println!("[web #{turn_n}] сеть не ответила «{topic}» ({src}) — ждём дальше");
             continue;
         };
         let mut facts = 0usize;
@@ -465,7 +535,7 @@ fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
         }
         let info_n = st.info.lock().expect("info lock").len();
         st.web_hits.fetch_add(1, Ordering::Relaxed);
-        println!("[web #{turn_n}] «{topic}» → фактов +{facts}, инфосфера {info_n}");
+        println!("[web #{turn_n}] «{topic}» ({src}) → фактов +{facts}, инфосфера {info_n}");
     }
 }
 
@@ -1102,6 +1172,51 @@ mod tests {
     fn form_plus_is_space() {
         assert_eq!(form_decode("a+b%2Bc"), "a b+c");
     }
+    /// Ключевые слова: короткие и служебные выпали, содержательные —
+    /// нижним регистром, без повторов.
+    #[test]
+    fn keywords_filter_and_pick() {
+        let kw = keywords("опыт диалога: как работает Спинтроника, спинтроника? вихревые токи", 3);
+        assert_eq!(kw, vec!["работает", "спинтроника", "вихревые"], "не то: {kw:?}");
+        // служебное «диалога» не въедет в тему
+        assert!(!keywords("опыт диалога", 5).contains(&"диалога".to_string()));
+    }
+
+    /// Тема web-фида по ОПЫТУ инфосферы (свой и чужой): свежий опыт
+    /// задаёт поисковый запрос; без опыта — фолбэк (None → список роя).
+    #[test]
+    fn web_topic_uses_infosphere_experience() {
+        let mut info = InfoStore::new();
+        let a = Ed25519Signer::from_seed(&[71u8; 32]);
+        assert_eq!(web_topic(&info, 1), None, "опытов нет — фолбэк");
+
+        info.put(craft_entry(
+            &a,
+            KIND_EXPERIENCE,
+            1000,
+            b"kv: How does spintronics work? and eddy currents",
+        ));
+        info.put(craft_entry(
+            &a,
+            KIND_FACT,
+            1001,
+            b"web fact (topic): spintronics uses electron spin",
+        ));
+        let t1 = web_topic(&info, 1).expect("единственный опыт → тема");
+        assert!(t1.contains("spintronics"), "тема: {t1}");
+
+        // СВЕЖЕЕ опыт перетягивает запрос (родился позже, ts больше):
+        // чужой опыт (по p2p) тоже считается — автор другой.
+        let b = Ed25519Signer::from_seed(&[72u8; 32]);
+        info.put(craft_entry(
+            &b,
+            KIND_EXPERIENCE,
+            2000,
+            b"kv: Fermentation of foods and sauerkraut brewing",
+        ));
+        let t2 = web_topic(&info, 1).expect("два опыта → свежий первый");
+        assert!(t2.contains("fermentation"), "новый опыт не взяли: {t2}");
+    }
 }
 
 /// Дым webchat-моста: worker llama.cpp отвечает через трейт ChatModel.
@@ -1151,4 +1266,5 @@ mod llama_tests {
         // собираются; токен-за-токеном доказан живым прогоном (34 куска)
         assert!(got.len() >= 1, "мост не отдал ни куска: {got:?}");
     }
+
 }
