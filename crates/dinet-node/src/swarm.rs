@@ -87,6 +87,11 @@ pub struct Node {
     /// local_batch отдаёт их вместо sim-честного/отравленного батча.
     /// Точка прикрепления клиента-пользователя: dinet-client::pair_to_sample.
     pub batch_override: Option<Vec<Sample>>,
+    /// X25519-секрет маскирования secure_agg, выведенный ИЗ ЛИЧНОГО
+    /// ключа узла (единый ed25519 seed → RFC-конверсия в X25519;
+    /// dinet_crypto::x25519_from_ed25519_seed). Sim-узлы оставляют None —
+    /// ключи выводятся из id в peer_keys (см. peer_keys).
+    pub x_sk: Option<dinet_crypto::X25519Key>,
 }
 
 impl Node {
@@ -106,6 +111,9 @@ impl Node {
             byz,
             blobs: crate::blob_torrent::BlobStore::default(),
             batch_override: None,
+            // реальный клиент (webchat) перезаписывает из своего SEED;
+            // sim — fallback-вывод из id в peer_keys
+            x_sk: None,
         }
     }
 
@@ -456,7 +464,8 @@ pub fn era_publish(
     let was_reveal = (era + 1) % cfg.reveal_every == 0;
     let ehash = era_hash32(era);
     // X25519-ключи роя: парный секрет secure_agg v1 = РЕАЛЬНЫЙ Диффи-Хеллман
-    let xk = peer_keys(all_ids);
+    // (маскирование от ЛИЧНЫХ ed25519-ключей узлов, а не sim-вывода)
+    let xk = peer_keys(all_ids, mine);
     let peers: Vec<(usize, [u8; 32])> = all_ids
         .iter()
         .filter_map(|&id| xk.get(&id).map(|k| (id as usize, k.pk)))
@@ -750,11 +759,26 @@ fn apply_delta(replica: LoRAAdapter, agg_delta: &[f32]) -> LoRAAdapter {
     out
 }
 
-/// X25519-ключи роя по id (sim: детерминированный вывод из [id;32]).
-/// v1: настоящий клиент шлёт свой pubkey в Hello — тут остаётся карта id→pk.
-fn peer_keys(ids: &[NodeId]) -> BTreeMap<NodeId, dinet_crypto::X25519Key> {
-    ids.iter()
-        .map(|&id| (id, dinet_crypto::x25519_from_seed(&[id as u8; 32])))
+/// X25519-ключи роя: sk — ЛИЧНЫЙ x_sk узла (v1: из ed25519-ключа, один
+/// личный ключ на всё; sim-узлы с None — fallback-вывод из id), pk пары —
+/// Монтгомери-конверсия Ed25519-pubkey (в кадре он уже летит как sender).
+fn peer_keys(
+    all_ids: &[NodeId],
+    reals: &[Node], // узлы с реальными личными ключами (клиенты роя)
+) -> BTreeMap<NodeId, dinet_crypto::X25519Key> {
+    let real: BTreeMap<NodeId, &dinet_crypto::X25519Key> = reals
+        .iter()
+        .filter_map(|n| n.x_sk.as_ref().map(|k| (n.id, k)))
+        .collect();
+    all_ids
+        .iter()
+        .map(|&id| {
+            let k = real
+                .get(&id)
+                .map(|r| (*r).clone())
+                .unwrap_or_else(|| dinet_crypto::x25519_from_ed25519_seed(&[id as u8; 32]));
+            (id, k)
+        })
         .collect()
 }
 

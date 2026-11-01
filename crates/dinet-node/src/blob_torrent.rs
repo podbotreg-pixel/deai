@@ -24,15 +24,42 @@ use dinet_registry::{DeltaManifest, RegistryLog, DEFAULT_CHUNK_LEN};
 use std::collections::BTreeMap;
 
 /// Локальный склад весовых блобов узла: manifest_id → (манифест, куски).
+/// КЕПКА: склад не растёт бесконечно — начиная с квоты старейшие
+/// ПО ВСТАВКЕ блобы вымываются (актуальные чек-пойнты клиент держит у
+/// себя в рой-KV, так что потеря склада не теряет состояние клиента).
 #[derive(Debug, Default, Clone)]
 pub struct BlobStore {
     blobs: BTreeMap<[u8; 32], (DeltaManifest, Vec<Vec<u8>>)>,
+    /// порядок вставки (для вымывания старейших) + квота
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
 }
+
+/// Квота склада блобов (шт. манифестов).
+pub const MAX_BLOBS: usize = 24;
 
 impl BlobStore {
     /// Хранить блоб (куски держатся целиком: узел — полный сид).
+    /// Растущий сверх квоты склад вымывает старейшие по вставке.
     pub fn put(&mut self, m: DeltaManifest, chunks: Vec<Vec<u8>>) {
-        self.blobs.insert(m.id(), (m, chunks));
+        let id = m.id();
+        if !self.blobs.contains_key(&id) {
+            while self.blobs.len() >= self.cap {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.blobs.remove(&old);
+                    }
+                    None => break, // order рассинхрон — лечим вставкой ниже
+                }
+            }
+            self.order.push_back(id);
+        }
+        self.blobs.insert(id, (m, chunks));
+    }
+
+    /// Своя квота (для тестов — меньше константы).
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
     }
 
     pub fn has(&self, id: &[u8; 32]) -> bool {
@@ -74,6 +101,7 @@ impl BlobStore {
     /// очистка старых блобов по квоте.
     pub fn clear(&mut self) {
         self.blobs.clear();
+        self.order.clear();
     }
 
     /// Выбросить один кусок (тест «частичная потеря диска»; пустой кусок
@@ -345,6 +373,31 @@ mod tests {
     /// 6 узлов (byz — последний), 3 эры (2 masked + REVEAL), затем две
     /// «потери»: у узла 0 склад вычищен целиком, у узла 2 пропал кусок 3.
     /// torrent должен собрать блоб узлу 0 из кусков разных пиров бит-в-бит.
+    /// КЕПКА склада: старейшие по вставке блобы вымываются, свежие и
+    /// повторные put живут; has по удалённым — false.
+    #[test]
+    fn blob_quota_evicts_oldest() {
+        let mut s = BlobStore::default();
+        s.set_cap(3);
+        let mut ids = Vec::new();
+        for i in 0..5u8 {
+            let m = DeltaManifest::pack(format!("_checkpoint body {i}").as_bytes(), 4096).0;
+            ids.push(m.id());
+            s.put(m, Vec::new());
+        }
+        assert_eq!(s.len(), 3, "кепка не держит: {}", s.len());
+        assert!(!s.has(&ids[0]) && !s.has(&ids[1]), "старейшие не вымылись");
+        assert!(s.has(&ids[2]) && s.has(&ids[3]) && s.has(&ids[4]));
+        // пановка тог же манифеста — не вымывание и не дубликат
+        let (m, _) = DeltaManifest::pack(b"_checkpoint body 4", 4096);
+        s.put(m, Vec::new());
+        assert_eq!(s.len(), 3, "повтор put испортил склад");
+        assert!(s.has(&ids[4]));
+        // clear полностью пусто (и порядок)
+        s.clear();
+        assert!(s.is_empty());
+    }
+
     #[test]
     fn torrent_assembles_from_peers_after_loss() {
         let cfg = SimConfig {

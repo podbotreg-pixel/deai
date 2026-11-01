@@ -187,6 +187,7 @@ pub fn sha256(data: &[u8]) -> [u8; SHA256_LEN] {
 // ---------------------------------------------------------------------------
 
 /// X25519-ключи узла.
+#[derive(Clone)]
 pub struct X25519Key {
     pub sk: [u8; 32],
     pub pk: [u8; 32],
@@ -212,6 +213,26 @@ pub fn x_pair_secret(sk: &[u8; 32], pk: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::StaticSecret::from(*sk)
         .diffie_hellman(&x25519_dalek::PublicKey::from(*pk))
         .to_bytes()
+}
+
+/// X25519-пара ИЗ ed25519-пары (ОДИН личный ключ узла на всё):
+/// RFC-конверсия — sk = sha512(seed)[0..32] (тот материал, из которого
+/// ed25519 разворачивает скаляр; ed25519-dalek::SigningKey::to_scalar_bytes),
+/// pk = публичная точка Ed25519 в Монтгомери-представлении
+/// (VerifyingKey::to_montgomery). Тогда ЧУЖОЙ X25519-pk получается прямо
+/// из Ed25519-pubkey кадра — отдельный ключевой обмен не нужен.
+pub fn x25519_from_ed25519_seed(seed: &[u8; ED25519_PUB_LEN]) -> X25519Key {
+    let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+    let pk = sk.verifying_key().to_montgomery().to_bytes();
+    X25519Key { sk: sk.to_scalar_bytes(), pk }
+}
+
+/// Чужой X25519-pk из Ed25519-pubkey (Монтгомери-конверсия). None —
+/// байты не являются корректным Ed25519-pubkey.
+pub fn x25519_pk_from_ed25519(peer_pk: &[u8; ED25519_PUB_LEN]) -> Option<[u8; 32]> {
+    ed25519_dalek::VerifyingKey::from_bytes(peer_pk)
+        .ok()
+        .map(|vk| vk.to_montgomery().to_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +549,30 @@ pub fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Единый личный ключ: из ОДНОГО ed25519 seed выводится и пара
+    /// X25519, и pk ЧУЖОГО из его ed25519-pubkey; DH СИММЕТРИЧЕН
+    /// (i,j и j,i — один секрет) — маски secure_agg обязаны схлопываться.
+    #[test]
+    fn x25519_pair_from_ed25519_keys_is_symmetric() {
+        let seeds = [[11u8; 32], [22u8; 32], [33u8; 32]];
+        let keys: Vec<X25519Key> = seeds.iter().map(x25519_from_ed25519_seed).collect();
+        // pk пары == Монтгомери-конверсия соответствующего ed25519-pubkey
+        for (i, s) in seeds.iter().enumerate() {
+            let ed_pk = Ed25519Signer::from_seed(s).pubkey();
+            let pk_mont = x25519_pk_from_ed25519(&ed_pk).expect("валидный ed-pk");
+            assert_eq!(pk_mont, keys[i].pk, "pk не из той пары (узел {i})");
+        }
+        // СКВОЗНОЙ DH: пары через ed-конверсию дают симметричный секрет —
+        // основа pairwise-масок (i,j) + (j,i) = 0
+        // (маловероятные не-каноничные y dalek не отвергает, но чужой
+        // pk приходит ПОД подписью — строже не нужно)
+        let sij = x_pair_secret(&keys[0].sk, &keys[1].pk);
+        let sji = x_pair_secret(&keys[1].sk, &keys[0].pk);
+        assert_eq!(sij, sji, "DH пары не симметричен — маски не схлопнутся");
+        let sik = x_pair_secret(&keys[0].sk, &keys[2].pk);
+        assert_ne!(sij, sik, "секрет разных пар совпал — всё сломано");
+    }
 
     #[test]
     fn ed25519_signer_real_roundtrip_and_tamper() {
