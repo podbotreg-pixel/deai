@@ -11,8 +11,9 @@ dinet-proto = { path = "../dinet-proto" }
 dinet-node = { path = "../dinet-node" }
 dinet-fl = { path = "../dinet-fl" }
 
-libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "macros"] }
+libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "macros", "mdns"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 futures = "0.3"
+libp2p-mdns = "0.49"
 
 [dev-dependencies]

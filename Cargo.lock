@@ -742,6 +742,7 @@ dependencies = [
  "dinet-proto",
  "futures",
  "libp2p",
+ "libp2p-mdns",
  "tokio",
 ]
 

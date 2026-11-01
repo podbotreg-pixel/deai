@@ -41,6 +41,7 @@
 use dinet_crypto::{Ed25519Signer, Ed25519Verifier, Signer, Verifier};
 use futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
+use libp2p::mdns;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use std::time::Duration;
@@ -60,10 +61,13 @@ fn gossip_config() -> Result<gossipsub::Config, gossipsub::ConfigBuilderError> {
         .build()
 }
 
-/// Поведение узла: пока только gossipsub (фазы эпохи поверх кадра).
+/// Поведение узла: gossipsub (фазы эпохи поверх кадра) + mdns
+/// (обнаружение соседей по локальной сети: --dial не обязателен).
 #[derive(NetworkBehaviour)]
 pub struct NodeBehaviour {
     pub gossip: gossipsub::Behaviour,
+    /// локальное обнаружение (libp2p-mdns): события → авто-диал
+    pub mdns: mdns::tokio::Behaviour,
 }
 
 /// Команда сетевой задаче узла.
@@ -113,7 +117,9 @@ fn build_swarm(seed: [u8; 32]) -> Result<(Swarm<NodeBehaviour>, PeerId), String>
         cfg,
     )
     .map_err(|e| format!("gossip: {e}"))?;
-    let behaviour = NodeBehaviour { gossip };
+    let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+        .map_err(|e| format!("mdns: {e}"))?;
+    let behaviour = NodeBehaviour { gossip, mdns };
     let swarm = SwarmBuilder::with_existing_identity(key.clone())
         .with_tokio()
         .with_tcp(
@@ -599,7 +605,7 @@ fn gossip_node_thread(
     rt.block_on(async move {
         let me_pub = Ed25519Signer::from_seed(&seed).pubkey();
         let me_id = u16::from_be_bytes([me_pub[0], me_pub[1]]);
-        let (mut swarm, peer_id) = match build_swarm(seed) {
+        let (mut swarm, peer_id_of) = match build_swarm(seed) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[bridge] swarm: {e}");
@@ -647,14 +653,24 @@ fn gossip_node_thread(
             match ev {
                 Ok(SwarmEvent::NewListenAddr { address, .. }) => {
                     let addr = address.clone();
-                    *ready.lock().expect("ready") = Some((peer_id, addr));
+                    *ready.lock().expect("ready") = Some((peer_id_of, addr));
+                }
+                Ok(SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(
+                    list,
+                )))) => {
+                    // найден сосед по локальной сети → авто-диал (без --dial)
+                    for (peer_id, addr) in list {
+                        if peer_id != peer_id_of {
+                            let _ = swarm.dial(addr);
+                        }
+                    }
                 }
                 Ok(SwarmEvent::Behaviour(NodeBehaviourEvent::Gossip(
                     gossipsub::Event::Message { message, .. },
                 ))) => {
                     if let Some(ch) = topic_channel(&message.topic) {
                         if let Some(frame) =
-                            verify_frame(&message.data, message.source.unwrap_or(peer_id))
+                            verify_frame(&message.data, message.source.unwrap_or(peer_id_of))
                         {
                             queues[usize::from(ch)].lock().expect("queue").push(frame);
                         }
