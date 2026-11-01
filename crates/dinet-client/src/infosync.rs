@@ -5,8 +5,10 @@
 //! mesh) крутится одна фаза-тик:
 //!   1. collect чужого → анонсы / аски / тела / печати;
 //!   2. пуш СВОИХ ещё не анонсированных записей (квота за тик —
-//!      вежливость) + relay ЧУЖИХ инструкций: правила роя доходят
-//!      всем даже без прямых связей «автор → все»;
+//!      вежливость) + релей ЧУЖИХ: инструкции — до RELAY_QUOTA/тик
+//!      (правила роя важнее), факты/опыт — до RELAY_MISC_QUOTA/тик
+//!      (разреженная сеть: сосед доносит то, что держит; держатель ли
+//!      чужое тело — решает каждый сам, кепки вида защищают память);
 //!   3. чужие аски → InfoBody из своего хранилища (мы держатели,
 //!      кадр подписан нами, авторская подпись внутри payload);
 //!   4. чужие тела → InfoStore.put (id/подпись автора проверяет put
@@ -32,6 +34,9 @@ pub const PUSH_QUOTA: usize = 8;
 /// Максимум ЧУЖИХ инструкций, ретранслируемых за один тик (правила роя
 /// должны доходить всем даже без прямых связей «автор → все»).
 pub const RELAY_QUOTA: usize = 4;
+/// Максимум ЧУЖИХ фактов/опыта, ретранслируемых за один тик (разреженная
+/// сеть: сосед доносит то, что держит; квота — против размножения мусора).
+pub const RELAY_MISC_QUOTA: usize = 6;
 /// Максимум id в одном InfoAsk.
 pub const ASK_QUOTA: usize = 16;
 /// Максимум InfoBody, отвечаемых за один чужой аск.
@@ -99,6 +104,8 @@ pub struct InfoSinkReport {
     pub asked_out: u32,
     /// ЧУЖИХ инструкций ретранслировано (правила роя идут всем)
     pub relayed: u32,
+    /// ЧУЖИХ фактов/опыта ретранслировано (соседи доносят держимое)
+    pub relayed_other: u32,
     /// со-подписей выслали (признали чужие инструкции)
     pub seals_out: u32,
     /// печатей чужих приняли и проверили
@@ -269,19 +276,23 @@ pub fn info_exchange_tick(
         }
     }
 
-    // ретрансляция ЧУЖИХ ИНСТРУКЦИЙ: правила роя должны услышать все
-    // (свои аски/тела не форвардим — факты/опыт пусть берут у автора)
-    let foreign_rules: Vec<InfoRec> = info
-        .all()
-        .filter(|r| {
-            r.kind == KIND_INSTRUCTION
-                && r.author != *me_pub
-                && !state.shared.contains(&r.info_id)
-        })
-        .take(RELAY_QUOTA)
-        .cloned()
-        .collect();
-    for r in foreign_rules {
+    // ретрансляция ЧУЖИХ записей: у инструкций своя квота (правила роя
+    // важнее), у фактов/опыта — своя (разреженная сеть: сосед доносит
+    // то, что держит). Содержимое content-addressed и проверяемо:
+    // всякий узел решает сам, держать ли чужое тело (кепки вида
+    // защищают память от «мусорного» переполнения).
+    let mut relayed_n = 0usize; // чужие инструкции: до RELAY_QUOTA
+    let mut relayed_any = 0usize; // прочие чужие: до RELAY_MISC_QUOTA
+    for r in info.all() {
+        if r.author == *me_pub || state.shared.contains(&r.info_id) {
+            continue;
+        }
+        let is_ins = r.kind == KIND_INSTRUCTION;
+        let n = if is_ins { relayed_n } else { relayed_any };
+        let quota = if is_ins { RELAY_QUOTA } else { RELAY_MISC_QUOTA };
+        if n >= quota {
+            continue;
+        }
         let out = signed_payload_bytes(
             key,
             MsgType::InfoAnnounce,
@@ -295,7 +306,13 @@ pub fn info_exchange_tick(
         if let Ok(bytes) = out {
             t.send(CH_INFO, me_id, None, &bytes);
             state.shared.insert(r.info_id);
-            rep.relayed += 1;
+            if is_ins {
+                rep.relayed += 1;
+                relayed_n += 1;
+            } else {
+                rep.relayed_other += 1;
+                relayed_any += 1;
+            }
         }
     }
 
@@ -358,6 +375,78 @@ mod tests {
             let src = if me == 17005 { &mut self.a_in } else { &mut self.b_in };
             std::mem::take(src)
         }
+    }
+
+    /// Разреженный рой A(17005)↔B(42000)↔C(42002): A и C НЕ связаны
+    /// (рамки «A→C» и «C→A» теряются). Факт автора A обязан дойти до C
+    /// через РЕЛЕЙ чужой записи B-узлом (и тело B отвечает как держатель).
+    struct BusStar {
+        a_in: Vec<Vec<u8>>,
+        b_in: Vec<Vec<u8>>,
+        c_in: Vec<Vec<u8>>,
+    }
+    impl BusStar {
+        fn new() -> BusStar {
+            BusStar { a_in: Vec::new(), b_in: Vec::new(), c_in: Vec::new() }
+        }
+    }
+    impl dinet_node::transport::Transport for BusStar {
+        fn send(&mut self, _ch: u8, from: NodeId, _to: Option<NodeId>, frame: &[u8]) {
+            if from != 17005 {
+                self.a_in.push(frame.to_vec()); // A слушает всех, кроме себя
+            }
+            // B слышит A и C
+            if from != 42000 {
+                self.b_in.push(frame.to_vec());
+            }
+            // C слышит ТОЛЬКО B (не A!)
+            if from == 42000 {
+                self.c_in.push(frame.to_vec());
+            }
+        }
+        fn collect(&mut self, _ch: u8, me: NodeId) -> Vec<Vec<u8>> {
+            let src = match me {
+                17005 => &mut self.a_in,
+                42000 => &mut self.b_in,
+                _ => &mut self.c_in,
+            };
+            std::mem::take(src)
+        }
+    }
+
+    #[test]
+    fn bus_relay_reaches_far_node_in_sparse_swarm() {
+        let a_key = Ed25519Signer::from_seed(&[41u8; 32]);
+        let b_key = Ed25519Signer::from_seed(&[42u8; 32]);
+        let c_key = Ed25519Signer::from_seed(&[43u8; 32]);
+        let mut bus = BusStar::new();
+        let mut ia = InfoStore::new();
+        let mut ib = InfoStore::new();
+        let mut ic = InfoStore::new();
+        let fact = craft_entry(&a_key, KIND_FACT, 400, b"web fact by distant A");
+        ia.put(fact.clone());
+        let exp = craft_entry(&b_key, KIND_EXPERIENCE, 401, b"dialog experience B");
+        ib.put(exp.clone());
+        let mut sa = InfoExchangeState::new();
+        let mut sb = InfoExchangeState::new();
+        let mut sc = InfoExchangeState::new();
+
+        let mut relayed_other_b = 0u32;
+        for _ in 0..10 {
+            let ra = info_exchange_tick(&a_key, 17005, &a_key.pubkey(), &mut ia, &mut sa, &mut bus);
+            let rb = info_exchange_tick(&b_key, 42000, &b_key.pubkey(), &mut ib, &mut sb, &mut bus);
+            let rc = info_exchange_tick(&c_key, 42002, &c_key.pubkey(), &mut ic, &mut sc, &mut bus);
+            relayed_other_b += rb.relayed_other;
+            let _ = rc;
+        }
+
+        // РЕЛЕЙ сработал: C (нет связи с A) держит факт автора A
+        assert!(ic.has(&fact.info_id), "релей чужой записи не доехал до C");
+        assert!(ib.has(&fact.info_id));
+        // и опыт B доехал до A (прямой push, сеть двусторонняя)
+        assert!(ia.has(&exp.info_id));
+        // релей чужих фактов/опыта учтён в отчёте B
+        assert!(relayed_other_b >= 1, "B не релеил чужое: {relayed_other_b}");
     }
 
     /// Полная дисциплина обмена двоих клиентов: инфосферы сходятся к
