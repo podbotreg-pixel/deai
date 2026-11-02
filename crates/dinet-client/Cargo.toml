@@ -14,6 +14,8 @@ dinet-node = { path = "../dinet-node" }
 dinet-proto = { path = "../dinet-proto" }
 # llama.cpp для GUI-чата: фича llama + --model (сборка настоящей LLM в webchat)
 dinet-llama = { path = "../dinet-llama", optional = true }
+# train-cpp: head-LoRA тренажёр поверх llama.cpp (фонд фичи llama)
+dinet-train = { path = "../dinet-train" }
 # реальная сеть (libp2p-мост) для обмена инфосферой: фича p2p + --p2p
 dinet-p2p = { path = "../dinet-p2p", optional = true }
 

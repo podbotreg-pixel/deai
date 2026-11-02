@@ -1,0 +1,8 @@
+[package]
+name = "dinet-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "train-cpp: дообучение настоящей llama.cpp-модели — LoRA-дельта головы поверх скрытых состояний llama.cpp, экспорт в adapter-GGUF"
+
+[dev-dependencies]

@@ -674,6 +674,7 @@ dependencies = [
  "dinet-node",
  "dinet-p2p",
  "dinet-proto",
+ "dinet-train",
 ]
 
 [[package]]
@@ -702,6 +703,7 @@ name = "dinet-llama"
 version = "0.1.0"
 dependencies = [
  "dinet-chat",
+ "dinet-train",
  "llama-cpp-2",
 ]
 
@@ -759,6 +761,10 @@ version = "0.1.0"
 dependencies = [
  "dinet-crypto",
 ]
+
+[[package]]
+name = "dinet-train"
+version = "0.1.0"
 
 [[package]]
 name = "displaydoc"

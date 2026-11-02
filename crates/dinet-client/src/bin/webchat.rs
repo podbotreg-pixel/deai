@@ -31,9 +31,13 @@
 //! ```sh
 //! cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
 //! # открой http://localhost:8080
-//! # РЕАЛЬНАЯ LLM (gemma-270m и другие GGUF): фича llama + --model:
+//! # РЕАЛЬНАЯ LLM (Qwen2.5-0.5B и другие GGUF): фича llama + --model:
+//! # train-cpp: --train-secs N — дообучение head-LoRA на парах чата фоном
+//! #   (в <dir>.lora.gguf; worker подхватывает по mtime). Модель должна
+//! #   иметь НЕпривязанную голову (--train-secs отвергает привязанные).
 //! cargo run -p dinet-client --features llama --bin webchat -- \
-//!     ./dinet-web-mem --port 8080 --model /tmp/opencode/gemma270m.gguf
+//!     ./dinet-web-mem --port 8080 --model /tmp/opencode/qwen05b.gguf \
+//!     --train-secs 20
 //! ```
 //!
 //! Выбор ответчика с --model: ходы на МИКРОЯЗЫКЕ роя (слова «ай би ви…»)
@@ -66,6 +70,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+#[cfg(feature = "llama")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -266,6 +272,18 @@ struct ChatState {
     web_hits: AtomicU64,
     /// Чужих записей инфосферы принял p2p-обмен (для /api/stats).
     p2p_took: AtomicU64,
+    /// train-cpp (M2-1): период фоновой тренировки head-LoRA, сек (0 = выкл).
+    #[cfg(feature = "llama")]
+    train_secs: u64,
+    /// train-cpp: последний лосс × 10 000 (для /api/stats).
+    #[cfg(feature = "llama")]
+    train_loss_x4: AtomicU64,
+    /// путь к gguf-модели (для train-потока; None если llama не собран/не задан).
+    #[cfg(feature = "llama")]
+    gguf_path: Option<PathBuf>,
+    /// каталог памяти (для файлов .lora.gguf рядом с .info/.roi).
+    #[cfg(feature = "llama")]
+    dir: PathBuf,
 }
 
 fn now_ts() -> u64 {
@@ -376,6 +394,147 @@ fn bg_trainer(st: Arc<ChatState>, node_seed: [u8; 32]) {
             println!(
                 "[фон #{ticks}] опыт +{new_exp} → инфосфера {info_n}; пар реплике +{fresh} → эра роя",
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TRAIN-CPP (M2-1): дообучение РЕАЛЬНОЙ llama.cpp-модели по таймеру.
+// llama.cpp forward-only → у нас нет своего трансформера: llama.cpp сам
+// отдаёт вход головы (hidden после финальной нормы, per-token embeddings)
+// и базовые логиты; dinet-train тренирует ТОЛЬКО LoRA-дельту головы
+// (backward — простые произведения) и пишет adapter-GGUF
+// (<dir>.lora.gguf), который worker llama.cpp горячо накладывает.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "llama")]
+fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
+    use dinet_llama::{llama_backend, probe_tokens, LlamaModel, LlamaModelParams};
+    use dinet_train::{read_model_header, HeadLora, HeadSpec};
+
+    // честная проверка ДО цикла: head-LoRA v0 требует НЕПРИВЯЗАННУЮ голову
+    // (output.weight). У привязанных моделей (gemma-3 ≤1b и др.) LoRA
+    // llama.cpp на token_embd действует на входе эмбеддингов — это НЕ
+    // дельта головы; тренировать её как head-LoRA было бы подменой.
+    let header = match read_model_header(&gguf) {
+        Some(h) if h.output_weight => h,
+        Some(_) => {
+            eprintln!(
+                "[train] у модели нет output.weight (привязанная голова) — \
+                 head-LoRA v0 недоступна; ждём LoRA на слоях (v1)"
+            );
+            return;
+        }
+        None => {
+            eprintln!("[train] GGUF {} не читается — тренировка не начнётся", gguf.display());
+            return;
+        }
+    };
+    let arch = header.arch.unwrap_or_else(|| "llama".to_string());
+
+    let lora_out = Path::new(&st.dir).with_extension("lora.gguf");
+    let seed64 = u64::from_le_bytes(node_seed[..8].try_into().expect("seed64"));
+
+    // состояние на процесс: модель/хед/бэкенд создаются лениво (первый цикл)
+    let mut backend: Option<Arc<dinet_llama::LlamaBackend>> = None;
+    let mut model: Option<LlamaModel> = None;
+    let mut head: Option<HeadLora> = None;
+    let mut steps = 0u64;
+    let mut rot = 0usize;
+    let lr = 1.5e-3f32;
+
+    loop {
+        std::thread::sleep(Duration::from_secs(st.train_secs.max(2)));
+        let pairs: Vec<LearnPair> = {
+            let g = st.session.lock().expect("session lock");
+            g.pairs()
+        };
+        if pairs.is_empty() {
+            continue;
+        }
+        // модель грузится один раз (mmap шарит страницы с worker-копией)
+        if model.is_none() {
+            let be = match llama_backend() {
+                Ok(be) => be,
+                Err(e) => {
+                    eprintln!("[train] backend: {e}");
+                    return;
+                }
+            };
+            match LlamaModel::load_from_file(&be, &gguf, &LlamaModelParams::default()) {
+                Ok(m) => {
+                    println!("[train] модель {} → arch {arch}", gguf.display());
+                    backend = Some(be);
+                    model = Some(m);
+                }
+                Err(e) => {
+                    eprintln!("[train] модель не открылась: {e} (пока прерываем)");
+                    return;
+                }
+            }
+        }
+        let be = backend.as_ref().expect("be");
+        let m = model.as_ref().expect("model");
+        // пары по кругу (свежие первыми, ротация чтобы не застревать)
+        let n = pairs.len();
+        // до 8 шагов за цикл: всё фоново, не задерживая чат
+        for _ in 0..8 {
+            let pair = &pairs[rot % n];
+            rot = rot.wrapping_add(1);
+            let text = format!("Вопрос: {}\nОтвет: {}", pair.prompt, pair.answer);
+            let tokens = {
+                let vocab = m.vocab();
+                let mut toks = vocab.tokenize(text.as_bytes(), true, true);
+                toks.truncate(64);
+                toks
+            };
+            if tokens.len() < 4 {
+                continue;
+            }
+            let targets: Vec<u32> = tokens
+                .iter()
+                .skip(1)
+                .map(|t| t.0 as u32)
+                .collect();
+            let probe = match probe_tokens(m, be, &tokens) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[train] probe: {e}");
+                    break;
+                }
+            };
+            if head.is_none() {
+                println!(
+                    "[train] head-LoRA d={} v={} r=8 (seed {seed64:08x})",
+                    probe.n_embd, probe.n_vocab
+                );
+                head = Some(HeadLora::new(
+                    HeadSpec {
+                        d: probe.n_embd as u32,
+                        v: probe.n_vocab as u32,
+                        r: 8,
+                    },
+                    seed64,
+                ));
+            }
+            let h = head.as_mut().expect("head");
+            // учимся на сдвиге: позиция p предсказывает токен p+1; у ПОСЛЕДНЕЙ
+            // позиции продолжения нет — срезаем её из показаний llama.cpp
+            let n_pos = targets.len();
+            let hidden = probe.hidden[..n_pos * probe.n_embd].to_vec();
+            let base = probe.base_logits[..n_pos * probe.n_vocab].to_vec();
+            let mask = vec![1f32; n_pos];
+            let loss = h.train_step(&hidden, &base, &targets, &mask, lr, 0.0);
+            steps += 1;
+            st.train_loss_x4
+                .store((loss * 10_000.0) as u64, Ordering::Relaxed);
+            if steps % 12 == 0 {
+                if let Err(e) = h.save_adapter(&arch, &lora_out) {
+                    eprintln!("[train] adapter не записался: {e}");
+                } else {
+                    println!("[train] шаг {steps}, loss {loss:.3} → {}", lora_out.display());
+                }
+            }
         }
     }
 }
@@ -867,12 +1026,24 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                 &ToyModel { base: e.node.base.clone(), adapter: e.node.adapter.clone() },
                 &eval,
             );
+            // train-cpp: последний лосс head-LoRA (u64::MAX = ещё не тикало)
+            #[cfg(feature = "llama")]
+            let trainl = {
+                let raw = st.train_loss_x4.load(Ordering::Relaxed);
+                if raw == u64::MAX {
+                    "нет".to_string()
+                } else {
+                    format!("{:.3}", raw as f32 / 10_000.0)
+                }
+            };
+            #[cfg(not(feature = "llama"))]
+            let trainl = "нет".to_string();
             respond(
                 out,
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}&trainl={trainl}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -890,6 +1061,8 @@ fn main() {
     let mut every = 4u32;
     let mut bg_secs = 20u64;
     let mut web_secs = 0u64;
+    #[cfg(feature = "llama")]
+    let mut train_secs = 0u64;
     let mut p2p_on = false;
     let mut dial_addr: Option<String> = None;
     #[cfg(feature = "llama")]
@@ -904,6 +1077,8 @@ fn main() {
             "--dial" => dial_addr = args.next(),
             #[cfg(feature = "llama")]
             "--model" => model_path = args.next(),
+            #[cfg(feature = "llama")]
+            "--train-secs" => train_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             _ => {}
         }
     }
@@ -911,7 +1086,13 @@ fn main() {
     let llama_slot: Option<Mutex<Box<dyn dinet_chat::ChatModel + Send>>> = match &model_path {
         Some(p) => {
             use dinet_llama::{LlamaChatModel, LlamaOptions};
-            let bridge = LlamaChatModel::spawn_worker(std::path::PathBuf::from(p), LlamaOptions::default());
+            let bridge = LlamaChatModel::spawn_worker(
+                std::path::PathBuf::from(p),
+                LlamaOptions {
+                    lora: Some(Path::new(&dir).with_extension("lora.gguf")),
+                    ..LlamaOptions::default()
+                },
+            );
             println!("llama.cpp: {p} поднят в worker-потоке (свободные ходы — ГГМ, микроязык — рой)");
             Some(Mutex::new(Box::new(bridge) as Box<dyn dinet_chat::ChatModel + Send>))
         }
@@ -1019,10 +1200,33 @@ fn main() {
         p2p_took: AtomicU64::new(0),
         #[cfg(feature = "llama")]
         llama: llama_slot,
+        #[cfg(feature = "llama")]
+        train_secs,
+        #[cfg(feature = "llama")]
+        train_loss_x4: AtomicU64::new(u64::MAX),
+        #[cfg(feature = "llama")]
+        gguf_path: model_path.map(|s| PathBuf::from(s)),
+        #[cfg(feature = "llama")]
+        dir: PathBuf::from(&dir),
     });
     // ФОН (M2-1): дообучение по таймеру — поток живёт, пока жив клиент.
     let st_bg = Arc::clone(&st);
     std::thread::spawn(move || bg_trainer(st_bg, node_seed));
+    // TRAIN-CPP (M2-1): дообучение РЕАЛЬНОЙ модели head-LoRA по таймеру.
+    #[cfg(feature = "llama")]
+    if st.train_secs > 0 && st.gguf_path.is_some() {
+        let st_tr = Arc::clone(&st);
+        let path = st.gguf_path.clone().expect("/model задан");
+        std::thread::Builder::new()
+            .name("train-cpp".into())
+            .spawn(move || train_thread(st_tr, path, node_seed))
+            .expect("train thread");
+        println!(
+            "train-cpp: раз в {} сек — пары чата → head-LoRA → {}",
+            st.train_secs,
+            Path::new(&dir).with_extension("lora.gguf").display()
+        );
+    }
     // WEB-ФИД (M2-2): факты из сети → инфосфера (0 = выкл).
     if web_secs > 0 {
         let st_web = Arc::clone(&st);

@@ -22,9 +22,26 @@
       без Content-Length: тело пишется кусками прямо из модели + flush)
       и JS-насос `getReader`/TextDecoder в PAGE — ответ рисуется по мере
       генерации, служебный хвост «контекст: N» отрезается от пузыря.
-- [ ] Дообучение реальной модели (train-cpp): llama.cpp forward-only —
-      нужен отдельный тренировочный крейт; точки прикрепления
-      `ChatModel::respond` (готов) и LocalTrainer (интерфейс в dinet-fl)
+- [x] train-cpp v0 — head-LoRA на НАСТОЯЩЕЙ модели: llama.cpp forward-only,
+      своего трансформера нет — llama.cpp сам отдаёт вход головы
+      (hidden после финальной нормы через embeddings+pooling NONE) и
+      базовые логиты по всем позициям (probe, dinet-llama::probe_tokens);
+      dinet-train тренирует ТОЛЬКО LoRA-дельту головы (ΔW=B·A, backward —
+      простые произведения; AdamW; численная сверка градиента finite
+      differences — выловлена ошибка CE: у целевого токена вычитается
+      ИНДИКАТОР (1), не вероятность) и пишет adapter-GGUF
+      (output.weight.lora_a/lora_b, alpha=rank ⇒ scale 1 при наложении;
+      формат(adapter) сверён с исходником llama-adapter.cpp — проверка
+      шейпов, «lora_a не транспонирован»).
+      webchat `--train-secs N`: пары чата (сессия) → токенизация → шаги;
+      каждые 12 шагов adapter на диск (tmp→rename); worker подхватывает
+      файл по mtime (lora_adapter_init до создания контекста, затем
+      lora_adapter_set на КОНКРЕТНЫЙ контекст, scale 1.0).
+      следующий масштаб: LoRA на СЛОЯХ (attention/MLP) — свой backprop
+      через граф llama — большой отдельный заход.
+      Тесты: dinet-train 8 (сходимость/FD/roundtrip/чтение арх из GGUF
+      по своим байтам), dinet-llama env-gated (probe-шейпы, adapter
+      принят + нулевой B не меняет жадную генерацию).
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp
