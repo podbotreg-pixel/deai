@@ -12,6 +12,8 @@ dinet-fl = { path = "../dinet-fl" }
 dinet-memory = { path = "../dinet-memory" }
 dinet-node = { path = "../dinet-node" }
 dinet-proto = { path = "../dinet-proto" }
+# manifest-куски torrent-обмена LoRA-адаптеров (файлы-опыты узлов)
+dinet-registry = { path = "../dinet-registry" }
 # llama.cpp для GUI-чата: фича llama + --model (сборка настоящей LLM в webchat)
 dinet-llama = { path = "../dinet-llama", optional = true }
 # train-cpp: head-LoRA тренажёр поверх llama.cpp (фонд фичи llama)

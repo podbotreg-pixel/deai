@@ -433,7 +433,7 @@ mod tests {
 
         let mut relayed_other_b = 0u32;
         for _ in 0..10 {
-            let ra = info_exchange_tick(&a_key, 17005, &a_key.pubkey(), &mut ia, &mut sa, &mut bus);
+            let _ra = info_exchange_tick(&a_key, 17005, &a_key.pubkey(), &mut ia, &mut sa, &mut bus);
             let rb = info_exchange_tick(&b_key, 42000, &b_key.pubkey(), &mut ib, &mut sb, &mut bus);
             let rc = info_exchange_tick(&c_key, 42002, &c_key.pubkey(), &mut ic, &mut sc, &mut bus);
             relayed_other_b += rb.relayed_other;

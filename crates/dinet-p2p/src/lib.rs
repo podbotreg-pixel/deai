@@ -580,6 +580,43 @@ impl GossipBridge {
     pub fn send_frame(&self, ch: u8, to: Option<u16>, bytes: Vec<u8>) {
         let _ = self.cmd_tx.send(BridgeCmd::Publish { ch, to, bytes });
     }
+
+    /// Отдельная ручка канала узла для ВТОРОГО потребителя: infosync и
+    /// релей LoRA крутятся в разных нитях ОДНОГО сетевого узла (общий
+    /// сварм/TCP; каждый приорикан видит СВОИ каналы, сбор/публикация
+    /// на чужой канал не мешает — очереди раздельные по ch).
+    pub fn link(&self) -> GossipLink {
+        GossipLink {
+            cmd_tx: self.cmd_tx.clone(),
+            queues: self.queues.clone(),
+            peer: self.peer,
+        }
+    }
+}
+
+/// Transport-вид ручки канала (те же правила, что у моста).
+pub struct GossipLink {
+    cmd_tx: std_mpsc::Sender<BridgeCmd>,
+    queues: Vec<Arc<StdMutex<Vec<InFrame>>>>,
+    peer: PeerId,
+}
+
+impl dinet_node::transport::Transport for GossipLink {
+    fn send(&mut self, ch: u8, _from: u16, to: Option<u16>, frame: &[u8]) {
+        // NB: без loopback-копии как у моста — клиентские тики (infosync/
+        // lorasync) СВОИ кадры и так пропускают, а эхо своей публикации
+        // придёт из сети (gossipsub доставляет своё, если подписаны).
+        let _ = self.cmd_tx.send(BridgeCmd::Publish { ch, to, bytes: frame.to_vec() });
+    }
+
+    fn collect(&mut self, ch: u8, _me: u16) -> Vec<Vec<u8>> {
+        self.queues[usize::from(ch)]
+            .lock()
+            .expect("queue")
+            .drain(..)
+            .map(|f| f.raw)
+            .collect()
+    }
 }
 
 impl Drop for GossipBridge {

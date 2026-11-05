@@ -674,6 +674,7 @@ dependencies = [
  "dinet-node",
  "dinet-p2p",
  "dinet-proto",
+ "dinet-registry",
  "dinet-train",
 ]
 

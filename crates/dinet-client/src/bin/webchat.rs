@@ -66,12 +66,16 @@
 //! WEB-ФИД (M2): при `--web <сек>` фоновый коннектор (DuckDuckGo HTML
 //! через curl — бесплатный, без ключей/телеметрии) приносит факты по
 //! вращающимся темам → записи kind=факт в инфосферу.
+//! РОЕВОЙ LoRA-РЕЛЕЙ (общая память роя): при `--p2p` узел вдобавок
+//! раздаёт/тянет торрент-файл train-адаптера `<dir>.lora.gguf` по
+//! кусочкам (кадры BlobHave/BlobChunk канала CH_BLOB — тот же механизм
+//! репликации весов чек-пойнтов); чужие собранные адаптеры пишутся в
+//! `{dir}.lora-peer-*.gguf` и тА её подхватывается релеем (сид для
+//! третьих узлов). Период тика `--lora-share <сек>` (0 = выкл).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
-#[cfg(feature = "llama")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -282,8 +286,10 @@ struct ChatState {
     #[cfg(feature = "llama")]
     gguf_path: Option<PathBuf>,
     /// каталог памяти (для файлов .lora.gguf рядом с .info/.roi).
-    #[cfg(feature = "llama")]
     dir: PathBuf,
+    /// LoRA-РЕЛЕЙ (общая память роя): чужих адаптеров собрано целиком.
+    #[cfg(feature = "p2p")]
+    lora_count: AtomicU64,
 }
 
 fn now_ts() -> u64 {
@@ -741,33 +747,12 @@ fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "p2p")]
-fn p2p_info_thread(st: Arc<ChatState>, node_seed: [u8; 32], dial: Option<String>) {
+fn p2p_info_thread(st: Arc<ChatState>, node_seed: [u8; 32], mut bridge: dinet_p2p::GossipBridge) {
     use dinet_client::infosync::{info_exchange_tick, InfoExchangeState};
-    use dinet_p2p::GossipBridge;
 
     let key = Ed25519Signer::from_seed(&node_seed);
     let my_pub = key.pubkey();
     let me_id = u16::from_be_bytes([my_pub[0], my_pub[1]]);
-    // мост libp2p: ТОТ ЖЕ личный ключ — кадры подписываются узлом как есть
-    let mut bridge = match GossipBridge::spawn(me_id, node_seed) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[p2p] мост не поднялся: {e}");
-            return;
-        }
-    };
-    if let Some(addr) = &bridge.addr {
-        println!(
-            "[p2p] мост узла {me_id} слушает {addr}{}",
-            dial.as_ref().map(|d| format!(", dial {d}")).unwrap_or_default()
-        );
-    }
-    if let Some(d) = dial {
-        match d.parse() {
-            Ok(a) => bridge.dial(a),
-            Err(e) => eprintln!("[p2p] dial некорректен: {e}"),
-        }
-    }
     let mut state = InfoExchangeState::new();
     let mut tick_n = 0u64;
     loop {
@@ -783,6 +768,87 @@ fn p2p_info_thread(st: Arc<ChatState>, node_seed: [u8; 32], dial: Option<String>
         if taken > 0 || tick_n == 1 {
             let info_n = st.info.lock().expect("info lock").len();
             println!("[p2p #{tick_n}] узел {me_id}: принял записей {taken}, всего {info_n}");
+        }
+    }
+}
+
+/// LoRA-РЕЛЕЙ (общая память роя): торрент-обмен файлом train-адаптера.
+/// Своё: свежий `<dir>.lora.gguf` (перечитка по mtime+len) → манифест+
+/// куски → объявка BlobHave раз за версию. Чужое: канон хэш-связан с id,
+/// куски верифицируются по манифесту; собрался → файл `{dir}.lora-peer-…`
+/// (никто НЕ применяет чужой адаптер — материал ждёт рой-кворума, это
+/// честный отказ от подмены семантики) → сид для третьих из релей-кэша.
+#[cfg(feature = "p2p")]
+fn p2p_lora_thread(
+    st: Arc<ChatState>,
+    mut link: dinet_p2p::GossipLink,
+    node_seed: [u8; 32],
+    period: u64,
+) {
+    use dinet_client::lorasync::{lora_exchange_tick, home_pack, HomeBlob, LoraSync};
+
+    let key = Ed25519Signer::from_seed(&node_seed);
+    let my_pub = key.pubkey();
+    let me_id = u16::from_be_bytes([my_pub[0], my_pub[1]]);
+    let seed_path = std::path::Path::new(&st.dir).with_extension("lora.gguf");
+    let prefix = st.dir.clone();
+    let mut sync = LoraSync::new();
+    let mut home: Option<HomeBlob> = None;
+    let mut home_seen: Option<(u64, u64)> = None; // (mtime-sek, длина)
+    let mut tick_n = 0u64;
+    loop {
+        std::thread::sleep(Duration::from_secs(period.max(1)));
+        tick_n += 1;
+        // свой файл: перечитываем ток при изменении (mtime+длина)
+        if let Ok(md) = std::fs::metadata(&seed_path) {
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_secs()).unwrap_or(0))
+                .unwrap_or(0);
+            let len = md.len();
+            if home_seen != Some((mtime, len)) {
+                home_seen = Some((mtime, len));
+                match home_pack(&seed_path) {
+                    Ok(h) => home = Some(h),
+                    Err(_) => home = None, // ещё пишется train-потоком — вежливо ждём
+                }
+            }
+        }
+        let rep = lora_exchange_tick(
+            &key,
+            me_id,
+            &my_pub,
+            home.as_ref(),
+            Some(&prefix),
+            &mut sync,
+            &mut link,
+        );
+        if rep.completed > 0 {
+            st.lora_count.fetch_add(u64::from(rep.completed), Ordering::Relaxed);
+            println!(
+                "[train-p2p #{tick_n}] LoRA от роя принят: {} КиБ → {}",
+                rep.last_len / 1024,
+                dinet_client::lorasync::foreign_path(&prefix, &rep.last_sender).display()
+            );
+        }
+        if rep.announced > 0 {
+            println!(
+                "[train-p2p #{tick_n}] LoRA своя объявлена рой ({} КиБ)",
+                home.as_ref().map(|h| h.manifest.total / 1024).unwrap_or(0)
+            );
+        }
+        if rep.rejected > 0 {
+            println!("[train-p2p #{tick_n}] отброшено мусора: {}", rep.rejected);
+        }
+        // (диагностика роя) раз в 5 тиков — пульс канала CH_BLOB
+        if tick_n % 5 == 0 {
+            println!(
+                "[lora-dbg #{}]| in={} bad={} taken={} asked={} serve={} have={} announced={} pulling={} relayed={}",
+                tick_n, rep.frames_in, rep.frame_drop, rep.taken, rep.asked, rep.serve, rep.have_out, rep.announced,
+                sync.pulling(), sync.relayed()
+            );
         }
     }
 }
@@ -1038,12 +1104,16 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             };
             #[cfg(not(feature = "llama"))]
             let trainl = "нет".to_string();
+            #[cfg(feature = "p2p")]
+            let lora_n = st.lora_count.load(Ordering::Relaxed);
+            #[cfg(not(feature = "p2p"))]
+            let lora_n = 0u64;
             respond(
                 out,
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}&trainl={trainl}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}&lorap={lora_n}&trainl={trainl}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -1065,6 +1135,8 @@ fn main() {
     let mut train_secs = 0u64;
     let mut p2p_on = false;
     let mut dial_addr: Option<String> = None;
+    #[cfg(feature = "p2p")]
+    let mut lora_secs = 3u64;
     #[cfg(feature = "llama")]
     let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
@@ -1075,6 +1147,8 @@ fn main() {
             "--web" => web_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--p2p" => p2p_on = true,
             "--dial" => dial_addr = args.next(),
+            #[cfg(feature = "p2p")]
+            "--lora-share" => lora_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(3),
             #[cfg(feature = "llama")]
             "--model" => model_path = args.next(),
             #[cfg(feature = "llama")]
@@ -1206,8 +1280,9 @@ fn main() {
         train_loss_x4: AtomicU64::new(u64::MAX),
         #[cfg(feature = "llama")]
         gguf_path: model_path.map(|s| PathBuf::from(s)),
-        #[cfg(feature = "llama")]
         dir: PathBuf::from(&dir),
+        #[cfg(feature = "p2p")]
+        lora_count: AtomicU64::new(0),
     });
     // ФОН (M2-1): дообучение по таймеру — поток живёт, пока жив клиент.
     let st_bg = Arc::clone(&st);
@@ -1239,12 +1314,42 @@ fn main() {
     // записей, аски отсутствующих, тела, приём с проверкой автора.
     #[cfg(feature = "p2p")]
     if p2p_on {
-        let st_p2p = Arc::clone(&st);
-        let dial = dial_addr.clone();
-        std::thread::Builder::new()
-            .name("info-p2p".into())
-            .spawn(move || p2p_info_thread(st_p2p, node_seed, dial))
-            .expect("p2p thread");
+        // мост — ОДИН на узел (один TCP-сварм); нитям отдаём раздельные
+        // ручки: infosync (CH_INFO) и LoRA-релей (CH_BLOB) — очереди
+        // каналов раздельные, publication/collect не мешают.
+        match dinet_p2p::GossipBridge::spawn(node_id, node_seed) {
+            Err(e) => eprintln!("[p2p] мост не поднялся: {e}"),
+            Ok(bridge) => {
+                if let Some(addr) = &bridge.addr {
+                    println!(
+                        "[p2p] мост узла {node_id} слушает {addr}{}",
+                        dial_addr.as_ref().map(|d| format!(", dial {d}")).unwrap_or_default()
+                    );
+                }
+                if let Some(d) = dial_addr.clone() {
+                    match d.parse() {
+                        Ok(a) => bridge.dial(a),
+                        Err(e) => eprintln!("[p2p] dial некорректен: {e}"),
+                    }
+                }
+                let st_p2p = Arc::clone(&st);
+                let link = bridge.link();
+                std::thread::Builder::new()
+                    .name("info-p2p".into())
+                    .spawn(move || p2p_info_thread(st_p2p, node_seed, bridge))
+                    .expect("p2p thread");
+                // LoRA-релей: свой период (--lora-share, 0 = выкл);
+                // узел без --model тоже участвует (сид/релей чужого).
+                if lora_secs > 0 {
+                    println!("lora-релей: раз в {lora_secs} сек — {dir}.lora.gguf ↔ торрент роя");
+                    let st_lora = Arc::clone(&st);
+                    std::thread::Builder::new()
+                        .name("lora-p2p".into())
+                        .spawn(move || p2p_lora_thread(st_lora, link, node_seed, lora_secs))
+                        .expect("lora thread");
+                }
+            }
+        }
     }
     #[cfg(not(feature = "p2p"))]
     let _ = (p2p_on, dial_addr);
@@ -1353,7 +1458,8 @@ document.getElementById('st').textContent='ходов: '+pairs.turns+' | обу�
 +' | инфосфера: '+pairs.info+' записей'
 +' | web-фид: '+pairs.web+' тем (факты из сети)'
 +' | правил роя: '+pairs.rules+' (кворумных: '+pairs.qrs+')'
-+' | p2p-обмен: '+pairs.p2p+' принятых записей';});}
++' | p2p-обмен: '+pairs.p2p+' принятых записей'
++' | LoRA от роя: '+pairs.lorap+' чужих адаптеров';});}
 /* системный Bootstrap: реально загрузился? нет — живём на собственной
    теме (no-bs), есть — пусть управляет кнопками/полями (has-bs). */
 (function(){

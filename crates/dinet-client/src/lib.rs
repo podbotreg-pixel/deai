@@ -41,6 +41,7 @@
 //! std-only: никаких внешних зависимостей, как весь workspace.
 
 pub mod infosync;
+pub mod lorasync;
 
 use dinet_fl::toy_llm::{Sample, CTX, V};
 
