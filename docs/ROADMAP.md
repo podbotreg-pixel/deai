@@ -52,13 +52,29 @@
       layer max|pred−obs| = 6e-6 на живом обученном адаптере — llama
       применяет ffn_down-лору как ровно B·(A·xsw) на линейной точке
       l_out-23 (вставка в ffn_out, resid после). Урок первой ловушки:
-      захваченный узел «norm» — это ВЫХОД RMS-нормы (нелинейное место),
-      δ там ≠ δ слоя — паритет обязан мериться на l_out-23 (или ffn_out),
-      а head-путь — на hidden (выход out_norm) → логиты Ф32 совпадают.
-      Тесты: dinet-train 15 (слой: grads_match_finite_diff,
+      узел llama «norm» (cb ДО умножения на вес) — уже НЕлинейная точка
+      (x/rms), δ там ≈ δ/rms — паритет обязан мериться на линейном
+      l_out-23 (или ffn_out); голова — на hidden (после out_norm) →
+      логиты Ф32 совпадают. Capture h_pre в cb правильный: копируется
+      src[0] узла «norm» = РЕЗИДУАЛ до нормы (layer.rs сам восстанавливает
+      норму в градиенте).
+      Тесты: dinet-train 16 (слой: grads_match_finite_diff,
       zero_delta_loss_is_base_ce, train_step_reduces_loss;
       synthetic_gguf_roundtrip), dinet-llama gain 8 (env-gated:
-      lora_delta_parity — head/layer изоляторы через свой писец).
+      lora_delta_parity — head/layer изоляторы, слой парсится из имени;
+      работа тестов с ОБЕИМИ моделями).
+- [x] **train-cpp v1.1 — tied-модель (SmolLM2-135M Q8_0, llama-арх, 30
+      слоёв):** head-LoRA честно НЕ включается (output_weight=false —
+      llama-лору к связанной голове не подать: это была бы подмена);
+      для ЛОССА layer-шага головой служит token_embd.weight (именно
+      llama.cpp строит ею логиты при связке) — layer-LoRA обучается
+      (blk.29.ffn_down, р=8; лосс слоя падает: 1.58 → 0.72 за 24 шага),
+      layer-only адаптер 68 КиБ (alpha=рангу слоя → scale=1).
+      Проверено ЖИВЫМ: паритет layer max|pred−obs| = 2.1e-4 (< 1e-3) на
+      обученном адаптере; полный gated-набор 8/8 и на qwen05b, и на
+      SmolLM2 (паритет-тест динамический; zero-adapter для tied пишется
+      нулевым слоем; head-де-квант честно пропускается; стрим копит
+      СЫРЫЕ байты — SPM-токены режут UTF-8 посреди символа).
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp

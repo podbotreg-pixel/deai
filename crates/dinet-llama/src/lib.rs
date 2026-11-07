@@ -532,16 +532,22 @@ mod tests {
         .expect("GGUF загружается llama.cpp");
         let mut plain = m.respond("Скажи: привет", &[]);
         let mut n = 0;
-        let mut streamed = String::new();
+        let mut streamed = Vec::new();
         let _ = m.generate_stream(
             &build_prompt("Скажи: привет", &[]),
             &mut |b| {
                 n += 1;
-                streamed.push_str(&String::from_utf8_lossy(b));
+                // копим СЫРЫЕ байты: кусок потока может резать UTF-8
+                // посреди символа (SPM-токены SmolLM2 и пр.)
+                streamed.extend_from_slice(b);
             },
         );
         assert!(n >= 1, "куски потока не отданы: {n}");
-        assert_eq!(streamed.trim(), plain.trim(), "стрим ≠ целине");
+        assert_eq!(
+            String::from_utf8_lossy(&streamed).trim(),
+            plain.trim(),
+            "стрим ≠ целике"
+        );
         plain.clear();
     }
 
@@ -646,15 +652,40 @@ mod tests {
             .tokenize("Вопрос: привет\nОтвет: привет мир".as_bytes(), true, true);
         let probe = probe_tokens(&model, &backend, &tokens).expect("probe");
         let arch = read_architecture(Path::new(&path)).expect("arch из GGUF");
-        let spec = HeadSpec {
-            d: probe.n_embd as u32,
-            v: probe.n_vocab as u32,
-            r: 8,
-        };
-        let head = HeadLora::new(spec, 2026);
+        let gg = dinet_train::gguf::GgufModel::open(Path::new(&path)).expect("gguf");
         let tmp = std::env::temp_dir()
             .join(format!("dinet-neutral-{}.gguf", std::process::id()));
-        head.save_adapter(&arch, &tmp).expect("adapter пишется");
+        // tied-модель (output.weight нет — SmolLM2, gemma-3 ≤1b): llama.cpp
+        // head-лору к связанной голове НЕ принимает; нулевой adapter пишется
+        // на слой (ffn_down последнего слоя) — тоже нейтральное начало.
+        let tied = gg.tensor("output.weight").is_none();
+        if !tied {
+            let spec = HeadSpec {
+                d: probe.n_embd as u32,
+                v: probe.n_vocab as u32,
+                r: 8,
+            };
+            let head = HeadLora::new(spec, 2026);
+            head.save_adapter(&arch, &tmp).expect("adapter пишется");
+        } else {
+            let n_in = gg.num("feed_forward_length").unwrap_or(0) as usize;
+            let n_layer = gg.num("block_count").unwrap_or(0) as usize;
+            assert!(n_in > 0 && n_layer > 0, "размеры модели читаются");
+            let r = 8usize;
+            dinet_train::save_adapter_pieces(
+                &arch,
+                &tmp,
+                &[dinet_train::AdapterPiece {
+                    base: format!("blk.{}.ffn_down.weight", n_layer - 1),
+                    a: vec![0f32; r * n_in],
+                    a_ne0: n_in as u64,
+                    b: vec![0f32; probe.n_embd as usize * r],
+                    b_ne1: probe.n_embd as u64,
+                    r: r as u64,
+                }],
+            )
+            .expect("layer-zero adapter пишется");
+        }
 
         let plain = greedy_generate(&model, &backend, "Вопрос: привет\nОтвет:", None, 6);
         let mut a = model.lora_adapter_init(&tmp).expect("adapter принят");

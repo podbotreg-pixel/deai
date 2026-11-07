@@ -611,7 +611,15 @@ mod impl_probe2 {
             return;
         };
         let gg = dinet_train::gguf::GgufModel::open(Path::new(&path)).expect("gguf-ридер");
-        let head = gg.read_f32("output.weight").expect("голова читается");
+        let head = match gg.read_f32("output.weight") {
+            Ok(h) => h,
+            Err(_) => {
+                // tied-модель (SmolLM2, gemma-3 ≤1b): головы-тензора нет,
+                // де-квант головы не о чем — честная остановка
+                eprintln!("tied-модель (output.weight нет): head-часть пропущена");
+                return;
+            }
+        };
         let n_embd = gg.num("embedding_length").expect("n_embd в kv") as usize;
         assert_eq!(head.row, n_embd, "строка головы = n_embd");
 
@@ -691,13 +699,19 @@ mod impl_probe2 {
             };
         use dinet_train::AdapterPiece;
         let gg = dinet_train::gguf::GgufModel::open(Path::new(&model_path)).expect("gguf");
-        assert!(gg.num("qwen2.feed_forward_length").unwrap_or(4864) > 0);
-        let d = gg.num("qwen2.embedding_length").unwrap_or(896) as usize;
+        // размеры БЕЗ префикса арха: поиск по суффиксу (qwen2/llama/...)
+        let d = gg.num("embedding_length").expect("n_embd в gguf") as usize;
+        let n_layer = gg.num("block_count").unwrap_or(0) as usize;
+        assert!(d > 0 && n_layer > 0, "размеры модели читаются");
+        // арх берётся из МОДЕЛИ: llama.cpp сверяет arch адаптера с моделью
+        let arch_m = gg.architecture().as_deref().unwrap_or("llama").to_string();
 
         // адаптер — целиком СВОЙ ридер (пары lora_a/lora_b, F32)
         let ad = dinet_train::gguf::GgufModel::open(Path::new(&adapter_path)).expect("adapter");
-        let a_h = ad.read_f32("output.weight.lora_a").expect("head lora_a");
-        let b_h = ad.read_f32("output.weight.lora_b").expect("head lora_b");
+        // голова ОПЦИОНАЛЬНА: tied-модели (SmolLM2, gemma-3 ≤1b и др.) пишут
+        // только слой — head-часть паритета тогда пропускается
+        let head_pr =
+            ad.read_f32("output.weight.lora_a").ok().zip(ad.read_f32("output.weight.lora_b").ok());
         let (base_name, a_l, b_l) = match ad
             .tensors
             .keys()
@@ -711,8 +725,6 @@ mod impl_probe2 {
             ),
             None => (None, None, None),
         };
-        assert_eq!(a_h.row as usize, d, "строка головы = n_embd");
-
         let eng = Probe2::load(Path::new(&model_path)).expect("модель");
         let tok = tokenize_gated(Path::new(&model_path), "вопрос привет ответ");
         let base = eng.run(&tok, false).expect("базовый проход");
@@ -724,50 +736,57 @@ mod impl_probe2 {
 
         let tmpd = std::env::temp_dir();
 
-        // --- изоляция БЕЗ слойной лоры: голова на выходе norm Ф32 → сравнение точное
-        let head_only = tmpd.join("dinet-parity-head.gguf");
-        dinet_train::save_adapter_pieces("qwen2", &head_only, &[AdapterPiece {
-            base: "output.weight".into(),
-            a: a_h.data.clone(),
-            a_ne0: a_h.row as u64,
-            b: b_h.data.clone(),
-            b_ne1: b_h.rows as u64,
-            r: a_h.rows as u64,
-        }])
-        .expect("head-only пишется");
-        let obs_head = eng
-            .run_with_lora(&tok, &head_only)
-            .expect("head-only проход");
-        let mut mh = 0f32;
-        {
-            let pos = 0usize;
-            let hid = base.hidden.as_ref().expect("hidden")[pos].clone();
-            for j in 0..eng.n_vocab {
-                let mut z_h = vec![0f32; a_h.rows];
-                for (i, zz) in z_h.iter_mut().enumerate() {
-                    let row = &a_h.data[i * d..(i + 1) * d];
-                    *zz = row.iter().zip(hid.iter()).map(|(w, v)| w * v).sum();
+        // --- изоляция БЕЗ слойной лоры: голова на выходе norm Ф32 → сравнение точное.
+        // Пропускается для layer-only адаптера (tied-модели: SmolLM2 и др.).
+        if let Some((a_h, b_h)) = head_pr.as_ref() {
+            assert_eq!(a_h.row as usize, d, "строка головы = n_embd");
+            let head_only = tmpd.join("dinet-parity-head.gguf");
+            dinet_train::save_adapter_pieces(&arch_m, &head_only, &[AdapterPiece {
+                base: "output.weight".into(),
+                a: a_h.data.clone(),
+                a_ne0: a_h.row as u64,
+                b: b_h.data.clone(),
+                b_ne1: b_h.rows as u64,
+                r: a_h.rows as u64,
+            }])
+            .expect("head-only пишется");
+            let obs_head = eng.run_with_lora(&tok, &head_only).expect("head-only проход");
+            let mut mh = 0f32;
+            {
+                let pos = 0usize;
+                let hid = base.hidden.as_ref().expect("hidden")[pos].clone();
+                for j in 0..eng.n_vocab {
+                    let mut z_h = vec![0f32; a_h.rows];
+                    for (i2, zz) in z_h.iter_mut().enumerate() {
+                        let row = &a_h.data[i2 * d..(i2 + 1) * d];
+                        *zz = row.iter().zip(hid.iter()).map(|(w, v)| w * v).sum();
+                    }
+                    let brow = &b_h.data[j * b_h.row..(j + 1) * b_h.row];
+                    let pred: f32 = brow.iter().zip(z_h.iter()).map(|(w, v)| w * v).sum();
+                    let ob = obs_head[pos][j] - base.base_logits[pos][j];
+                    mh = mh.max((pred - ob).abs());
                 }
-                let brow = &b_h.data[j * b_h.row..(j + 1) * b_h.row];
-                let pred: f32 = brow.iter().zip(z_h.iter()).map(|(w, v)| w * v).sum();
-                let ob = obs_head[pos][j] - base.base_logits[pos][j];
-                mh = mh.max((pred - ob).abs());
             }
+            eprintln!("head-only: max|pred−obs|={mh:.4}");
+            assert!(mh < 1e-3, "head-паритет сломался: {mh}");
+            let _ = std::fs::remove_file(&head_only);
+        } else {
+            eprintln!("layer-only адаптер (tied): head-часть паритета пропущена");
         }
-        eprintln!("head-only: max|pred−obs|={mh:.4}");
-        assert!(mh < 1e-3, "head-паритет сломался: {mh}");
-        let _ = std::fs::remove_file(&head_only);
 
-        // --- слой-only: llama вычисляет δ на ЛИНЕЙНОЙ точке l_out-23 =>
+        // --- слой-only: llama вычисляет δ на ЛИНЕЙНОЙ точке l_out-{il} =>
         // obsδ = l_out(с лорой) − l_out(база) обязан равняться B·(A·xsw) точно.
-        // v1 тренирует только ffn_down ПОСЛЕДНЕГО (23-го) слоя — узел l_out-23.
+        // v1 тренирует только ffn_down ПОСЛЕДНЕГО слоя; слой парсится из имени
+        // (qwen2 → blk.23, llama-арх (SmolLM2-135M) → blk.29 — динамично).
         if let (Some(bn), Some(al), Some(bl)) = (base_name, a_l, b_l) {
-            assert!(
-                bn.ends_with("blk.23.ffn_down.weight"),
-                "v1-паритет ожидает последний слой, а не {bn}"
-            );
+            let il: usize = bn
+                .split('.')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .expect("номер слоя в имени тензора");
+            assert_eq!(il + 1, n_layer, "v1 тренирует ПОСЛЕДНИЙ слой (blk.{il})");
             let lay_only = tmpd.join("dinet-parity-layer.gguf");
-            dinet_train::save_adapter_pieces("qwen2", &lay_only, &[AdapterPiece {
+            dinet_train::save_adapter_pieces(&arch_m, &lay_only, &[AdapterPiece {
                 base: bn.clone(),
                 a: al.data.clone(),
                 a_ne0: al.row as u64,
@@ -776,16 +795,20 @@ mod impl_probe2 {
                 r: al.rows as u64,
             }])
             .expect("layer-only пишется");
-            // вход down = узел ffn_swiglu-23 llama
-            let psx = eng
-                .run_target(&tok, false, "ffn_swiglu-23")
-                .expect("swiglu-база");
-            let xs = psx.clone().x_down.expect("xsw789");
+            // вход ffn_down = выход swiGLU слоя llama (ffn_silu — запасной
+            // вариант naming для архов без PAR-сплит свиGLU)
+            let psx = match eng.run_target(&tok, false, &format!("ffn_swiglu-{il}")) {
+                Ok(pp) => pp,
+                Err(_) => eng
+                    .run_target(&tok, false, &format!("ffn_silu-{il}"))
+                    .expect("вход ffn_down (ffn_swiglu/ffn_silu)"),
+            };
+            let xs = psx.x_down.expect("вход ffn_down не захвачен");
             let plo = eng
-                .run_target_lora(&tok, false, "l_out-23", Some(&lay_only))
+                .run_target_lora(&tok, false, &format!("l_out-{il}"), Some(&lay_only))
                 .expect("l_out лора проход");
             let pbo = eng
-                .run_target(&tok, false, "l_out-23")
+                .run_target(&tok, false, &format!("l_out-{il}"))
                 .expect("l_out баз проход");
             let yl = plo.x_down.as_ref().expect("l_out лора");
             let yb = pbo.x_down.as_ref().expect("l_out база");

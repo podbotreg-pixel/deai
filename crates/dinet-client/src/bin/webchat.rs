@@ -417,7 +417,7 @@ fn bg_trainer(st: Arc<ChatState>, node_seed: [u8; 32]) {
 
 #[cfg(feature = "llama")]
 fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
-    use dinet_llama::probe2::{self, L2Probe, Probe2};
+    use dinet_llama::probe2::{L2Probe, Probe2};
     use dinet_llama::{
         llama_backend, LlamaModel, LlamaModelParams,
     };
@@ -455,7 +455,19 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
             return;
         }
     };
-    let head_w = gg.read_f32("output.weight").ok();
+    // Голова для ЛОССА layer-шага: обычные модели — output.weight. У моделей
+    // со связкой (output_weight=false — SmolLM2, gemma-3 ≤1b и др.) голова
+    // == token_embd.weight: llama.cpp строит логиты той же матрицей, так что
+    // для лосса это ЧЕСТНЫЙ источник (head-LoRA при этом так и не включён).
+    let head_w = gg.read_f32("output.weight").ok().or_else(|| {
+        let t = gg.read_f32("token_embd.weight").ok();
+        if t.is_some() {
+            eprintln!(
+                "[train] голова связана с эмбеддингом (tied): для лосса layer-шага читаю token_embd.weight"
+            );
+        }
+        t
+    });
     let norm_w = gg.read_f32("output_norm.weight").ok();
     let eps = gg.f32val("layer_norm_rms_epsilon").unwrap_or(1e-5);
     let n_ff = gg.num("feed_forward_length").unwrap_or(0) as usize;
@@ -563,7 +575,7 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
                 }
             }
         }
-        let be = backend.as_ref().expect("be");
+        let _be = backend.as_ref().expect("be");
         let m = model.as_ref().expect("model");
         // пары по кругу (свежие первыми, ротация чтобы не застревать)
         let n = pairs.len();
