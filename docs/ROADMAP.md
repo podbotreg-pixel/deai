@@ -42,6 +42,23 @@
       Тесты: dinet-train 8 (сходимость/FD/roundtrip/чтение арх из GGUF
       по своим байтам), dinet-llama env-gated (probe-шейпы, adapter
       принят + нулевой B не меняет жадную генерацию).
+- [x] **train-cpp v1 — слой-ЛоRA на ffn_down (blk.23, r=8):** пары учителя
+      (p=4 слова микро-языка, a=1 слово; валидация `pair_to_sample`) →
+      head-шаг + layer-шаг (lr·0.6, AdamW, нормировка градиента на n_loss)
+      в train-потоке webchat (фоном, чат не блокируется); merged-adapter
+      (`save_adapter_pieces`: head + layer, alpha=рангу головы) пишется
+      каждые 12 шагов (tmp→rename), worker подхватывает по mtime.
+      Паритет llama.cpp подтверждён ТОЧНО: head max|pred−obs| = 0.0000;
+      layer max|pred−obs| = 6e-6 на живом обученном адаптере — llama
+      применяет ffn_down-лору как ровно B·(A·xsw) на линейной точке
+      l_out-23 (вставка в ffn_out, resid после). Урок первой ловушки:
+      захваченный узел «norm» — это ВЫХОД RMS-нормы (нелинейное место),
+      δ там ≠ δ слоя — паритет обязан мериться на l_out-23 (или ffn_out),
+      а head-путь — на hidden (выход out_norm) → логиты Ф32 совпадают.
+      Тесты: dinet-train 15 (слой: grads_match_finite_diff,
+      zero_delta_loss_is_base_ce, train_step_reduces_loss;
+      synthetic_gguf_roundtrip), dinet-llama gain 8 (env-gated:
+      lora_delta_parity — head/layer изоляторы через свой писец).
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp

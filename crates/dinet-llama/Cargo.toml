@@ -9,3 +9,4 @@ description = "Точка прикрепления llama.cpp (GGUF Q4): ChatMode
 dinet-chat = { path = "../dinet-chat" }
 dinet-train = { path = "../dinet-train" }
 llama-cpp-2 = "0.1"
+llama-cpp-sys-2 = "0.1"

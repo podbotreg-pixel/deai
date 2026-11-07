@@ -125,7 +125,7 @@ robust step (v0: dinet-node::swarm::robust_screen, проверен сим-те�
    ↓
 notary-кворум ── CHECKPOINT_ANNOUNCE (hash, parent_hash, eval-метрики, watermark)
    ↓ реплицируется в реестр (append-only gossip-лог)
-все узлы: скачивают дель炙 через torrent/прямую передачу, local-verify (hash+watermark), apply.
+все узлы: скачивают дельты через torrent/прямую передачу, local-verify (hash+watermark), apply.
 ```
 
 Управление эпохой: `era_id = f(hash(previous_checkpoint, time_bucket))`.

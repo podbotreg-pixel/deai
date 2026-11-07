@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn stamp_quorum_forgery_ignored() {
         let (mut nodes, ids, mut t, dir, cp, mut anchors) = seeded("stamp");
-        let mut regs = reopen_regs(&dir);
+        let regs = reopen_regs(&dir);
 
         // докоммита нет: обе головы уже запечатаны fixture'ом после эр
         let counts = anchors_seal(&mut nodes, &ids, &regs, &mut anchors, &mut t);
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn rollback_detected_repaired_via_h() {
         let (mut nodes, ids, mut t, dir, cp, mut anchors) = seeded("rollback");
-        let mut regs = reopen_regs(&dir);
+        let regs = reopen_regs(&dir);
         // печать гостевых голов уже прошла в fixture — докомму здесь нечего
         let counts = anchors_seal(&mut nodes, &ids, &regs, &mut anchors, &mut t);
         assert!(counts.iter().all(|&c| c == 0), "печать сорвалась: {counts:?}");

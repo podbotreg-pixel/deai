@@ -285,7 +285,9 @@ struct ChatState {
     /// путь к gguf-модели (для train-потока; None если llama не собран/не задан).
     #[cfg(feature = "llama")]
     gguf_path: Option<PathBuf>,
-    /// каталог памяти (для файлов .lora.gguf рядом с .info/.roi).
+    /// каталог памяти (для файлов .lora.gguf рядом с .info/.roi);
+    /// читается только llama/p2p-потоками (без фич — мёртвое поле, это ожидаемо).
+    #[allow(dead_code)]
     dir: PathBuf,
     /// LoRA-РЕЛЕЙ (общая память роя): чужих адаптеров собрано целиком.
     #[cfg(feature = "p2p")]
@@ -415,28 +417,70 @@ fn bg_trainer(st: Arc<ChatState>, node_seed: [u8; 32]) {
 
 #[cfg(feature = "llama")]
 fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
-    use dinet_llama::{llama_backend, probe_tokens, LlamaModel, LlamaModelParams};
-    use dinet_train::{read_model_header, HeadLora, HeadSpec};
+    use dinet_llama::probe2::{self, L2Probe, Probe2};
+    use dinet_llama::{
+        llama_backend, LlamaModel, LlamaModelParams,
+    };
+    use dinet_train::layer::{HeadWeights, LayerBatch, LayerLora, LayerSpec};
+    use dinet_train::{read_model_header, save_adapter_pieces, AdapterPiece, HeadLora, HeadSpec};
 
     // честная проверка ДО цикла: head-LoRA v0 требует НЕПРИВЯЗАННУЮ голову
     // (output.weight). У привязанных моделей (gemma-3 ≤1b и др.) LoRA
     // llama.cpp на token_embd действует на входе эмбеддингов — это НЕ
     // дельта головы; тренировать её как head-LoRA было бы подменой.
-    let header = match read_model_header(&gguf) {
-        Some(h) if h.output_weight => h,
-        Some(_) => {
-            eprintln!(
-                "[train] у модели нет output.weight (привязанная голова) — \
-                 head-LoRA v0 недоступна; ждём LoRA на слоях (v1)"
-            );
+    let header = read_model_header(&gguf);
+    let head_ok = matches!(&header, Some(h) if h.output_weight);
+    if !head_ok {
+        eprintln!(
+            "[train] head-LoRA v0 недоступна ({}); пробуем layer-LoRA v1",
+            match &header {
+                Some(_) => "привязанная голова",
+                None => "GGUF не читается",
+            }
+        );
+        if header.is_none() {
             return;
         }
-        None => {
-            eprintln!("[train] GGUF {} не читается — тренировка не начнётся", gguf.display());
+    }
+    let arch =
+        header.as_ref().and_then(|h| h.arch.clone()).unwrap_or_else(|| "llama".to_string());
+
+    // глубокое чтение GGUF для layer-LoRA: голова, финальная норма, размеры
+    // (dinet-train::gguf — СВОЙ ридер: F32/F16/Q8_0; Q4_K/дры другие кванты
+    // не читаем — для layer-LoRA нужны только норма+голова)
+    let gg = match dinet_train::gguf::GgufModel::open(&gguf) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[train] gguf-глубина не читается: {e}");
             return;
         }
     };
-    let arch = header.arch.unwrap_or_else(|| "llama".to_string());
+    let head_w = gg.read_f32("output.weight").ok();
+    let norm_w = gg.read_f32("output_norm.weight").ok();
+    let eps = gg.f32val("layer_norm_rms_epsilon").unwrap_or(1e-5);
+    let n_ff = gg.num("feed_forward_length").unwrap_or(0) as usize;
+    let n_layer = gg.num("block_count").unwrap_or(0);
+    // последний слой: базовый тензор слоя для adapter-пары
+    let ffn_base = if n_layer > 0 {
+        format!("blk.{}.ffn_down.weight", n_layer - 1)
+    } else {
+        String::new()
+    };
+    let layer_ok = norm_w.is_some()
+        && head_w.is_some()
+        && n_ff > 0
+        && n_layer > 0
+        && gg.tensor(&ffn_base).is_some();
+    if !layer_ok {
+        eprintln!(
+            "[train] layer-LoRA v1 недоступна (norm_w:{}, head_w:{}, n_ff:{n_ff}, n_layer:{n_layer})",
+            norm_w.is_some(),
+            head_w.is_some()
+        );
+    }
+    if !head_ok && !layer_ok {
+        return;
+    }
 
     let lora_out = Path::new(&st.dir).with_extension("lora.gguf");
     let seed64 = u64::from_le_bytes(node_seed[..8].try_into().expect("seed64"));
@@ -445,6 +489,8 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
     let mut backend: Option<Arc<dinet_llama::LlamaBackend>> = None;
     let mut model: Option<LlamaModel> = None;
     let mut head: Option<HeadLora> = None;
+    let mut layer: Option<LayerLora> = None;
+    let mut eng: Option<Probe2> = None;
     let mut steps = 0u64;
     let mut rot = 0usize;
     let lr = 1.5e-3f32;
@@ -471,6 +517,44 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
                 Ok(m) => {
                     println!("[train] модель {} → arch {arch}", gguf.display());
                     backend = Some(be);
+
+                    if layer_ok {
+                        match Probe2::load(&gguf) {
+                            Ok(e2) => {
+                                layer = Some(LayerLora::new(
+                                    LayerSpec {
+                                        n_in: n_ff as u32,
+                                        n_out: e2.n_embd as u32,
+                                        r: 8,
+                                    },
+                                    seed64 ^ 0x1111_2222_3333_4444,
+                                ));
+                                println!(
+                                    "[train] layer-LoRA v1 {ffn_base} r=8 (последний слой)"
+                                );
+                                eng = Some(e2);
+                            }
+                            Err(e) => {
+                                eprintln!("[train] probe2 не загрузился: {e}");
+                            }
+                        }
+                    }
+
+                    if head_ok {
+                        if let Some(w) = head_w.as_ref() {
+                            println!(
+                                "[train] head-LoRA d={} v={} r=8 (seed {seed64:08x})",
+                                w.row, w.rows
+                            );
+                        }
+                        head = head_w.as_ref().map(|w| {
+                            HeadLora::new(
+                                HeadSpec { d: w.row as u32, v: w.rows as u32, r: 8 },
+                                seed64,
+                            )
+                        });
+                    }
+
                     model = Some(m);
                 }
                 Err(e) => {
@@ -497,48 +581,94 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
             if tokens.len() < 4 {
                 continue;
             }
-            let targets: Vec<u32> = tokens
-                .iter()
-                .skip(1)
-                .map(|t| t.0 as u32)
-                .collect();
-            let probe = match probe_tokens(m, be, &tokens) {
+            let targets: Vec<u32> =
+                tokens.iter().skip(1).map(|t| t.0 as u32).collect();
+
+            // raw-проход probe2: ОДИН forward отдаёт материал и head-шагу
+            // (hidden, логиты), и layer-шагу (x_down, h_pre)
+            let Some(e2) = eng.as_ref() else { continue };
+            let tok_ivec: Vec<i32> =
+                tokens.iter().map(|t| t.0).collect();
+            let probe: L2Probe = match e2.run(&tok_ivec, false) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[train] probe: {e}");
+                    eprintln!("[train] probe2: {e}");
                     break;
                 }
             };
-            if head.is_none() {
-                println!(
-                    "[train] head-LoRA d={} v={} r=8 (seed {seed64:08x})",
-                    probe.n_embd, probe.n_vocab
-                );
-                head = Some(HeadLora::new(
-                    HeadSpec {
-                        d: probe.n_embd as u32,
-                        v: probe.n_vocab as u32,
-                        r: 8,
-                    },
-                    seed64,
-                ));
-            }
-            let h = head.as_mut().expect("head");
-            // учимся на сдвиге: позиция p предсказывает токен p+1; у ПОСЛЕДНЕЙ
-            // позиции продолжения нет — срезаем её из показаний llama.cpp
             let n_pos = targets.len();
-            let hidden = probe.hidden[..n_pos * probe.n_embd].to_vec();
-            let base = probe.base_logits[..n_pos * probe.n_vocab].to_vec();
-            let mask = vec![1f32; n_pos];
-            let loss = h.train_step(&hidden, &base, &targets, &mask, lr, 0.0);
+            if probe.n_tokens < n_pos {
+                continue;
+            }
+
+            let mut piece_head: Option<AdapterPiece> = None;
+            let mut loss_head = 0f32;
+            if let Some(h) = head.as_mut() {
+                // учимся на сдвиге: позиция p предсказывает токен p+1
+                let hidv = probe.hidden.as_ref().expect("hidden есть");
+                let mut hidden = Vec::with_capacity(n_pos * probe.n_embd);
+                for r in hidv.iter().take(n_pos) {
+                    hidden.extend_from_slice(r);
+                }
+                let mut base = Vec::with_capacity(n_pos * probe.n_vocab);
+                for r in probe.base_logits.iter().take(n_pos) {
+                    base.extend_from_slice(r);
+                }
+                let mask = vec![1f32; n_pos];
+                loss_head = h.train_step(&hidden, &base, &targets, &mask, lr, 0.0);
+                piece_head = Some(h.to_piece());
+            }
+
+            let mut piece_layer: Option<AdapterPiece> = None;
+            let mut loss_layer = 0f32;
+            if let (Some(ly), Some(xd), Some(hp), Some(hid)) = (
+                layer.as_mut(),
+                probe.x_down.as_ref(),
+                probe.h_pre.as_ref(),
+                probe.hidden.as_ref(),
+            ) {
+                let batch = LayerBatch {
+                    x: xd.iter().take(n_pos).cloned().collect(),
+                    h_pre: hp.iter().take(n_pos).cloned().collect(),
+                    hidden: hid.iter().take(n_pos).cloned().collect(),
+                    base_logits: probe.base_logits.iter().take(n_pos).cloned().collect(),
+                    target: targets.iter().map(|t| *t as i32).collect(),
+                };
+                let hw = HeadWeights {
+                    w: head_w.as_ref().expect("head_w").data.clone(),
+                    n_vocab: probe.n_vocab,
+                    d: probe.n_embd,
+                };
+                // норма: данные F32 [n_embd × 1]
+                if let Some(nw) = norm_w.as_ref() {
+                    if let Some(ls) = ly.train_step(&batch, &hw, &nw.data, eps, lr * 0.6, 0.0) {
+                        loss_layer = ls.loss;
+                        piece_layer = Some(ly.to_piece(&ffn_base));
+                    }
+                }
+            }
+
             steps += 1;
             st.train_loss_x4
-                .store((loss * 10_000.0) as u64, Ordering::Relaxed);
+                .store((loss_head * 10_000.0) as u64, Ordering::Relaxed);
             if steps % 12 == 0 {
-                if let Err(e) = h.save_adapter(&arch, &lora_out) {
-                    eprintln!("[train] adapter не записался: {e}");
-                } else {
-                    println!("[train] шаг {steps}, loss {loss:.3} → {}", lora_out.display());
+                // составной адаптер: голова (если есть) + слой (если есть)
+                let mut pieces: Vec<AdapterPiece> = Vec::new();
+                if let Some(ph) = piece_head {
+                    pieces.push(ph);
+                }
+                if let Some(pl) = piece_layer {
+                    pieces.push(pl);
+                }
+                if pieces.is_empty() {
+                    continue;
+                }
+                match save_adapter_pieces(&arch, &lora_out, &pieces) {
+                    Ok(()) => println!(
+                        "[train] шаг {steps}, loss head {loss_head:.3} layer {loss_layer:.3} → {}",
+                        lora_out.display()
+                    ),
+                    Err(e) => eprintln!("[train] adapter не записался: {e}"),
                 }
             }
         }

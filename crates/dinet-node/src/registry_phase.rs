@@ -176,7 +176,6 @@ mod tests {
     use super::*;
     use crate::swarm::{era_collect_and_vote, era_publish, era_tally, Node as SwarmNode, SimConfig};
     use crate::transport::MeshTransport;
-    use dinet_fl::toy_llm::{LoRAAdapter, ToyBase};
     use dinet_registry::GENESIS;
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {

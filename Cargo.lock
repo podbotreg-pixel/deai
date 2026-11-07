@@ -706,6 +706,7 @@ dependencies = [
  "dinet-chat",
  "dinet-train",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
 ]
 
 [[package]]

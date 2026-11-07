@@ -589,7 +589,6 @@ impl GossipBridge {
         GossipLink {
             cmd_tx: self.cmd_tx.clone(),
             queues: self.queues.clone(),
-            peer: self.peer,
         }
     }
 }
@@ -598,7 +597,6 @@ impl GossipBridge {
 pub struct GossipLink {
     cmd_tx: std_mpsc::Sender<BridgeCmd>,
     queues: Vec<Arc<StdMutex<Vec<InFrame>>>>,
-    peer: PeerId,
 }
 
 impl dinet_node::transport::Transport for GossipLink {

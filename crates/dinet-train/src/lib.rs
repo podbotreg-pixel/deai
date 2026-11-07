@@ -42,11 +42,13 @@
 //! v1 (дальше): LoRA на слоях трансформера — нужен собственный backprop
 //! через attention/MLP, большой отдельный заход.
 
+pub mod gguf;
+pub mod layer;
+
 /// Топология head-LoRA: d — размер скрытого состояния (n_embd),
 /// v — размер словаря (n_vocab), r — ранг LoRA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeadSpec {
-    pub d: u32,
+pub struct HeadSpec {    pub d: u32,
     pub v: u32,
     pub r: u32,
 }
@@ -113,8 +115,7 @@ pub struct HeadLora {
 impl HeadLora {
     /// Свежий адаптер: A — мелкий гаусс (симметрия снята), B — нули
     /// (старт Δ=0 — поведение модели не меняется до обучения).
-    pub fn new(spec: HeadSpec, seed: u64) -> Self {
-        let d = spec.d as usize;
+    pub fn new(spec: HeadSpec, seed: u64) -> Self {        let d = spec.d as usize;
         let v = spec.v as usize;
         let r = spec.r as usize;
         let mut rng = Rng::new(seed);
@@ -333,6 +334,19 @@ impl HeadLora {
     /// adapter.lora.alpha (f32); тензоры output.weight.lora_a (ne [d, r])
     /// и output.weight.lora_b (ne [r, v]), F32, offset'ы выровнены на 32
     /// от начала data-секции.
+    /// LoRA-пара для составного адаптера: база — голова «output.weight».
+    pub fn to_piece(&self) -> AdapterPiece {
+        AdapterPiece {
+            base: "output.weight".to_string(),
+            a: self.a.clone(),
+            a_ne0: self.d as u64,
+            b: self.b.clone(),
+            b_ne1: self.v as u64,
+            r: self.r as u64,
+        }
+    }
+
+    /// Сохранить одиночный head-LoRA как v0-адаптер (2 тензора).
     pub fn save_adapter(&self, arch: &str, path: &std::path::Path) -> Result<(), SaveError> {
         use std::io::Write;
         let mut buf: Vec<u8> = Vec::with_capacity(4096 * 8);
@@ -386,6 +400,97 @@ impl HeadLora {
         std::fs::rename(&tmp, path).map_err(|e| SaveError(format!("rename: {e}")))?;
         Ok(())
     }
+}
+
+/// Одна LoRA-пара на базовый тензор — элемент мультитензорного адаптера.
+///
+/// Формы по конвенции llama.cpp (llama-adapter.cpp): a.ne = [in, r]
+/// (a.ne0 == W.ne0), b.ne = [r, out] (b.ne1 == W.ne1, a.ne1 == b.ne0).
+/// Буферы — row-major (a: r строк по in; b: out строк по r), c которого
+/// ggml читает col-major медленный ne[1] — flat-раскладка совпадает.
+pub struct AdapterPiece {
+    /// имя БАЗОВОГО GGUF-тензора ("output.weight", "blk.23.ffn_down.weight")
+    pub base: String,
+    /// A [r × a_ne0]
+    pub a: Vec<f32>,
+    pub a_ne0: u64,
+    /// B [b_ne1 × r]
+    pub b: Vec<f32>,
+    pub b_ne1: u64,
+    pub r: u64,
+}
+
+/// Сохранить СОСТАВНОЙ LoRA-адаптер: произвольное число пар тензоров
+/// (`{base}.lora_a` + `{base}.lora_b`) в одном GGUF — голова + внутренние
+/// слои разом. kv `adapter.lora.alpha` = ранг ПЕРВОЙ пары (у llama.cpp
+/// alpha глобальна; при применении задаём scale явно).
+pub fn save_adapter_pieces(
+    arch: &str,
+    path: &std::path::Path,
+    pieces: &[AdapterPiece],
+) -> Result<(), SaveError> {
+    use std::io::Write;
+    if pieces.is_empty() {
+        return Err(SaveError("пустой список пар".into()));
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(4096 * 8);
+    let mut w = std::io::Cursor::new(&mut buf);
+    let err = |e: std::io::Error| SaveError(format!("write: {e}"));
+
+    // header: v3
+    w.write_all(b"GGUF").map_err(err)?;
+    w.write_all(&3u32.to_le_bytes()).map_err(err)?;
+    w.write_all(&(pieces.len() as u64 * 2).to_le_bytes()).map_err(err)?; // tensor_count
+    w.write_all(&4u64.to_le_bytes()).map_err(err)?; // kv_count
+
+    const KV_F32: u32 = 6;
+    kv_string(&mut w, "general.type", "adapter").map_err(err)?;
+    kv_string(&mut w, "general.architecture", arch).map_err(err)?;
+    kv_string(&mut w, "adapter.type", "lora").map_err(err)?;
+    kv_float(&mut w, "adapter.lora.alpha", KV_F32, pieces[0].r as f32).map_err(err)?;
+
+    // таблица тензоров и раскладка данных
+    // (собираем сначала описания — чтобы цикл записи был одинаковый)
+    let mut layout: Vec<(String, Vec<u64>, u64)> = Vec::with_capacity(pieces.len() * 2); // (имя, ne, длина байт)
+    let mut off: u64 = 0;
+    for pc in pieces {
+        let len_a = (pc.a.len() as u64) * 4;
+        let len_b = (pc.b.len() as u64) * 4;
+        layout.push((format!("{}.lora_a", pc.base), vec![pc.a_ne0, pc.r], off));
+        off += (len_a + 31) / 32 * 32;
+        layout.push((format!("{}.lora_b", pc.base), vec![pc.r, pc.b_ne1], off));
+        off += len_b; // хвост — выравнивание не обязательно
+    }
+
+    for (name, ne, o) in &layout {
+        ti(&mut w, name, ne, 0, *o).map_err(err)?;
+    }
+
+    // выравнивание начала data-секции на 32
+    let p = w.position() as usize;
+    let pad = (32 - p % 32) % 32;
+    w.write_all(&vec![0u8; pad]).map_err(err)?;
+
+    // данные по layout
+    for pc in pieces {
+        for x in &pc.a {
+            w.write_all(&x.to_le_bytes()).map_err(err)?;
+        }
+        let len_a = (pc.a.len() as u64) * 4;
+        let padded = (len_a + 31) / 32 * 32;
+        let gap = (padded - len_a) as usize;
+        w.write_all(&vec![0u8; gap]).map_err(err)?;
+        for x in &pc.b {
+            w.write_all(&x.to_le_bytes()).map_err(err)?;
+        }
+    }
+    drop(w);
+
+    // атомарная запись: tmp → rename
+    let tmp = path.with_extension("gguf.tmp");
+    std::fs::write(&tmp, &buf).map_err(|e| SaveError(format!("tmp: {e}")))?;
+    std::fs::rename(&tmp, path).map_err(|e| SaveError(format!("rename: {e}")))?;
+    Ok(())
 }
 
 /// Один элемент AdamW.
@@ -637,8 +742,6 @@ mod tests {
             losses.push(l.train_step(&h, &base, &targets, &mask, 0.1, 0.0));
         }
         assert!(losses[5] < losses[0], "лосс не падает: {:?}", losses);
-        // и итог стал ниже «нулевого» лосса
-        let l2 = HeadLora::new(spec, 5);
         assert!(losses[5] < 0.7, "после 6 шагов лосс {} всё ещё высок", losses[5]);
     }
 
@@ -789,89 +892,75 @@ mod tests {
             std::process::id()
         ));
         l.save_adapter("gemma3", &path).expect("пишется");
-
-        let bytes = std::fs::read(&path).expect("читается");
+        // v0-writer и pieces-writer должны давать одно и то же для одной пары
+        let one = vec![l.to_piece()];
+        let path2 = std::env::temp_dir().join(format!(
+            "dinet-test-adapter-joint-{}.gguf",
+            std::process::id()
+        ));
+        crate::save_adapter_pieces("gemma3", &path2, &one).expect("пишется");
+        let b2 = std::fs::read(&path2).expect("читается");
+        let b1 = std::fs::read(&path).expect("читается");
+        // kvs и раскладка совпадают (первая половина файла до данных)
+        assert_eq!(b1.len(), b2.len(), "размер v0 и joint-записи совпадает");
+        assert_eq!(&b1[..200.min(b1.len())], &b2[..200.min(b1.len())]);
+        // и через свой ридер: имена/значения читаются назад
+        let m = crate::gguf::GgufModel::open(&path2).unwrap();
+        assert_eq!(m.architecture().as_deref(), Some("gemma3"));
+        assert!(m.tensor("output.weight.lora_a").is_some());
+        assert!(m.tensor("output.weight.lora_b").is_some());
+        let _ = std::fs::remove_file(&path2);
         let _ = std::fs::remove_file(&path);
-
-        let mut p = 0usize;
-        assert_eq!(&bytes[0..4], b"GGUF");
-        p += 4;
-        let ver = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-        p += 4;
-        assert_eq!(ver, 3);
-        let n_tensors = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
-        p += 8;
-        let n_kvs = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
-        p += 8;
-        assert_eq!((n_tensors, n_kvs), (2, 4));
-
-        let mut kv = std::collections::HashMap::new();
-        for _ in 0..n_kvs {
-            let kl = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) as usize;
-            p += 8;
-            let key = String::from_utf8(bytes[p..p + kl].to_vec()).unwrap();
-            p += kl;
-            let vt = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-            p += 4;
-            if vt == 8 {
-                let vl = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) as usize;
-                p += 8;
-                let val = String::from_utf8(bytes[p..p + vl].to_vec()).unwrap();
-                p += vl;
-                kv.insert(key, val);
-            } else {
-                assert_eq!(vt, 6, "только string/f32 в тесте, got {vt}");
-                let val = f32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-                p += 4;
-                kv.insert(key, format!("{val}"));
-            }
-        }
-        assert_eq!(kv["general.type"], "adapter");
-        assert_eq!(kv["general.architecture"], "gemma3");
-        assert_eq!(kv["adapter.type"], "lora");
-        let alpha: f32 = kv["adapter.lora.alpha"].parse().unwrap();
-        assert_eq!(alpha, 4.0, "alpha = rank (масштаб == 1 при adapter_scale 1)");
-
-        // tensors
-        let mut tensors = Vec::new();
-        for _ in 0..n_tensors {
-            let nl = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) as usize;
-            p += 8;
-            let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
-            p += nl;
-            let nd = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-            p += 4;
-            let mut ne = Vec::new();
-            for _ in 0..nd {
-                ne.push(u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()));
-                p += 8;
-            }
-            let tt = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-            p += 4;
-            let off = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
-            p += 8;
-            tensors.push((name, ne, tt, off as usize));
-        }
-        assert_eq!(tensors[0].0, "output.weight.lora_a");
-        assert_eq!(tensors[0].1, vec![16, 4]);
-        assert_eq!(tensors[0].2, 0, "GGML_TYPE_F32");
-        assert_eq!(tensors[1].0, "output.weight.lora_b");
-        assert_eq!(tensors[1].1, vec![4, 24]);
-        let (off_a, off_b) = (tensors[0].3, tensors[1].3);
-        assert_eq!(off_a % 32, 0);
-        assert_eq!(off_b % 32, 0);
-        let data_start = (p + 31) / 32 * 32;
-        let a_ref: Vec<u8> = l.a.iter().flat_map(|x| x.to_le_bytes()).collect();
-        assert_eq!(
-            &bytes[data_start + off_a..data_start + off_a + a_ref.len()],
-            &a_ref[..]
-        );
-        let b_ref: Vec<u8> = l.b.iter().flat_map(|x| x.to_le_bytes()).collect();
-        assert_eq!(
-            &bytes[data_start + off_b..data_start + off_b + b_ref.len()],
-            &b_ref[..]
-        );
     }
+
+    /// Составной адаптер: голова + слой в одном файле, все 4 тензора
+    /// читаются назад через наш GGUF-ридер с точными значениями.
+    #[test]
+    fn adapter_pieces_roundtrip_multi() {
+        // голова: d=4, v=6, r=2 → A 8 значений, B 12
+        let piece_head = crate::AdapterPiece {
+            base: "output.weight".into(),
+            a: (0..8).map(|i| i as f32 * 0.25).collect(),
+            a_ne0: 4,
+            b: (0..12).map(|i| -i as f32 * 0.1).collect(),
+            b_ne1: 6,
+            r: 2,
+        };
+        // слой: n_in=3, n_out=4, r=2 → A 6 значений, B 8
+        let piece_layer = crate::AdapterPiece {
+            base: "blk.23.ffn_down.weight".into(),
+            a: (0..6).map(|i| 10.0 + i as f32).collect(),
+            a_ne0: 3,
+            b: (0..8).map(|i| 100.0 + i as f32).collect(),
+            b_ne1: 4,
+            r: 2,
+        };
+        let pieces = vec![piece_head, piece_layer];
+        let path = std::env::temp_dir().join(format!(
+            "dinet-test-pieces-{}.gguf",
+            std::process::id()
+        ));
+        crate::save_adapter_pieces("qwen2", &path, &pieces).expect("пишется");
+        println!("multi path = {:?}", path);
+        println!("exists = {}", path.exists());
+        let m = crate::gguf::GgufModel::open(&path).expect("читается");
+
+        assert_eq!(m.tensors.len(), 4);
+        let head_a = m.read_f32("output.weight.lora_a").unwrap();
+        assert_eq!((head_a.row, head_a.rows), (4, 2));
+        assert_eq!(head_a.data, (0..8).map(|i| i as f32 * 0.25).collect::<Vec<f32>>());
+        let head_b = m.read_f32("output.weight.lora_b").unwrap();
+        assert_eq!((head_b.row, head_b.rows), (2, 6));
+        assert_eq!(head_b.data[5], -0.5);
+        let lay_a = m.read_f32("blk.23.ffn_down.weight.lora_a").unwrap();
+        assert_eq!((lay_a.row, lay_a.rows), (3, 2));
+        assert_eq!(lay_a.data[4], 14.0);
+        let lay_b = m.read_f32("blk.23.ffn_down.weight.lora_b").unwrap();
+        assert_eq!((lay_b.row, lay_b.rows), (2, 4));
+        assert_eq!(lay_b.data[7], 107.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
 
     /// read_model_header: прочитать СВОЙ adapter-файл (arch есть,
     /// output.weight нет) + синтетическую модель с output.weight

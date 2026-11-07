@@ -348,6 +348,8 @@ pub fn probe_tokens(
 
 use std::sync::mpsc as std_mpsc;
 
+pub mod probe2;
+
 /// Части потокового ответа: байты куска токена (может резать UTF-8 между
 /// токенами — собирающий уровень доклеивает) и признак конца.
 enum StreamMsg {

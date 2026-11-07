@@ -259,7 +259,7 @@ mod tests {
         let sig = bad.sign(&body);
         let wire = frame.encode_with_sender_sig(&victim_key, &sig).expect("кадр");
 
-        let mut nbook = PeerBook::empty();
+        let nbook = PeerBook::empty();
         let mut t = MeshTransport::new(4);
         t.send(CH_HELLO, 3, Some(0), &wire);
         // узел 0 ждёт hello-кадр и получает ПОДДЕЛКУ
