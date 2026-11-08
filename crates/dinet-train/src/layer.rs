@@ -156,6 +156,24 @@ impl LayerLora {
         }
     }
 
+    /// РЕЗЮМ v1.2: восстановить слой-адаптер из piece-пары. spec собирается
+    /// ИЗ piece (n_in = a_ne0, n_out = b_ne1, r = r); caller заранее сверил
+    /// эти числа с живой моделью. A/B — из файла, Adam-моменты и счётчик —
+    /// с нуля (from_ab: мягкий прогрев).
+    pub fn from_piece(pc: &crate::AdapterPiece) -> Result<Self, String> {
+        let (r, n_in, n_out) = (pc.r as usize, pc.a_ne0 as usize, pc.b_ne1 as usize);
+        if r == 0 || pc.a.len() != r * n_in || pc.b.len() != n_out * r {
+            return Err(format!(
+                "piece '{}' не сходится: a {} =? {r}·{n_in}, b {} =? {n_out}·{r}",
+                pc.base,
+                pc.a.len(),
+                pc.b.len()
+            ));
+        }
+        let spec = LayerSpec { n_in: n_in as u32, n_out: n_out as u32, r: r as u32 };
+        Ok(Self::from_ab(spec, pc.a.clone(), pc.b.clone()))
+    }
+
     /// Дельта для одного вектора x: δ = B·(A·x) — [n_out].
     pub fn delta_of(&self, x: &[f32]) -> Vec<f32> {
         let r = self.spec.r as usize;
@@ -551,5 +569,69 @@ mod layer_tests {
         let d = lora.delta_of(&batch.x[0]);
         let dn = d.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(dn > 0.0, "дельта нулевая после обучения");
+    }
+
+    /// РЕЗЮМ v1.2 слоя: fresh → шаги → to_piece → from_piece — A/B сохранены
+    /// точно, spec собран из piece (n_in/n_out/r), Adam-моменты и шаги —
+    /// с нуля; следующий шаг резюма продолжает с ТОГО ЖЕ лосса
+    /// (train_step возвращает лосс ДО обновления); битая форма отвергается.
+    #[test]
+    fn layer_resume_from_piece() {
+        let sp = spec();
+        let (batch, head, norm_w, eps) = scene(23);
+        let mut lora = LayerLora::new(sp, 5);
+        for _ in 0..20 {
+            let _ = lora
+                .train_step(&batch, &head, &norm_w, eps, 0.08, 0.0)
+                .expect("шаг конечен");
+        }
+        let pc = lora.to_piece("blk.23.ffn_down.weight");
+
+        let mut resumed = LayerLora::from_piece(&pc).expect("резюм");
+        assert_eq!(resumed.a(), pc.a.as_slice(), "A должна прийти из файла");
+        assert_eq!(resumed.b(), pc.b.as_slice(), "B должна прийти из файла");
+        assert_eq!(
+            (resumed.spec.n_in, resumed.spec.n_out, resumed.spec.r),
+            (sp.n_in, sp.n_out, sp.r),
+            "spec собран из piece"
+        );
+        assert_eq!(resumed.steps(), 0, "шаги сброшены");
+        assert!(resumed.ma.iter().all(|&x| x == 0.0), "моменты Adam — с нуля");
+        assert!(resumed.vb.iter().all(|&x| x == 0.0), "моменты Adam — с нуля");
+
+        // непрерывность: следующий шаг резюма == следующий шаг исходного
+        let was = lora
+            .train_step(&batch, &head, &norm_w, eps, 0.08, 0.0)
+            .expect("шаг конечен");
+        let got = resumed
+            .train_step(&batch, &head, &norm_w, eps, 0.08, 0.0)
+            .expect("шаг конечен");
+        assert!(
+            (was.loss - got.loss).abs() < 1e-5,
+            "резюм разошёлся с продолжением: {:?} vs {:?}",
+            was,
+            got
+        );
+
+        // и дальше снижается (продолжение, а не обнуление)
+        let mut last = got.loss;
+        for _ in 0..24 {
+            last = resumed
+                .train_step(&batch, &head, &norm_w, eps, 0.08, 0.0)
+                .expect("шаг конечен")
+                .loss;
+        }
+        assert!(last < got.loss, "резюм не продолжил падение: {got:?} → {last}");
+
+        // битая форма отвергается
+        let bad = crate::AdapterPiece {
+            base: "blk.23.ffn_down.weight".into(),
+            a: vec![0f32; 3],
+            a_ne0: 3,
+            b: vec![0f32; 4 * 2],
+            b_ne1: 4,
+            r: 2,
+        };
+        assert!(LayerLora::from_piece(&bad).is_err(), "битая форма прошла");
     }
 }

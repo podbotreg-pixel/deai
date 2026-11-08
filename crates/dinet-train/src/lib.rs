@@ -346,6 +346,35 @@ impl HeadLora {
         }
     }
 
+    /// РЕЗЮМ v1.2: восстановить адаптер из сохранённой piece-пары. A/B —
+    /// из файла, Adam-моменты и счётчик шагов — с нуля (мягкий прогрев:
+    /// bias-correction снова разгонится за первые шаги). Размерности
+    /// берутся ИЗ piece (d = a_ne0, v = b_ne1) — caller до этого проверил
+    /// их против живой модели; здесь проверяется внутренняя согласованность.
+    pub fn from_piece(pc: &AdapterPiece) -> Result<Self, String> {
+        let (d, v, r) = (pc.a_ne0 as usize, pc.b_ne1 as usize, pc.r as usize);
+        if r == 0 || pc.a.len() != r * d || pc.b.len() != v * r {
+            return Err(format!(
+                "piece '{}' не сходится: a {} =? {r}·{d}, b {} =? {v}·{r}",
+                pc.base,
+                pc.a.len(),
+                pc.b.len()
+            ));
+        }
+        Ok(Self {
+            d,
+            v,
+            r,
+            a: pc.a.clone(),
+            b: pc.b.clone(),
+            ma: vec![0f32; r * d],
+            va: vec![0f32; r * d],
+            mb: vec![0f32; v * r],
+            vb: vec![0f32; v * r],
+            steps: 0,
+        })
+    }
+
     /// Сохранить одиночный head-LoRA как v0-адаптер (2 тензора).
     pub fn save_adapter(&self, arch: &str, path: &std::path::Path) -> Result<(), SaveError> {
         use std::io::Write;
@@ -491,6 +520,50 @@ pub fn save_adapter_pieces(
     std::fs::write(&tmp, &buf).map_err(|e| SaveError(format!("tmp: {e}")))?;
     std::fs::rename(&tmp, path).map_err(|e| SaveError(format!("rename: {e}")))?;
     Ok(())
+}
+
+/// Прочитать адаптер обратно в piece-пары (резюм v1.2). Пары ищутся по
+/// суффиксам `.lora_a`/`.lora_b`; ne[0] — самый быстрый размер GGUF, так что
+/// A ne=[a_ne0, r], B ne=[r, b_ne1] — ровно как сохраняет save_adapter_pieces
+/// (и одиночный head save_adapter).
+pub fn read_adapter_pieces(path: &std::path::Path) -> Result<Vec<AdapterPiece>, String> {
+    let gg = gguf::GgufModel::open(path)?;
+    let mut pieces = Vec::new();
+    for (name, ti) in &gg.tensors {
+        let Some(base) = name.strip_suffix(".lora_a") else {
+            continue;
+        };
+        let bn = format!("{base}.lora_b");
+        let bt = gg
+            .tensors
+            .get(&bn)
+            .ok_or_else(|| format!("адаптер: для '{base}' нет {bn}"))?;
+        if ti.ne.len() != 2 || bt.ne.len() != 2 {
+            return Err(format!("адаптер: пара '{base}' не 2d"));
+        }
+        let a = gg.read_f32(name)?;
+        let b = gg.read_f32(&bn)?;
+        let (a_ne0, r_a) = (ti.ne[0], ti.ne[1]);
+        let (r_b, b_ne1) = (bt.ne[0], bt.ne[1]);
+        if r_a != r_b || r_a == 0 || a.rows as u64 != r_a || b.row as u64 != r_b {
+            return Err(format!(
+                "адаптер: формы пары '{base}' разошлись (A ne={:?}, B ne={:?})",
+                ti.ne, bt.ne
+            ));
+        }
+        pieces.push(AdapterPiece {
+            base: base.to_string(),
+            a: a.data,
+            a_ne0,
+            b: b.data,
+            b_ne1,
+            r: r_a,
+        });
+    }
+    if pieces.is_empty() {
+        return Err("адаптер: ни одной пары lora_a/lora_b".into());
+    }
+    Ok(pieces)
 }
 
 /// Один элемент AdamW.
@@ -793,7 +866,112 @@ mod tests {
         assert!(last < first * 0.2, "лосс не упал: first {first} → last {last}");
     }
 
-    /// Численная проверка градиента (finite differences) против gB/gA.
+    /// РЕЗЮМ v1.2: fresh → шаги → то же ЗЕРКАЛО webchat (to_piece → файл →
+    /// read_adapter_pieces → from_piece) — A/B сохранены точно, Adam-моменты
+    /// и счётчик шагов сброшены; следующий шаг резюма продолжает с ТОГО ЖЕ
+    /// лосса (train_step возвращает лосс ДО обновления, значения совпадают);
+    /// рестарт с нуля на тех же шагах проигрывает резюму; битая форма
+    /// отвергается.
+    #[test]
+    fn head_resume_from_piece() {
+        let spec = HeadSpec { d: 8, v: 12, r: 8 };
+        // тот же датасет, что в train_lora_loss_falls: учитель W + argmax-цели
+        let mut rng = Rng::new(2026);
+        let d = spec.d as usize;
+        let v = spec.v as usize;
+        let vd = spec.v as usize * spec.d as usize;
+        let mut w = vec![0f32; vd];
+        for x in w.iter_mut() {
+            *x = rng.gauss();
+        }
+        let n = 8usize;
+        let mut h = vec![0f32; n * d];
+        for x in h.iter_mut() {
+            *x = rng.gauss();
+        }
+        let mut base = vec![0f32; n * v];
+        let mut targets = vec![0u32; n];
+        for p in 0..n {
+            for j in 0..v {
+                let mut s = 0f32;
+                for i in 0..d {
+                    s += w[j * d + i] * h[p * d + i];
+                }
+                base[p * v + j] = s;
+            }
+            let mut best = 0usize;
+            for j in 1..v {
+                if base[p * v + j] > base[p * v + best] {
+                    best = j;
+                }
+            }
+            targets[p] = best as u32;
+        }
+        let mask = vec![1f32; n];
+        let step = |l: &mut HeadLora| l.train_step(&h, &base, &targets, &mask, 0.1, 0.0);
+
+        let mut l = HeadLora::new(spec, 11);
+        let fresh_first = step(&mut l);
+        for _ in 0..39 {
+            step(&mut l);
+        }
+
+        // ЗЕРКАЛО webchat: to_piece → файл → read → from_piece
+        let fpath =
+            std::env::temp_dir().join(format!("resume-hd-{}.gguf", std::process::id()));
+        save_adapter_pieces("qwen2", &fpath, &[l.to_piece()]).expect("сохранение");
+        let back = read_adapter_pieces(&fpath).expect("чтение");
+        let _ = std::fs::remove_file(&fpath);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].base, "output.weight");
+        assert_eq!((back[0].a_ne0, back[0].b_ne1, back[0].r), (8, 12, 8));
+        assert_eq!(back[0].a, l.a, "roundtrip: A не тронут");
+        assert_eq!(back[0].b, l.b, "roundtrip: B не тронут");
+
+        // резюм из прочитанного piece
+        let mut resumed = HeadLora::from_piece(&back[0]).expect("резюм");
+        assert_eq!(resumed.a, back[0].a, "A — из файла без изменений");
+        assert_eq!(resumed.b, back[0].b, "B — из файла без изменений");
+        assert_eq!((resumed.d, resumed.v, resumed.r), (d, v, 8));
+        assert_eq!(resumed.steps(), 0, "шаги сброшены");
+        assert!(resumed.ma.iter().all(|&x| x == 0.0), "моменты Adam — с нуля");
+        assert!(resumed.vb.iter().all(|&x| x == 0.0), "моменты Adam — с нуля");
+
+        // непрерывность: следующая потеря резюма == потеря продолжения исходного
+        let was = step(&mut l);
+        let got = step(&mut resumed);
+        assert!(
+            (was - got).abs() < 1e-6,
+            "резюм разошёлся с продолжением: {was} vs {got}"
+        );
+
+        // рестарт с нуля на тех же 60 шагах проигрывает резюму: старт с
+        // обученной A/B (градиенты через уже ненулевой B текут), а у свежего
+        // градиент по A нулевой, пока B не оторвётся от нуля.
+        let mut l2 = HeadLora::new(spec, 11);
+        let mut last_resumed = got;
+        let mut last_fresh = 0f32;
+        for _ in 0..60 {
+            last_resumed = step(&mut resumed);
+            last_fresh = step(&mut l2);
+        }
+        assert!(
+            last_resumed < last_fresh,
+            "резюм не обгоняет рестарт: {last_resumed} vs {last_fresh}"
+        );
+        assert!(last_fresh < fresh_first, "свежий рестарт тоже должен учиться");
+
+        // битая форма отвергается
+        let bad = AdapterPiece {
+            base: "output.weight".into(),
+            a: vec![0f32; 3],
+            a_ne0: 8,
+            b: back[0].b.clone(),
+            b_ne1: 12,
+            r: 8,
+        };
+        assert!(HeadLora::from_piece(&bad).is_err(), "битая форма прошла");
+    }
     #[test]
     fn finite_difference_matches_grads() {
         let spec = HeadSpec { d: 6, v: 9, r: 5 };

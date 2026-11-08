@@ -533,17 +533,49 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
                     if layer_ok {
                         match Probe2::load(&gguf) {
                             Ok(e2) => {
-                                layer = Some(LayerLora::new(
-                                    LayerSpec {
-                                        n_in: n_ff as u32,
-                                        n_out: e2.n_embd as u32,
-                                        r: 8,
-                                    },
-                                    seed64 ^ 0x1111_2222_3333_4444,
-                                ));
-                                println!(
-                                    "[train] layer-LoRA v1 {ffn_base} r=8 (последний слой)"
-                                );
+                                let fresh_spec =
+                                    LayerSpec { n_in: n_ff as u32, n_out: e2.n_embd as u32, r: 8 };
+                                let fresh =
+                                    || LayerLora::new(fresh_spec, seed64 ^ 0x1111_2222_3333_4444);
+                                // РЕЗЮМ v1.2: продолжаем существующий слой,
+                                // если в lora_out он есть и форма совпала
+                                let got = dinet_train::read_adapter_pieces(&lora_out)
+                                    .ok()
+                                    .and_then(|pcs| pcs.into_iter().find(|p| p.base == ffn_base));
+                                layer = match got {
+                                    Some(pc) if pc.a_ne0 == n_ff as u64
+                                        && pc.b_ne1 == e2.n_embd as u64 =>
+                                    {
+                                        match LayerLora::from_piece(&pc) {
+                                            Ok(l) => {
+                                                println!(
+                                                    "[train] layer-LoRA {ffn_base} r={} — продолжаем существующий адаптер (Adam с нуля)",
+                                                    l.spec.r
+                                                );
+                                                Some(l)
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[train] piece слоя битый ({e}) — старт с нуля"
+                                                );
+                                                println!("[train] layer-LoRA v1 {ffn_base} r=8 (последний слой)");
+                                                Some(fresh())
+                                            }
+                                        }
+                                    }
+                                    Some(pc) => {
+                                        eprintln!(
+                                            "[train] слой в адаптере {0}×{1} против живого {2}×{3} — старт с нуля",
+                                            pc.a_ne0, pc.b_ne1, n_ff, e2.n_embd
+                                        );
+                                        println!("[train] layer-LoRA v1 {ffn_base} r=8 (последний слой)");
+                                        Some(fresh())
+                                    }
+                                    None => {
+                                        println!("[train] layer-LoRA v1 {ffn_base} r=8 (последний слой)");
+                                        Some(fresh())
+                                    }
+                                };
                                 eng = Some(e2);
                             }
                             Err(e) => {
@@ -553,17 +585,50 @@ fn train_thread(st: Arc<ChatState>, gguf: PathBuf, node_seed: [u8; 32]) {
                     }
 
                     if head_ok {
-                        if let Some(w) = head_w.as_ref() {
-                            println!(
-                                "[train] head-LoRA d={} v={} r=8 (seed {seed64:08x})",
-                                w.row, w.rows
-                            );
-                        }
                         head = head_w.as_ref().map(|w| {
-                            HeadLora::new(
-                                HeadSpec { d: w.row as u32, v: w.rows as u32, r: 8 },
-                                seed64,
-                            )
+                            let fresh = || {
+                                HeadLora::new(
+                                    HeadSpec { d: w.row as u32, v: w.rows as u32, r: 8 },
+                                    seed64,
+                                )
+                            };
+                            // РЕЗЮМ v1.2: голова в lora_out той же формы?
+                            let got = dinet_train::read_adapter_pieces(&lora_out).ok().and_then(
+                                |pcs| pcs.into_iter().find(|p| p.base == "output.weight"),
+                            );
+                            match got {
+                                Some(pc) if pc.a_ne0 == w.row as u64 && pc.b_ne1 == w.rows as u64 => {
+                                    match HeadLora::from_piece(&pc) {
+                                        Ok(h) => {
+                                            println!(
+                                                "[train] head-LoRA d={} v={} — продолжаем существующий адаптер (Adam с нуля)",
+                                                w.row, w.rows
+                                            );
+                                            h
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[train] piece головы битый ({e}) — старт с нуля"
+                                            );
+                                            fresh()
+                                        }
+                                    }
+                                }
+                                Some(pc) => {
+                                    eprintln!(
+                                        "[train] голова в адаптере {0}×{1} против живой {2}×{3} — старт с нуля",
+                                        pc.a_ne0, pc.b_ne1, w.row, w.rows
+                                    );
+                                    fresh()
+                                }
+                                None => {
+                                    println!(
+                                        "[train] head-LoRA d={} v={} r=8 (seed {seed64:08x})",
+                                        w.row, w.rows
+                                    );
+                                    fresh()
+                                }
+                            }
                         });
                     }
 
