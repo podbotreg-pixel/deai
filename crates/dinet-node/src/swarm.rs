@@ -27,7 +27,7 @@ use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyBase, ToyModel};
 use dinet_fl::{krum_select, norm2, Lcg};
 use dinet_proto::{Frame, MsgType, Payload, SENDER_LEN};
 
-use crate::transport::{Transport, CH_ANNOUNCE, CH_SHARES, CH_VOTES};
+use crate::transport::{Transport, CH_ANNOUNCE, CH_LAZY, CH_SHARES, CH_VOTES};
 
 pub type NodeId = u16;
 
@@ -48,6 +48,9 @@ pub struct SimConfig {
     pub eval_size: u32,
     /// кусок блоба чек-пойнта для torrent-репликации (байтов).
     pub blob_chunk_len: u32,
+    /// доля lazy-аудита masked-эры (v1.3 роли): ceil(pct × (N−1)) прочих
+    /// узлов перепроверяют анонс агрегатора (0.10 → «10% аудит»).
+    pub audit_pct: f32,
 }
 
 impl Default for SimConfig {
@@ -64,6 +67,7 @@ impl Default for SimConfig {
             krum_ratio: 2.5,
             eval_size: 96,
             blob_chunk_len: 8192,
+            audit_pct: 0.10,
         }
     }
 }
@@ -237,7 +241,16 @@ pub struct EraReport {
     pub accuracy_before: f32,
     pub accuracy_after: f32,
     pub mean_norm: f32,
+    /// masked-эра (v1.3): «агрегация эры честна» по своей роли —
+    /// агрегатор/аудитор сверяли сами, passive — по кворуму аудиторов.
     pub masked_sum_ok: bool,
+    /// Ротация v1.3: агрегатор эры (None в reveal-эрах — там все считают сами).
+    pub aggregator: Option<NodeId>,
+    /// Роль этого узла в masked-эре.
+    pub role: EraRole,
+    /// lazy-audit: сколько pass/fail-вердиктов узел видел (masked-эры).
+    pub audits_pass: u8,
+    pub audits_fail: u8,
 }
 
 #[must_use]
@@ -430,6 +443,16 @@ fn collab_masked_check(shares: &[ShareEntry], truths: &[(NodeId, Vec<f32>, Vec<i
 /// Plain-дельты эпохи (truth харнеса: run_era сверяет с masked-суммой).
 pub type Truth = (NodeId, Vec<f32>, Vec<i64>);
 
+/// Роль узла в masked-эре (ротация v1.3): агрегатор, ленивый аудитор или
+/// пассивный (верит кворуму аудиторов). В reveal-эрах все Passive —
+/// DiLoCo-тяжёлый раунд каждый считает сам.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EraRole {
+    Aggregator,
+    Auditor,
+    Passive,
+}
+
 /// Промежуточное состояние узла после фаз B/C (вход tally-фазы).
 #[derive(Debug, Clone)]
 pub struct MidNode {
@@ -440,6 +463,15 @@ pub struct MidNode {
     pub masked_ok: bool,
     pub before_replica: LoRAAdapter,
     pub vote: Option<Vote>,
+    /// Ротация v1.3: СОБСТВЕННЫЕ роли этой эры верны (my role).
+    pub role: EraRole,
+    /// Хэш оглашённой masked-суммы (AggCommit агрегатора; masked-эра).
+    pub agg_hash: Option<[u8; 32]>,
+    /// Собранные СВОИ ShareEntry (аудиторы пересчитывают из них в фазе D).
+    pub shares: Vec<ShareEntry>,
+    /// lazy-audit: сколько аудиторских вердиктов pass/fail узел видел в фазе E.
+    pub n_audits_pass: u8,
+    pub n_audits_fail: u8,
 }
 
 /// Собственный голос узла (для tally).
@@ -564,7 +596,15 @@ pub fn era_collect_and_vote(
             masked_ok: true,
             before_replica: mine[idx].adapter.clone(),
             vote: None,
+            role: EraRole::Passive,
+            agg_hash: None,
+            shares: Vec::new(),
+            n_audits_pass: 0,
+            n_audits_fail: 0,
         };
+        if !was_reveal {
+            mid.shares = shares.clone();
+        }
         if was_reveal {
             let mean_norm = if reveals.is_empty() {
                 0.0
@@ -579,9 +619,46 @@ pub fn era_collect_and_vote(
         } else {
             mid.contributors = shares.len();
             mid.mean_norm = norm2(&mine[idx].adapter.as_vec());
-            if let Some((truths, reporter)) = checker {
-                if mine[idx].id == reporter {
-                    mid.masked_ok = collab_masked_check(&shares, truths);
+            // РОТАЦИЯ РОЛЕЙ v1.3: детерминированный вывод из (эра, пиры) —
+            // выборов нет, каждый узел сам знает свою роль. Агрегатор
+            // вычисляет masked-сумму и оглашает её хэш (AggCommit 0x20);
+            // ленивые аудиторы (10%) пересчитают её в фазе D из СВОИХ
+            // share'ов и выставят LazyAudit (0x23); остальные верят
+            // кворуму — «ленивая» агрегация без собственной работы.
+            let agg_id = crate::roles::aggregator_for(all_ids, era);
+            let auditors = crate::roles::auditors_for(all_ids, era, cfg.audit_pct);
+            mid.role = if mine[idx].id == agg_id {
+                EraRole::Aggregator
+            } else if auditors.contains(&mine[idx].id) {
+                EraRole::Auditor
+            } else {
+                EraRole::Passive
+            };
+            if mid.role == EraRole::Aggregator {
+                let sh_fx: Vec<Vec<i64>> = shares.iter().map(|s| s.fx.clone()).collect();
+                let mut sum = aggregate(&sh_fx);
+                // byz-агрегатор публикует кривую сумму (подмена в fx-domain)
+                if mine[idx].byz && !sum.is_empty() {
+                    sum[0] = sum[0].wrapping_add(1);
+                }
+                let h = sha256(&fx_to_bytes(&sum));
+                mid.agg_hash = Some(h);
+                let frame = sign_frame(
+                    &mine[idx],
+                    MsgType::AggCommit,
+                    Payload::AggCommit {
+                        era_id: ehash,
+                        agg_result_hash: h,
+                        num_contrib: shares.len() as u16,
+                    },
+                );
+                transport.send(CH_VOTES, mine[idx].id, None, &frame);
+                // harness-сверка с ЧИСТОЙ правдой: в run_era репортёр —
+                // агрегатор эры; poisoned sum сам же нарушит инвариант
+                if let Some((truths, reporter)) = checker {
+                    if mine[idx].id == reporter {
+                        mid.masked_ok = collab_masked_check(&shares, truths) && !mine[idx].byz;
+                    }
                 }
             }
         }
@@ -625,50 +702,99 @@ pub fn era_tally(
     transport: &mut dyn Transport,
     era: u32,
     cfg: &SimConfig,
-    mids: Vec<MidNode>,
+    mut mids: Vec<MidNode>,
 ) -> Vec<EraReport> {
     let was_reveal = (era + 1) % cfg.reveal_every == 0;
     let ehash = era_hash32(era);
 
     // --- Фаза D
     for idx in 0..mine.len() {
-        if !was_reveal {
-            continue;
-        }
-        let book = peer_book_ids(all_ids);
-        let wire = transport.collect(CH_VOTES, mine[idx].id);
-        let payloads = decode_frames(&mut mine[idx], &book, wire);
-        let mut accepts = 0usize;
-        for (_nid, pl) in payloads.iter() {
-            if let Payload::EvalVote { pass_at_k, .. } = pl {
-                if *pass_at_k == 100 {
-                    accepts += 1;
+        if was_reveal {
+            let book = peer_book_ids(all_ids);
+            let wire = transport.collect(CH_VOTES, mine[idx].id);
+            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            // Кворум учитывает только голоса за Мой кандидат эры (кадр
+            // EvalVote не знает era_id — чек-пойнт-id даёт эпоху): заодно
+            // невались хвост чужих голосов прошлых эр (FileSpool во
+            // broadcast'ах копит кадры до sweep — LazyAudit/AggCommit
+            // добавляют файлы на тот же канал).
+            let my_hash = mids[idx].vote.as_ref().map(|v| v.candhash);
+            let mut accepts = 0usize;
+            let mut seen_votes = 0usize;
+            for (_nid, pl) in payloads.iter() {
+                if let Payload::EvalVote { checkpoint_id, pass_at_k, .. } = pl {
+                    if Some(checkpoint_id) == my_hash.as_ref() {
+                        seen_votes += 1;
+                        if *pass_at_k == 100 {
+                            accepts += 1;
+                        }
+                    }
                 }
             }
-        }
-        let quorum = accepts * 3 >= payloads.len().max(1) * 2;
-        if let Some(mv) = mids[idx].vote.clone() {
-            if quorum && mv.accept {
-                mine[idx].adapter = apply_delta(mine[idx].adapter.clone(), &mv.agg_delta);
-                let parent = mine[idx].last_cp;
-                mine[idx].last_cp = mv.candhash;
-                let mut buf = Vec::with_capacity(mv.agg_delta.len() * 4);
-                for v in &mv.agg_delta {
-                    buf.extend_from_slice(&v.to_le_bytes());
+            let quorum = accepts * 3 >= seen_votes.max(1) * 2;
+            if let Some(mv) = mids[idx].vote.clone() {
+                if quorum && mv.accept {
+                    mine[idx].adapter = apply_delta(mine[idx].adapter.clone(), &mv.agg_delta);
+                    let parent = mine[idx].last_cp;
+                    mine[idx].last_cp = mv.candhash;
+                    let mut buf = Vec::with_capacity(mv.agg_delta.len() * 4);
+                    for v in &mv.agg_delta {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let frame = sign_frame(
+                        &mine[idx],
+                        MsgType::CheckpointAnnounce,
+                        Payload::CheckpointAnnounce {
+                            id: mv.candhash,
+                            parent_id: parent,
+                            era_id: ehash,
+                            merge_recipe_hash: sha256(&buf),
+                            ppl: mv.cand_acc,
+                            pass_at_k: mids[idx].contributors as u8,
+                        },
+                    );
+                    transport.send(CH_ANNOUNCE, mine[idx].id, None, &frame);
                 }
-                let frame = sign_frame(
-                    &mine[idx],
-                    MsgType::CheckpointAnnounce,
-                    Payload::CheckpointAnnounce {
-                        id: mv.candhash,
-                        parent_id: parent,
-                        era_id: ehash,
-                        merge_recipe_hash: sha256(&buf),
-                        ppl: mv.cand_acc,
-                        pass_at_k: mids[idx].contributors as u8,
-                    },
-                );
-                transport.send(CH_ANNOUNCE, mine[idx].id, None, &frame);
+            }
+        } else {
+            // masked-эра: собрать AggCommit агрегатора; lazy-аудитор (10%)
+            // ПЕРЕСЧИТЫВАЕТ masked-сумму из СВОИХ share'ов и выносит вердикт.
+            let book = peer_book_ids(all_ids);
+            let wire = transport.collect(CH_VOTES, mine[idx].id);
+            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            let mut agg_hash = None;
+            for (_nid, pl) in payloads.iter() {
+                if let Payload::AggCommit { era_id, agg_result_hash, .. } = pl {
+                    if *era_id == ehash {
+                        agg_hash = Some(*agg_result_hash);
+                    }
+                }
+            }
+            mids[idx].agg_hash = agg_hash;
+            if mids[idx].role == EraRole::Auditor {
+                if let Some(h) = agg_hash {
+                    let sh_fx: Vec<Vec<i64>> =
+                        mids[idx].shares.iter().map(|s| s.fx.clone()).collect();
+                    let sum = aggregate(&sh_fx);
+                    let mine_h = sha256(&fx_to_bytes(&sum));
+                    // byz-аудитор злонамеренно мутит против честного анонса:
+                    // вердикт всегда «провалю» — v0-поведение отравителя
+                    let ok = mine_h == h && !mine[idx].byz;
+                    let frame = sign_frame(
+                        &mine[idx],
+                        MsgType::LazyAudit,
+                        Payload::LazyAudit {
+                            auditor_id: mine[idx].signer.pubkey(),
+                            checkpoint_id: h,
+                            ppl_before: 0.0,
+                            ppl_after: 0.0,
+                            verdict: ok,
+                        },
+                    );
+                    // Отдельный канал: LazyAudit'ы отправляются в D, кворум
+                    // собирается в E — drain'ы других каналов их не режут
+                    transport.send(CH_LAZY, mine[idx].id, None, &frame);
+                }
             }
         }
     }
@@ -676,16 +802,49 @@ pub fn era_tally(
     // --- Фаза E: отчёт
     let mut reports = Vec::with_capacity(mine.len());
     for idx in 0..mine.len() {
-        let announces = transport.collect(CH_ANNOUNCE, mine[idx].id);
         let book = peer_book_ids(all_ids);
-        let payloads = decode_frames(&mut mine[idx], &book, announces);
-        let announcements_valid: Vec<[u8; 32]> = payloads
-            .iter()
-            .filter_map(|(_nid, pl)| match pl {
-                Payload::CheckpointAnnounce { id, era_id, .. } if *era_id == ehash => Some(*id),
-                _ => None,
-            })
-            .collect();
+        let announcements_valid: Vec<[u8; 32]>;
+        if was_reveal {
+            let announces = transport.collect(CH_ANNOUNCE, mine[idx].id);
+            let payloads = decode_frames(&mut mine[idx], &book, announces);
+            announcements_valid = payloads
+                .iter()
+                .filter_map(|(_nid, pl)| match pl {
+                    Payload::CheckpointAnnounce { id, era_id, .. } if *era_id == ehash => Some(*id),
+                    _ => None,
+                })
+                .collect();
+        } else {
+            // masked-эра: LazyAudit-кворум от аудиторов (свой канал CH_LAZY:
+            // аудиторы все отсылают в D, до E — частичный drain невозможен;
+            // аудиторы видят и свой вердикт — broadcast включает автора)
+            let wire = transport.collect(CH_LAZY, mine[idx].id);
+            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            let mut pass = 0u8;
+            let mut fail = 0u8;
+            for (_nid, pl) in payloads.iter() {
+                if let Payload::LazyAudit { checkpoint_id, verdict, .. } = pl {
+                    if let Some(h) = mids[idx].agg_hash {
+                        if checkpoint_id == &h {
+                            if *verdict {
+                                pass = pass.saturating_add(1);
+                            } else {
+                                fail = fail.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+            mids[idx].n_audits_pass = pass;
+            mids[idx].n_audits_fail = fail;
+            // masked-эра: «агрегация эры честна» — по кворуму аудиторов
+            // (панель ≥3: одиночный byz-аудитор не решает, а byz-агрегатор
+            // ловится). Агрегатор тоже опирается на аудиторский кворум.
+            mids[idx].masked_ok = mids[idx].agg_hash.is_some()
+                && mids[idx].n_audits_pass >= mids[idx].n_audits_fail
+                && mids[idx].n_audits_pass >= 1;
+            announcements_valid = Vec::new();
+        }
         let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
         let acc_before = accuracy(
             &ToyModel { base: mine[idx].base.clone(), adapter: mids[idx].before_replica.clone() },
@@ -705,6 +864,14 @@ pub fn era_tally(
             accuracy_after: acc_after,
             mean_norm: mids[idx].mean_norm,
             masked_sum_ok: mids[idx].masked_ok,
+            aggregator: if was_reveal {
+                None
+            } else {
+                Some(crate::roles::aggregator_for(all_ids, era))
+            },
+            role: mids[idx].role,
+            audits_pass: mids[idx].n_audits_pass,
+            audits_fail: mids[idx].n_audits_fail,
         });
     }
     reports
@@ -734,6 +901,9 @@ pub fn run_era(
     seed: u64,
 ) -> EraReport {
     let all_ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
+    // Ротация v1.3: harness-сверку masked-суммы с ЧИСТОЙ правдой ведёт
+    // агрегатор эры (роль вычисляется так же детерминированно, как в рое)
+    let agg_id = crate::roles::aggregator_for(&all_ids, era);
     let truths = era_publish(nodes, &all_ids, transport, era, cfg, seed);
     let mids = era_collect_and_vote(
         nodes,
@@ -741,7 +911,7 @@ pub fn run_era(
         transport,
         era,
         cfg,
-        Some((&truths, all_ids[0])),
+        Some((&truths, agg_id)),
     );
     let reports = era_tally(nodes, &all_ids, transport, era, cfg, mids);
     reports.into_iter().next().expect("рою нужен хотя бы один узел")
@@ -834,6 +1004,76 @@ mod tests {
         let (reps, _) = simulate(5, 3, cfg, 2026);
         assert!(reps.iter().all(|r| r.masked_sum_ok), "secure-agg инвариант нарушен");
         assert!(reps.iter().all(|r| r.checkpoint_id.is_none()), "candidate era без reveal");
+    }
+
+    /// РОТИРУЕМЫЕ РОЛИ v1.3: за N эр агрегатором побывает каждый; честная
+    /// эра проходит кворум аудиторов (панель ≥3), byz-агрегатор ловится
+    /// (аудиторы пересчитывают masked-сумму из своих share'ов).
+    #[test]
+    fn rotatable_roles_rotate_and_byz_aggregator_caught() {
+        let cfg = SimConfig { byzantine_pct: 0.10, reveal_every: 99, ..Default::default() };
+        // 10 узлов: byz миллиметровый — id 0 (первый из 10%)
+        let mut nodes: Vec<Node> = (0..10).map(|i| Node::new(i, 7, i < 1)).collect();
+        let all_ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
+        let byz_id = nodes.iter().find(|n| n.byz).map(|n| n.id).expect("byz есть");
+        let mut mesh = crate::transport::MeshTransport::with_ids(&all_ids);
+        let mut byz_caught = 0u32;
+        for era in 0..10u32 {
+            let agg = crate::roles::aggregator_for(&all_ids, era);
+            let truths = era_publish(&mut nodes, &all_ids, &mut mesh, era, &cfg, 2026);
+            let mids = era_collect_and_vote(
+                &mut nodes,
+                &all_ids,
+                &mut mesh,
+                era,
+                &cfg,
+                Some((&truths, agg)),
+            );
+            let reports = era_tally(&mut nodes, &all_ids, &mut mesh, era, &cfg, mids);
+            assert_eq!(reports.len(), 10);
+            // ротация visible в каждом отчёте
+            for r in &reports {
+                assert_eq!(r.aggregator, Some(agg), "ротация сбита в эре {era}");
+                assert!(!r.was_reveal);
+            }
+            // распределение ролей: 1 агрегатор + панель из 3 аудиторов + остальные passive
+            let panel = crate::roles::auditors_for(&all_ids, era, cfg.audit_pct);
+            assert_eq!(panel.len(), 3);
+            let roles_of = |reports: &[EraReport]| -> (usize, usize, usize) {
+                let mut n = (0usize, 0usize, 0usize);
+                for r in reports {
+                    match r.role {
+                        EraRole::Aggregator => n.0 += 1,
+                        EraRole::Auditor => n.1 += 1,
+                        EraRole::Passive => n.2 += 1,
+                    }
+                }
+                n
+            };
+            assert_eq!(roles_of(&reports), (1, 3, 6), "роли эры {era}");
+            if agg == byz_id {
+                // byz-агрегатор публикует кривую сумму: КВОРУМ отвергает
+                byz_caught += 1;
+                for r in &reports {
+                    assert!(
+                        r.audits_fail > r.audits_pass && !r.masked_sum_ok,
+                        "Эра {era}: byz-агрегатор не пойман: {:?}",
+                        r
+                    );
+                }
+            } else {
+                // честная эра: кворум проходится (даже с одиночным byz-
+                // аудитором в панели: pass 2 против fail 1)
+                for r in &reports {
+                    assert!(
+                        r.masked_sum_ok && r.audits_pass >= 2,
+                        "эра {era}: честная агрегация отвергнута: {:?}",
+                        r
+                    );
+                }
+            }
+        }
+        assert_eq!(byz_caught, 1, "byz узел агрегатором ровно раз за N эр");
     }
 
     #[test]

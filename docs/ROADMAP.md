@@ -205,8 +205,32 @@
       математически не восстановит ни один личный апдейт; v2 — secret-sharing полос)
 - [x] Robust-agg: median norm-band + Krum-консенсус + trimmed mean
       (`dinet-node::swarm::robust_screen`; 10% poison-узлов отсекаются на reveal-эрах до чек-пойнта)
-- [ ] Ротируемые роли: aggregator каждый era (окно 1 ч), lazy-audit 10%
-      (v0: leaderless-сим — каждый узел проверяет всех Himself; ролям делать нечего до libp2p)
+- [x] Ротируемые роли: aggregator каждый era (окно 1 ч), lazy-audit 10%
+      (`dinet-node::roles` — leaderless-сим: роль выводится детерминированно
+      из (era, пиры), выборов нет; роль живёт одну эру; до libp2p это
+      sim-механика поверх Transport). Агрегатор masked-эры вычисляет
+      masked-сумму и оглашает её хэш (AggCommit 0x20); ленивые аудиторы —
+      ceil(pct × (N−1)), но ПАНЕЛЬ ≥3 (кворум pass ≥ fail терпит одиночного
+      byz-аудитора) — ПЕРЕСЧИТЫВАЮТ сумму из своих share'ов и выносят
+      LazyAudit 0x23 (отдельный канал CH_LAZY: аудиторы шлют в фазе D,
+      кворум собирается в E — без частичного drain); пассивные верят
+      кворуму. В отчёт эры добавлены aggregator/role/audits_pass/
+      audits_fail; reveal-эры не менялись (DiLoCo-тяжёлый раунд каждый
+      считает сам). Заодно кворум reveal-фазы D теперь считает только
+      голоса за КАНДИДАТА ЭТОГО узла (FileSpool копит broadcast-кадры до
+      sweep — тест wire_frames был заложником мусора).
+      Баг по пути: мост GossipBridge (dinet-p2p) держал число каналов
+      CH_N=9 (SHARES..CH_INFO 0..8) — новый CH_LAZY=9 ломал индекс
+      очереди: тест p2p_swarm_eras висел намертво (паника потока моста,
+      выживший узел вечно ждал свои реплики). CH_N 9 → 10 — эры поверх
+      TCP+gossipsub сходятся бит-в-бит с симуляцией (2.8 с).
+      Сим-опыт: 10 узлов
+      (1 byz, 10%): за N эр роль обошла всех, честные эры — панель 3,
+      кворум pass ≥ 2; byz-агрегатор ловится (pass 0, fail 3,
+      masked_sum_ok=false у всех). Тесты:
+      roles::rotation_visits_every_peer_once_per_cycle,
+      auditors_are_deterministic_and_sane,
+      swarm::rotatable_roles_rotate_and_byz_aggregator_caught.
 - [x] Fork-choice чек-пойнта: publish только при качестве ≥2/3 узлов (eval-vote), иначе last-good
 - [x] Реестр чек-пойнтов v1 (`dinet-registry` + `registry_phase`): append-only
       лог с нотарными печатями (кворум ceil(2N/3), distinct pubkey, подпись

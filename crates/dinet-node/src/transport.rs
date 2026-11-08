@@ -6,7 +6,7 @@
 //!
 //! Две реализации v0:
 //! 1. `MeshTransport` — детерминированная in-memory сеть (unit/rapid-тесты).
-//! 2. `FileSpool` — обмен через каталогwire-frame-файлами: два процесса на одной
+//! 2. `FileSpool` — обмен через каталог wire-frame-файлов: два процесса на одной
 //!    машине уже могут «жить» в одной сети. Правила: файл
 //!    `c{ch}-{to|all}-{from}-{seq}.wif`, читается и удаляется получателем.
 //!
@@ -31,6 +31,8 @@ pub const CH_ANCHOR: u8 = 6;
 pub const CH_HELLO: u8 = 7;
 /// Инфосфера: анонс/ask/body записей (фаза K — общая память роя).
 pub const CH_INFO: u8 = 8;
+/// Ротируемые роли v1.3: LazyAudit-вердикты аудиторов (E после D-аудита).
+pub const CH_LAZY: u8 = 9;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

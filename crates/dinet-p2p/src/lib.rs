@@ -540,7 +540,7 @@ pub struct GossipBridge {
     pub addr: Option<Multiaddr>,
 }
 
-const CH_N: usize = 9; // SHARES..CH_INFO (0..8): мост маршрутизирует все каналы
+const CH_N: usize = 10; // SHARES..CH_LAZY (0..9): мост маршрутизирует все каналы
 const TOPIC_BASE: &str = "dinet/v0";
 
 impl GossipBridge {
