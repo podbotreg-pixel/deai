@@ -833,4 +833,115 @@ mod impl_probe2 {
             let _ = std::fs::remove_file(&lay_only);
         }
     }
+
+    /// ЖИВОЙ ЦИКЛ v1 end-to-end: capture llama → обучение layer-LoRA НАШИМ
+    /// ходом (AdamW, как в webchat) → сохранённый адаптер ЧИТАЕТСЯ llama.cpp
+    /// → ЦЕЛЕВОЙ токен растёт против старого argmax в ЖИВОЙ модели.
+    /// Гейт: DI_NET_GGUF=/путь.gguf (арх любой: qwen2, llama-tied SmolLM2 —
+    /// голова лосса = output.weight / token_embd.weight, как в webchat).
+    #[test]
+    fn layer_train_moves_logits_gated() {
+        let Some(model_path) = std::env::var("DI_NET_GGUF").ok() else {
+            return;
+        };
+        use dinet_train::layer::{HeadWeights, LayerBatch, LayerLora, LayerSpec};
+
+        let gg = dinet_train::gguf::GgufModel::open(Path::new(&model_path)).expect("gguf");
+        let arch = gg.architecture().as_deref().unwrap_or("llama").to_string();
+        let n_ff = gg.num("feed_forward_length").expect("n_ff в gguf") as usize;
+        let eps = gg.f32val("layer_norm_rms_epsilon").unwrap_or(1e-5);
+        // голова для ЛОССА: output.weight; tied-модель — token_embd.weight
+        let head_w = gg
+            .read_f32("output.weight")
+            .ok()
+            .or_else(|| gg.read_f32("token_embd.weight").ok())
+            .expect("голова лосса (output/token_embd)");
+        let norm_w = gg.read_f32("output_norm.weight").expect("финальная норма");
+
+        let eng = Probe2::load(Path::new(&model_path)).expect("модель");
+        assert_eq!(head_w.row as usize, eng.n_embd, "строка головы = n_embd");
+        // пара учителя: p = 4 слова микро-языка, a = 1 слово
+        let toks = tokenize_gated(Path::new(&model_path), "Вопрос: ай би ви ги\nОтвет: ди");
+        let targets: Vec<i32> = toks.iter().skip(1).copied().collect();
+        let n_pos = targets.len();
+
+        let probe = eng.run(&toks, false).expect("базовый проход");
+        // ХВОСТ: последние 4 позиции (там живёт ответ «ди»); позиции
+        // независимы — CE на них тот же, шаг дешевле
+        let tail4 = n_pos.saturating_sub(4);
+        let batch = LayerBatch {
+            x: probe.x_down.as_ref().expect("x down")[tail4..n_pos].to_vec(),
+            h_pre: probe.h_pre.as_ref().expect("h_pre")[tail4..n_pos].to_vec(),
+            hidden: probe.hidden.as_ref().expect("hidden")[tail4..n_pos].to_vec(),
+            base_logits: probe.base_logits[tail4..n_pos].to_vec(),
+            target: targets[tail4..n_pos].to_vec(),
+        };
+
+        let mut ly = LayerLora::new(
+            LayerSpec { n_in: n_ff as u32, n_out: eng.n_embd as u32, r: 8 },
+            0x0BAB1E as u64,
+        );
+        let hw = HeadWeights {
+            w: head_w.data.clone(),
+            n_vocab: eng.n_vocab,
+            d: eng.n_embd,
+        };
+        let lr = 9e-4f32; // как в webchat: lr 1.5e-3 · 0.6
+        let mut loss_first = f32::NAN;
+        let mut loss_last = f32::NAN;
+        for _ in 0..24 {
+            if let Some(ls) = ly.train_step(&batch, &hw, &norm_w.data, eps, lr, 0.0) {
+                if loss_first.is_nan() {
+                    loss_first = ls.loss;
+                }
+                loss_last = ls.loss;
+            }
+        }
+        eprintln!("конвейер: loss {loss_first:.3} → {loss_last:.3} за 24 шага");
+        assert!(loss_last < loss_first, "лосс слоя не падает: {loss_first} → {loss_last}");
+
+        // сохранение в llama-формат (arch из МОДЕЛИ) и живая проверка
+        let base_name = format!("blk.{}.ffn_down.weight", eng.n_layer - 1);
+        let piece = ly.to_piece(&base_name);
+        let tmp = std::env::temp_dir().join(format!("dinet-moves-{}.gguf", std::process::id()));
+        dinet_train::save_adapter_pieces(&arch, &tmp, &[piece]).expect("adapter пишется");
+        let with = eng.run_with_lora(&toks, &tmp).expect("проход с адаптером");
+        let _ = std::fs::remove_file(&tmp);
+
+        // позиция p предсказывает токен p+1: «ди» — ПОСЛЕДНЯЯ цель —
+        // сравниваем её CE (до/с адаптером) и сдвиг против старого argmax
+        let fn_ce = |logits: &[f32], t: usize| {
+            let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lse = mx + logits.iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
+            lse - logits[t as usize]
+        };
+        let p = n_pos - 1;
+        let t = targets[p] as usize;
+        let ce_b = fn_ce(&probe.base_logits[p], t);
+        let ce_w = fn_ce(&with[p], t);
+        eprintln!("CE целевого токена: base {ce_b:.3} → с адаптером {ce_w:.3}");
+        assert!(
+            ce_w < ce_b,
+            "адаптер не снизил CE целевого токена в ЖИВОЙ llama: {ce_b} → {ce_w}"
+        );
+        // старый argmax (без целевого токена) — руками, f32 без Ord
+        let mut lm = usize::MAX;
+        let mut lm_v = f32::NEG_INFINITY;
+        for (j, v) in probe.base_logits[p].iter().enumerate() {
+            if j != t && *v > lm_v {
+                lm_v = *v;
+                lm = j;
+            }
+        }
+        assert!(lm != usize::MAX, "нет argmax");
+        let d_t = with[p][t] - probe.base_logits[p][t];
+        let d_m = with[p][lm] - probe.base_logits[p][lm];
+        eprintln!("сдвиги: цель {:+.3}, старый argmax {:+.3}", d_t, d_m);
+        assert!(
+            d_t > d_m + 0.1,
+            "целевой токен не обогнал старый argmax: цель {:+.3} argmax {:+.3}",
+            d_t,
+            d_m
+        );
+    }
 }

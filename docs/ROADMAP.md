@@ -60,9 +60,10 @@
       норму в градиенте).
       Тесты: dinet-train 16 (слой: grads_match_finite_diff,
       zero_delta_loss_is_base_ce, train_step_reduces_loss;
-      synthetic_gguf_roundtrip), dinet-llama gain 8 (env-gated:
+      synthetic_gguf_roundtrip), dinet-llama gain 9 (env-gated:
       lora_delta_parity — head/layer изоляторы, слой парсится из имени;
-      работа тестов с ОБЕИМИ моделями).
+      layer_train_moves — сквозной цикл с обучением; работа тестов с
+      ОБЕИМИ моделями).
 - [x] **train-cpp v1.1 — tied-модель (SmolLM2-135M Q8_0, llama-арх, 30
       слоёв):** head-LoRA честно НЕ включается (output_weight=false —
       llama-лору к связанной голове не подать: это была бы подмена);
@@ -71,10 +72,17 @@
       (blk.29.ffn_down, р=8; лосс слоя падает: 1.58 → 0.72 за 24 шага),
       layer-only адаптер 68 КиБ (alpha=рангу слоя → scale=1).
       Проверено ЖИВЫМ: паритет layer max|pred−obs| = 2.1e-4 (< 1e-3) на
-      обученном адаптере; полный gated-набор 8/8 и на qwen05b, и на
+      обученном адаптере; полный gated-набор 9/9 и на qwen05b, и на
       SmolLM2 (паритет-тест динамический; zero-adapter для tied пишется
       нулевым слоем; head-де-квант честно пропускается; стрим копит
       СЫРЫЕ байты — SPM-токены режут UTF-8 посреди символа).
+      Сквозной живой цикл `layer_train_moves_logits_gated` (гейт только
+      DI_NET_GGUF): capture llama → 24 шага layer-train (AdamW, lr 9e-4,
+      хвост 4 позиций) → merged-файл → ЖИВАЯ llama с адаптером: CE
+      целевого токена «ди» против старого argmax — qwen05b 9.99 → 0.00
+      (сдвиг +27.6 против −5.6), SmolLM2 4.09 → 3.08 (сдвиг +0.77
+      против −0.41); суррогат-лосс слоя падает до ~0 на обеих. Обучение
+      ДЕЙСТВИТЕЛЬНО меняет ход модели, а не только её surrogate.
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp
