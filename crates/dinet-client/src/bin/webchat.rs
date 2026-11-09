@@ -43,7 +43,7 @@
 //! Выбор ответчика с --model: ходы на МИКРОЯЗЫКЕ роя (слова «ай би ви…»)
 //! отвечаются репликой роя (то, что рой дообучил, и отвечает); всё
 //! остальное — свободной генерацией llama.cpp. Обучение на парах учителя
-//! и вклад в эры роя работают identично в обоих режимах.
+//! и вклад в эры роя работают идентично в обоих режимах.
 //! Оболочка = та же страница, которую позже завернёт Tauri 2 в окно
 //! (двойное использование: web UI → desktop UI без переписывания).
 //!
@@ -330,9 +330,9 @@ fn era_tick(era: &Arc<Mutex<EraNode>>) {
                 v
             });
             let kv = &mut e.kv;
-            let _ = kv.put("roй:adapter", &ab);
-            let _ = kv.put("roй:cps", &cps.to_le_bytes());
-            let _ = kv.put("roй:eras", &eras.to_le_bytes());
+            let _ = kv.put("рой:adapter", &ab);
+            let _ = kv.put("рой:cps", &cps.to_le_bytes());
+            let _ = kv.put("рой:eras", &eras.to_le_bytes());
             println!(
                 "[эра {}] REVEAL: вклад {} пар, acc {:.3}→{:.3}, чек-пойнт {}-й ПРИМЕНЁН К ЧАТУ",
                 r.era, e.valid.len(), r.accuracy_before, r.accuracy_after, e.cps
@@ -1405,8 +1405,8 @@ fn main() {
             })
             .unwrap_or(0)
     };
-    let eras = u32::try_from(kver("roй:eras")).unwrap_or(0).min(u32::MAX - 1);
-    let cps = u32::try_from(kver("roй:cps")).unwrap_or(0).min(u32::MAX - 1);
+    let eras = u32::try_from(kver("рой:eras")).unwrap_or(0).min(u32::MAX - 1);
+    let cps = u32::try_from(kver("рой:cps")).unwrap_or(0).min(u32::MAX - 1);
     // v1-ЛИЧНЫЙ КЛЮЧ УЗЛА (не сим-вывод [id;32]): генерируется при первом
     // старте и хранится в рой-KV; id = первые два байта pubkey (как в
     // GossipBridge). Несистемная подпись → записи/эры клиента проверяемы
@@ -1433,7 +1433,7 @@ fn main() {
     let mut node = Node::new(node_id, 7, false);
     let node_pub = node_key.pubkey();
     node.signer = Box::new(node_key); // v1: личный ключ вместо сим-вывода
-    if let Some(ab) = kv.get("roй:adapter") {
+    if let Some(ab) = kv.get("рой:adapter") {
         let vals: Vec<f32> = ab
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

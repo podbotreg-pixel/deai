@@ -76,8 +76,8 @@ pub fn clip_l2(v: &[f32], max_norm: f32) -> (Vec<f32>, bool) {
     (v.iter().map(|x| x * k).collect(), true)
 }
 
-/// Простой LCG — достаточно для демо-шума; в билд-криtик v2 —
-/// урmann-шум из crypto PRG (ChaCha от общего календарного ключа эры).
+/// Простой LCG — достаточно для демо-шума; в билд-критике v2 —
+/// криптостойкий шум из crypto PRG (ChaCha от общего календарного ключа эры).
 pub struct Lcg(u64);
 
 impl Lcg {

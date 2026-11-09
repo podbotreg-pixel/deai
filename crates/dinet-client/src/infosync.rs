@@ -168,7 +168,7 @@ pub fn info_exchange_tick(
     let mut new_ids: Vec<[u8; 32]> = Vec::new();
 
     // 1) СНАЧАЛА собираем всё чужое (вежливый барьер — не «заливаем»
-    //    сеть до поgoпления входа: чужим тоже надо успеть поcollect'ить)
+    //    сеть до подключения входа: чужим тоже надо успеть собрать своё)
     for raw in t.collect(CH_INFO, me_id) {
         let Some(frame) = frame_from_wire(&raw) else { continue };
         if frame.sender == *me_pub {
@@ -352,7 +352,7 @@ mod tests {
 
 
     /// Общая шина «все ко всем»: кадр A попадает только к B и наоборот
-    /// (инбоксы раздельные, как у мессa трансорта).
+    /// (инбоксы раздельные, как у мессенджера).
     struct BusBox {
         a_in: Vec<Vec<u8>>,
         b_in: Vec<Vec<u8>>,

@@ -29,6 +29,11 @@ pub fn notary_min(roster: usize) -> usize {
     (roster * 2 + 2) / 3
 }
 
+/// Сбор печатей над мостом: доставки распределены во времени — копим до
+/// кворума попытками; синхронным транспортам хватает первой.
+const NOTARY_ATTEMPTS: u32 = 24;
+const NOTARY_ATTEMPT_MS: u64 = 40;
+
 /// Отчёт фазы по узлу.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NotaryReport {
@@ -64,15 +69,19 @@ fn expected_entry(
 /// ФАЗА F: печать реестра (после `era_tally`, тот же mids, тот же transport).
 /// Параллельно узел, дописавший реестр, кладёт САМ БЛОБ дельты в свой
 /// склад (`Node::blobs`) — с этих пор он полноценный сид для torrent-фазы G.
-pub fn era_notary(
+/// ФАЗА F.1 — печать: узел с голосом (reveal-эра) подписывает канон со
+/// своей точки реестра и рассылает NotarySeal (broadcast). Отдельная
+/// функция — сетевые драйверы барьерируют между рассылкой и сбором (мост
+/// асинхронен; сим-транспортам всё равно).
+pub fn era_notary_seal(
     mine: &mut [Node],
-    all_ids: &[NodeId],
+    _all_ids: &[NodeId],
     transport: &mut dyn Transport,
     era: u32,
     cfg: &SimConfig,
     mids: &[MidNode],
     regs: &mut [RegistryLog],
-) -> Vec<NotaryReport> {
+) {
     let was_reveal = mids.iter().any(|m| m.vote.is_some());
 
     // --- 1. Печати: канон со своей точки + NotarySeal (broadcast)
@@ -98,6 +107,22 @@ pub fn era_notary(
         );
         transport.send(CH_NOTARY, mine[idx].id, None, &frame);
     }
+}
+
+/// ФАЗА F.2 — сбор: чужие NotarySeal сверяются с МОИМ каноном (бит-в-бит),
+/// подпись ed25519 поверх канона ключом From payload, distinct-пабки; по
+/// кворуму ceil(2N/3) запись дописывается в свой реестр и блоб дельты —
+/// в склад узла (узел становится сидом torrent-фазы G).
+pub fn era_notary_collect(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    mids: &[MidNode],
+    regs: &mut [RegistryLog],
+) -> Vec<NotaryReport> {
+    let was_reveal = mids.iter().any(|m| m.vote.is_some());
 
     // --- 2. Сбор чужих печатей; по кворуму — запись в свой реестр
     let mut reports = Vec::with_capacity(mine.len());
@@ -114,50 +139,65 @@ pub fn era_notary(
         };
         let my_canon = my_entry.encode();
         let book = peer_book_ids(all_ids);
-        let wire = transport.collect(CH_NOTARY, mine[idx].id);
-        let payloads = decode_frames(&mut mine[idx], &book, wire);
+        let min = notary_min(all_ids.len());
+        // Печати распределены во времени (мост асинхронен) — копим до кворума
+        // попытками: каждая попытка дрейнит канал, накопленное ЕСЛИ остаётся
+        // (частичный набор не теряется между попытками). Синхронным транспортам
+        // хватает первой попытки — сна в них не случается.
         let mut seals: Vec<Seal> = Vec::new();
-        for (_nid, pl) in payloads.iter() {
-            let Payload::NotarySeal { entry_bytes, seal_pubkey, seal_sig } = pl else {
-                mine[idx].rejected_frames += 1;
-                continue;
-            };
-            // 1) канон должен быть ТОЧНЫМ дубликатом моего (форк/разгон мимо)
-            if *entry_bytes != my_canon {
-                mine[idx].rejected_frames += 1;
-                continue;
-            }
-            // 2) печать ed25519 поверх канона; ключ внутри payload
-            if seal_pubkey.len() != 32 || seal_sig.len() != 64 {
-                mine[idx].rejected_frames += 1;
-                continue;
-            }
-            let mut pk = [0u8; 32];
-            pk.copy_from_slice(seal_pubkey);
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(seal_sig);
-            let verifier = match dinet_crypto::Ed25519Verifier::new(pk) {
-                Some(v) => v,
-                None => {
+        for attempt in 0..NOTARY_ATTEMPTS {
+            let wire = transport.collect(CH_NOTARY, mine[idx].id);
+            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            for (_nid, pl) in payloads.iter() {
+                let Payload::NotarySeal { entry_bytes, seal_pubkey, seal_sig } = pl else {
+                    mine[idx].rejected_frames += 1;
+                    continue;
+                };
+                // 1) канон должен быть ТОЧНЫМ дубликатом моего (форк/разгон мимо)
+                if *entry_bytes != my_canon {
                     mine[idx].rejected_frames += 1;
                     continue;
                 }
-            };
-            if !verifier.verify(&my_canon, &sig) {
-                mine[idx].rejected_frames += 1;
-                continue;
+                // 2) печать ed25519 поверх канона; ключ внутри payload
+                if seal_pubkey.len() != 32 || seal_sig.len() != 64 {
+                    mine[idx].rejected_frames += 1;
+                    continue;
+                }
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(seal_pubkey);
+                let mut sig = [0u8; 64];
+                sig.copy_from_slice(seal_sig);
+                let verifier = match dinet_crypto::Ed25519Verifier::new(pk) {
+                    Some(v) => v,
+                    None => {
+                        mine[idx].rejected_frames += 1;
+                        continue;
+                    }
+                };
+                if !verifier.verify(&my_canon, &sig) {
+                    mine[idx].rejected_frames += 1;
+                    continue;
+                }
+                if seals.iter().any(|s| s.pubkey == pk) {
+                    continue; // дубликат нотариуса не считается
+                }
+                seals.push(Seal { pubkey: pk, sig });
             }
-            if seals.iter().any(|s| s.pubkey == pk) {
-                continue; // дубликат нотариуса не считается
+            if seals.len() >= min {
+                break;
             }
-            seals.push(Seal { pubkey: pk, sig });
+            if attempt + 1 < NOTARY_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(NOTARY_ATTEMPT_MS));
+            }
         }
-        let min = notary_min(all_ids.len());
+        // канон записи детерминирован: печати сортируются по pubkey (сетевой
+        // порядок прибытия различается — бит-в-бит равенство цепочек держится)
+        seals.sort_by_key(|s| s.pubkey);
         if seals.len() >= min {
             regs[idx]
                 .append(Accepted { entry: my_entry.clone(), seals })
                 .unwrap_or_else(|e| panic!("канон валиден: append не может падать: {e}"));
-            // бLOB дельты — в склад узла: узел становится сидом для фазы G
+            // блоб дельты — в склад узла: узел становится сидом для фазы G
             if let Some(v) = &mids[idx].vote {
                 let (m, chunks) =
                     crate::blob_torrent::delta_f32_packed(&v.agg_delta, cfg.blob_chunk_len);
@@ -169,6 +209,21 @@ pub fn era_notary(
         }
     }
     reports
+}
+
+/// ФАЗА F весь: для синхронных транспортов рассылка → сбор подряд; сетевые
+/// драйверы зовут era_notary_seal / era_notary_collect порознь (барьер).
+pub fn era_notary(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    mids: &[MidNode],
+    regs: &mut [RegistryLog],
+) -> Vec<NotaryReport> {
+    era_notary_seal(mine, all_ids, transport, era, cfg, mids, regs);
+    era_notary_collect(mine, all_ids, transport, era, cfg, mids, regs)
 }
 
 #[cfg(test)]

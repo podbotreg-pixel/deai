@@ -744,6 +744,7 @@ dependencies = [
  "dinet-fl",
  "dinet-node",
  "dinet-proto",
+ "dinet-registry",
  "futures",
  "libp2p",
  "libp2p-mdns",

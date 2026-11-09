@@ -442,7 +442,7 @@ pub fn load_or_create_seed(path: &std::path::Path) -> Result<[u8; ED25519_PUB_LE
     Ok(seed)
 }
 
-/// ВерификаторPeerBook: только публичный ключ, никакого секрета.
+/// Верификатор PeerBook: только публичный ключ, никакого секрета.
 #[derive(Debug)]
 pub struct Ed25519Verifier {
     vk: Option<ed25519_dalek::VerifyingKey>,

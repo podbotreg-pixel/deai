@@ -224,7 +224,7 @@ impl ToyModel {
         dl[s.chosen as usize] -= 1.0;
         // (2) Hinge-предпочтение (saturating, DPO-lite): если logP(c) − logP(r) < M,
         //     поднимать logit(c)/опускать logit(r) ОТНОСИТЕЛЬНО, иначе — ноль
-        //     (без неограниченного давления Wооглуp rejected → не разрушает общий lанс).
+        //     (без неограниченного давления на rejected → не разрушает общий баланс).
         if let Some(rej) = s.rejected {
             const EPS: f32 = 1e-6;
             let lc = (p[s.chosen as usize] + EPS).ln();

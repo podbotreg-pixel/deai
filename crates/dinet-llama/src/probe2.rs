@@ -603,7 +603,7 @@ mod impl_probe2 {
     /// Cross-check де-кванта: голова из СВОЕГО GGUF-ридера
     /// (`output.weight`, Q8_0 → f32) · hidden (result_embd_pooled)
     /// против логитов llama.cpp. ggml перед matmul квантизует скрытые
-    /// Active quá Q8_0 — ви симулируем ту же процедуру; после неё
+    /// активации в Q8_0 — мы симулируем ту же процедуру; после неё
     /// расхождения обязаны быть шумом ≤2e-2.
     #[test]
     fn head_dequant_matches_llama_logits_gated() {
@@ -650,7 +650,7 @@ mod impl_probe2 {
             out
         }
 
-        // матvec по первой и последней позиции
+        // сверка head q8/float по первой и последней позиции
         let d = n_embd;
         let nv = p.n_vocab as usize;
         for pos in [0usize, tok.len() - 1] {
@@ -796,7 +796,7 @@ mod impl_probe2 {
             }])
             .expect("layer-only пишется");
             // вход ffn_down = выход swiGLU слоя llama (ffn_silu — запасной
-            // вариант naming для архов без PAR-сплит свиGLU)
+            // вариант naming для архов без PAR-сплит swiGLU)
             let psx = match eng.run_target(&tok, false, &format!("ffn_swiglu-{il}")) {
                 Ok(pp) => pp,
                 Err(_) => eng

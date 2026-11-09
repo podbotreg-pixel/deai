@@ -426,7 +426,7 @@ pub fn infosphere_sync(
         }
     }
 
-    // 2) ВСЕ сначала collect анонсов (строгий барьер), свод не-cамих
+    // 2) ВСЕ сначала collect анонсов (строгий барьер), свод не-самых
     //    себя absent-id по источникам; затем ВСЕ разом шлют asks
     let mut ask_bufs: Vec<Vec<(NodeId, Vec<[u8; 32]>)>> = (0..mine.len()).map(|_| Vec::new()).collect();
     for idx in 0..mine.len() {

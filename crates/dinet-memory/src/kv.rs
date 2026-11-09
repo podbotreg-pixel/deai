@@ -36,7 +36,7 @@ struct Slot {
 pub struct KvStore {
     path: PathBuf,
     // Хэндл для append-записи (seek на tail) и служебных перечитываний;
-    // чтенияValues по ключу открывают свежий read-хэндл (get — &self).
+    // чтения values по ключу открывают свежий read-хэндл (get — &self).
     file: File,
     tail: u64,
     index: BTreeMap<String, Slot>,

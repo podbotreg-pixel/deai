@@ -167,6 +167,99 @@ pub fn hello_join(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Консенсус состава (v0-M2): взаимная Hello-волна + самосертификация id.
+// Состав роя — отсортированный набор объявленных NodeId. Заявка
+// самосертифицируется: кадр подписан собственным ключом, и pk(seed[id])
+// == sender — чужой id под своим ключом не пройдёт (id выводится из
+// ключей sim-вывода; v1 — настоящие ключи клиентов: заявка обязана
+// совпадать с владельцем ключа, правила сверки те же).
+// ---------------------------------------------------------------------------
+
+/// PK, который sim-узел `id` получит из seed `[id;32]` (тот же вывод, что
+/// в `Node::new`; самосертификация знает только эту схему).
+pub fn pk_of_nid(id: NodeId) -> [u8; 32] {
+    dinet_crypto::Ed25519Signer::from_seed(&[id as u8; 32]).pubkey()
+}
+
+/// Заявка состава: подписанный Hello со СВОИМ id в поле port (broadcast).
+/// Повторы безвредны — слушатели заносят пир один раз.
+pub fn roster_announce(node: &mut Node, transport: &mut dyn Transport) {
+    let caps: [bool; 4] = [true, false, false, false];
+    let hello = Frame {
+        msg_type: MsgType::Hello,
+        sender: node.signer.pubkey(),
+        sig: [0u8; 64],
+        payload: Payload::Hello {
+            proto_ver: dinet_proto::PROTO_VERSION as u16,
+            caps,
+            port: node.id,
+        },
+    };
+    let sender = hello.sender;
+    let body = hello.encode_payload().expect("hello payload");
+    let sig = node.signer.sign(&body);
+    let wire = hello.encode_with_sender_sig(&sender, &sig).expect("hello кадр");
+    transport.send(CH_HELLO, node.id, None, &wire);
+}
+
+/// Обработать вход волны: TOFU-подпись + самосертификация заявленного id.
+/// Возврат — сколько НОВЫХ пиров занесено (для тихого окна драйвера).
+pub fn roster_listen(
+    node: &mut Node,
+    book: &mut PeerBook,
+    transport: &mut dyn Transport,
+) -> usize {
+    let me = node.signer.pubkey();
+    let mut fresh = 0usize;
+    for raw in transport.collect(CH_HELLO, node.id) {
+        let Ok(f) = Frame::decode(&raw) else {
+            node.rejected_frames += 1;
+            continue;
+        };
+        if f.sender == me {
+            continue; // свой loopback: id себя знаю и без волны
+        }
+        let body = match f.encode_payload() {
+            Ok(b) => b,
+            Err(_) => {
+                node.rejected_frames += 1;
+                continue;
+            }
+        };
+        let Payload::Hello { port, .. } = &f.payload else {
+            node.rejected_frames += 1;
+            continue;
+        };
+        let ver = match dinet_crypto::Ed25519Verifier::new(f.sender) {
+            Some(v) => v,
+            None => {
+                node.rejected_frames += 1;
+                continue;
+            }
+        };
+        // подпись ТОЛЬКО ключом sender + самосертификация заявленного id
+        if !ver.verify(&body, &f.sig) || pk_of_nid(*port) != f.sender {
+            node.rejected_frames += 1; // чужой id под своим ключом: брак
+            continue;
+        }
+        if !book.knows(&f.sender) {
+            book.enroll(f.sender, Some(*port));
+            fresh += 1;
+        }
+    }
+    fresh
+}
+
+/// Текущий состав: мой id + все занесённые пиры (sorted, без дублей).
+pub fn roster_now(me: NodeId, book: &PeerBook) -> Vec<NodeId> {
+    let mut v: Vec<NodeId> = book.nid_by_sender.values().copied().collect();
+    v.push(me);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +384,70 @@ mod tests {
     fn transport_tap(t: &mut MeshTransport, who: NodeId) -> Vec<Vec<u8>> {
         use crate::transport::Transport as _;
         t.collect(CH_HELLO, who)
+    }
+
+    /// КОНСЕНСУС СОСТАВА v0: взаимные Hello-волны сходятся к ОДНОМУ
+    /// отсортированному составу у всех узлов.
+    #[test]
+    fn roster_waves_converge_bit_identical() {
+        let mut nodes: Vec<SwarmNode> =
+            (0..5usize).map(|i| SwarmNode::new(i as NodeId, 7, false)).collect();
+        let mut books: Vec<PeerBook> = (0..5).map(|_| PeerBook::empty()).collect();
+        let mut mesh = MeshTransport::new(5);
+        for _round in 0..3 {
+            for n in &mut nodes {
+                roster_announce(n, &mut mesh);
+            }
+            for i in 0..nodes.len() {
+                roster_listen(&mut nodes[i], &mut books[i], &mut mesh);
+            }
+        }
+        let want: Vec<NodeId> = (0..5).collect();
+        for i in 0..5 {
+            assert_eq!(
+                roster_now(nodes[i].id, &books[i]),
+                want,
+                "состав узла {i} не сошёлся"
+            );
+        }
+    }
+
+    /// САМОСЕРТИФИКАЦИЯ: подписанный «чужой» id (у узла 9 подпись своя,
+    /// а заявка port=3) бракуется; честная заявка порт=9 проходит.
+    #[test]
+    fn roster_rejects_forged_claim() {
+        let mut listener = SwarmNode::new(0, 7, false);
+        let mut book = PeerBook::empty();
+        let mut mesh = MeshTransport::new(12);
+
+        // подделка: валидная подпись ключа узла 9, но port = 3 (чужой id)
+        let imposter = SwarmNode::new(9, 7, false);
+        let forged = Frame {
+            msg_type: MsgType::Hello,
+            sender: imposter.signer.pubkey(),
+            sig: [0u8; 64],
+            payload: Payload::Hello {
+                proto_ver: dinet_proto::PROTO_VERSION as u16,
+                caps: [true, false, false, false],
+                port: 3,
+            },
+        };
+        let body = forged.encode_payload().expect("payload");
+        let sig = imposter.signer.sign(&body);
+        let wire = forged
+            .encode_with_sender_sig(&imposter.signer.pubkey(), &sig)
+            .expect("кадр");
+        use crate::transport::Transport as _;
+        mesh.send(CH_HELLO, 9, None, &wire);
+
+        assert_eq!(roster_listen(&mut listener, &mut book, &mut mesh), 0);
+        assert!(listener.rejected_frames > 0, "подделка не замечена");
+        assert!(book.is_empty(), "чужой id просочился в книгу");
+
+        // честная заявка (свой ключ под своим id) заносится
+        let mut honest = SwarmNode::new(3, 7, false);
+        roster_announce(&mut honest, &mut mesh);
+        assert_eq!(roster_listen(&mut listener, &mut book, &mut mesh), 1);
+        assert_eq!(roster_now(0, &book), vec![0, 3]);
     }
 }

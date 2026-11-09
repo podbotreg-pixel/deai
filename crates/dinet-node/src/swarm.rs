@@ -29,6 +29,12 @@ use dinet_proto::{Frame, MsgType, Payload, SENDER_LEN};
 
 use crate::transport::{Transport, CH_ANNOUNCE, CH_LAZY, CH_SHARES, CH_VOTES};
 
+/// Сетевой мост асинхронен: сборы фаз ждут ожидаемый состав кадр-за-кадром
+/// (собранное остаётся, повторный collect достаёт поздних). Синхронные
+/// транспорты (mesh/спул) возвращают всё в первой попытке — сна в них нет.
+const WIRE_ATTEMPTS: u32 = 24;
+const WIRE_ATTEMPT_MS: u64 = 40;
+
 pub type NodeId = u16;
 
 #[derive(Debug, Clone, Copy)]
@@ -133,7 +139,7 @@ impl Node {
     }
 }
 
-/// PeerBook: sender (публичный ключ kadра) → проверка подписи.
+/// PeerBook: sender (публичный ключ кадра) → проверка подписи.
 /// Только публичные ключи — чужих секретов узел не знает никогда.
 pub struct PeerBook {
     pub(crate) verifiers: BTreeMap<[u8; SENDER_LEN], Box<dyn Verifier>>,
@@ -283,6 +289,16 @@ pub(crate) fn cand_hash32(era: u32, agg_delta: &[f32]) -> [u8; 32] {
 
 fn fx_to_bytes(fx: &[i64]) -> Vec<u8> {
     fx.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Вклад эры на канале SHARES: UpdShare (masked) / RobustInput (reveal) —
+/// для ожидания полного состава в сборе фаз B/C.
+fn era_input(p: &Payload, ehash: [u8; 32], was_reveal: bool) -> bool {
+    match p {
+        Payload::UpdShare { era_id, .. } => *era_id == ehash && !was_reveal,
+        Payload::RobustInput { era_id, .. } => *era_id == ehash && was_reveal,
+        _ => false,
+    }
 }
 
 fn bytes_to_fx(b: &[u8]) -> Vec<i64> {
@@ -570,8 +586,20 @@ pub fn era_collect_and_vote(
     let mut mids = Vec::with_capacity(mine.len());
     for idx in 0..mine.len() {
         let book = peer_book_ids(all_ids);
-        let wire = transport.collect(CH_SHARES, mine[idx].id);
-        let payloads = decode_frames(&mut mine[idx], &book, wire);
+        let mut payloads: Vec<(NodeId, Payload)> = Vec::new();
+        // Мост асинхронен: копим вклады до полного состава (отобранные
+        // остаются — повторные collect'ы достают только поздних).
+        for attempt in 0..WIRE_ATTEMPTS {
+            let wire = transport.collect(CH_SHARES, mine[idx].id);
+            payloads.extend(decode_frames(&mut mine[idx], &book, wire));
+            let rel = payloads.iter().filter(|(_, p)| era_input(p, ehash, was_reveal)).count();
+            if rel >= all_ids.len() {
+                break;
+            }
+            if attempt + 1 < WIRE_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
+            }
+        }
         let mut shares: Vec<ShareEntry> = Vec::new();
         let mut reveals: Vec<RevealEntry> = Vec::new();
         for (nid, pl) in payloads.iter() {
@@ -695,15 +723,20 @@ pub fn era_collect_and_vote(
     mids
 }
 
-/// ФАЗЫ D+E: Tally (кворум/apply/announce) и отчёт каждого своего узла.
-pub fn era_tally(
+/// ФАЗА D: reveal — применить чек-пойнт под кворумом и анонсировать
+/// (CH_ANNOUNCE); masked — аудиторы (ротация M1) пересчитывают
+/// masked-сумму из своих share'ов и выносят LazyAudit-вердикты (CH_LAZY).
+/// Отдельная функция — сетевые драйверы (dinet-p2p::swarm_net) барьерируют
+/// СТРОГО между D и E: у моста доставка асинхронна, «послал → тут же
+/// собрал» гонит пустой кворум (синхронные mesh/спул гонку не видят).
+pub fn era_audit(
     mine: &mut [Node],
     all_ids: &[NodeId],
     transport: &mut dyn Transport,
     era: u32,
     cfg: &SimConfig,
     mut mids: Vec<MidNode>,
-) -> Vec<EraReport> {
+) -> Vec<MidNode> {
     let was_reveal = (era + 1) % cfg.reveal_every == 0;
     let ehash = era_hash32(era);
 
@@ -711,24 +744,33 @@ pub fn era_tally(
     for idx in 0..mine.len() {
         if was_reveal {
             let book = peer_book_ids(all_ids);
-            let wire = transport.collect(CH_VOTES, mine[idx].id);
-            let payloads = decode_frames(&mut mine[idx], &book, wire);
-            // Кворум учитывает только голоса за Мой кандидат эры (кадр
+            // Кворум учитывает только голоса за МОЙ кандидат эры (кадр
             // EvalVote не знает era_id — чек-пойнт-id даёт эпоху): заодно
-            // невались хвост чужих голосов прошлых эр (FileSpool во
+            // отсекаются хвосты чужих голосов прошлых эр (FileSpool в
             // broadcast'ах копит кадры до sweep — LazyAudit/AggCommit
             // добавляют файлы на тот же канал).
             let my_hash = mids[idx].vote.as_ref().map(|v| v.candhash);
             let mut accepts = 0usize;
             let mut seen_votes = 0usize;
-            for (_nid, pl) in payloads.iter() {
-                if let Payload::EvalVote { checkpoint_id, pass_at_k, .. } = pl {
-                    if Some(checkpoint_id) == my_hash.as_ref() {
-                        seen_votes += 1;
-                        if *pass_at_k == 100 {
-                            accepts += 1;
+            // мост асинхронен: копим голоса до полного состава роя
+            for attempt in 0..WIRE_ATTEMPTS {
+                let wire = transport.collect(CH_VOTES, mine[idx].id);
+                let payloads = decode_frames(&mut mine[idx], &book, wire);
+                for (_nid, pl) in payloads.iter() {
+                    if let Payload::EvalVote { checkpoint_id, pass_at_k, .. } = pl {
+                        if Some(checkpoint_id) == my_hash.as_ref() {
+                            seen_votes += 1;
+                            if *pass_at_k == 100 {
+                                accepts += 1;
+                            }
                         }
                     }
+                }
+                if seen_votes >= all_ids.len() {
+                    break;
+                }
+                if attempt + 1 < WIRE_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
                 }
             }
             let quorum = accepts * 3 >= seen_votes.max(1) * 2;
@@ -760,14 +802,23 @@ pub fn era_tally(
             // masked-эра: собрать AggCommit агрегатора; lazy-аудитор (10%)
             // ПЕРЕСЧИТЫВАЕТ masked-сумму из СВОИХ share'ов и выносит вердикт.
             let book = peer_book_ids(all_ids);
-            let wire = transport.collect(CH_VOTES, mine[idx].id);
-            let payloads = decode_frames(&mut mine[idx], &book, wire);
             let mut agg_hash = None;
-            for (_nid, pl) in payloads.iter() {
-                if let Payload::AggCommit { era_id, agg_result_hash, .. } = pl {
-                    if *era_id == ehash {
-                        agg_hash = Some(*agg_result_hash);
+            // мост асинхронен: ждём AggCommit агрегатора ЭТОЙ эры
+            for attempt in 0..WIRE_ATTEMPTS {
+                let wire = transport.collect(CH_VOTES, mine[idx].id);
+                let payloads = decode_frames(&mut mine[idx], &book, wire);
+                for (_nid, pl) in payloads.iter() {
+                    if let Payload::AggCommit { era_id, agg_result_hash, .. } = pl {
+                        if *era_id == ehash {
+                            agg_hash = Some(*agg_result_hash);
+                        }
                     }
+                }
+                if agg_hash.is_some() {
+                    break;
+                }
+                if attempt + 1 < WIRE_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
                 }
             }
             mids[idx].agg_hash = agg_hash;
@@ -798,6 +849,23 @@ pub fn era_tally(
             }
         }
     }
+    mids
+}
+
+/// ФАЗА E: отчёт каждого своего узла (masked — кворум аудиторских
+/// вердиктов; reveal — собр announce'ов) + accuracy-замеры. `mids` — по
+/// ссылке: узел дописывает аудиторские счётчики (caller-драйвер может
+/// дальше отдать их же в фазу F-нотариата).
+pub fn era_report(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    mids: &mut [MidNode],
+) -> Vec<EraReport> {
+    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let ehash = era_hash32(era);
 
     // --- Фаза E: отчёт
     let mut reports = Vec::with_capacity(mine.len());
@@ -805,34 +873,55 @@ pub fn era_tally(
         let book = peer_book_ids(all_ids);
         let announcements_valid: Vec<[u8; 32]>;
         if was_reveal {
-            let announces = transport.collect(CH_ANNOUNCE, mine[idx].id);
-            let payloads = decode_frames(&mut mine[idx], &book, announces);
-            announcements_valid = payloads
-                .iter()
-                .filter_map(|(_nid, pl)| match pl {
-                    Payload::CheckpointAnnounce { id, era_id, .. } if *era_id == ehash => Some(*id),
-                    _ => None,
-                })
-                .collect();
+            // мост асинхронен: копим анонсы чек-пойнта до полного состава
+            let mut announcements: Vec<[u8; 32]> = Vec::new();
+            for attempt in 0..WIRE_ATTEMPTS {
+                let announces = transport.collect(CH_ANNOUNCE, mine[idx].id);
+                let payloads = decode_frames(&mut mine[idx], &book, announces);
+                for (_nid, pl) in payloads.iter() {
+                    if let Payload::CheckpointAnnounce { id, era_id, .. } = pl {
+                        if *era_id == ehash {
+                            announcements.push(*id);
+                        }
+                    }
+                }
+                if announcements.len() >= all_ids.len() {
+                    break;
+                }
+                if attempt + 1 < WIRE_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
+                }
+            }
+            announcements_valid = announcements;
         } else {
             // masked-эра: LazyAudit-кворум от аудиторов (свой канал CH_LAZY:
             // аудиторы все отсылают в D, до E — частичный drain невозможен;
             // аудиторы видят и свой вердикт — broadcast включает автора)
-            let wire = transport.collect(CH_LAZY, mine[idx].id);
-            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            let panel = crate::roles::auditors_for(all_ids, era, cfg.audit_pct).len();
             let mut pass = 0u8;
             let mut fail = 0u8;
-            for (_nid, pl) in payloads.iter() {
-                if let Payload::LazyAudit { checkpoint_id, verdict, .. } = pl {
-                    if let Some(h) = mids[idx].agg_hash {
-                        if checkpoint_id == &h {
-                            if *verdict {
-                                pass = pass.saturating_add(1);
-                            } else {
-                                fail = fail.saturating_add(1);
+            // мост асинхронен: копим вердикты до полной панели аудиторов
+            for attempt in 0..WIRE_ATTEMPTS {
+                let wire = transport.collect(CH_LAZY, mine[idx].id);
+                let payloads = decode_frames(&mut mine[idx], &book, wire);
+                for (_nid, pl) in payloads.iter() {
+                    if let Payload::LazyAudit { checkpoint_id, verdict, .. } = pl {
+                        if let Some(h) = mids[idx].agg_hash {
+                            if checkpoint_id == &h {
+                                if *verdict {
+                                    pass = pass.saturating_add(1);
+                                } else {
+                                    fail = fail.saturating_add(1);
+                                }
                             }
                         }
                     }
+                }
+                if usize::from(pass) + usize::from(fail) >= panel {
+                    break;
+                }
+                if attempt + 1 < WIRE_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
                 }
             }
             mids[idx].n_audits_pass = pass;
@@ -875,6 +964,20 @@ pub fn era_tally(
         });
     }
     reports
+}
+
+/// Фазы D+E одной функцией: для синхронных транспортов (mesh/спул) итог тот
+/// же; сетевые драйверы зовут фазы ПОРОЗНЬ (см. era_audit — барьер между D и E).
+pub fn era_tally(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+    mids: Vec<MidNode>,
+) -> Vec<EraReport> {
+    let mut mids = era_audit(mine, all_ids, transport, era, cfg, mids);
+    era_report(mine, all_ids, transport, era, cfg, &mut mids)
 }
 
 /// Фазы A–E над ПОДМНОЖЕСТВОМ узлов роя (без барьеров внутри — для тестов:

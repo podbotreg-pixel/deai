@@ -130,7 +130,7 @@ fn encode_pair(p: &LearnPair) -> Vec<u8> {
 }
 
 impl ChatSession {
-    /// Открыть/создать сессию чата (файл памяти общий с RAG/roй-обучением).
+    /// Открыть/создать сессию чата (файл памяти общий с RAG/рой-обучением).
     pub fn open(path: &Path) -> std::io::Result<ChatSession> {
         let store = KvStore::open(path)?;
         Ok(ChatSession { store, model_name: "toy-v0" })
