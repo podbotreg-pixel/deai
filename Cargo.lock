@@ -655,6 +655,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinet-agent"
+version = "0.1.0"
+dependencies = [
+ "dinet-crypto",
+ "dinet-memory",
+]
+
+[[package]]
 name = "dinet-chat"
 version = "0.1.0"
 dependencies = [
