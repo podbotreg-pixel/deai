@@ -565,6 +565,12 @@ REVEAL-эры с robust-агрегацией и чек-пойнтом); симу
       (dinet-memory KvStore: CRC, обрыв хвоста обрезается); undo снимает
       вершину (восстановить байты / удалить файл). Recovery = reopen
       (seq переживает рестарт, тест).
+  - [x] Шаг 2: полный аудит (`audit.rs`, `agent-audit.roi`): ВСЕ вызовы
+      инструментов пишутся — успехи, отказы гейта, анти-фишинг-блоки и
+      даже чтения (DoD «все действия в журнале»); запись seq/ts/tool/
+      granted/ok/summary (summary сплющен по \n, truncate 200 по
+      UTF-8-границе); reopen переживает рестарт; инструмент audit_tail
+      (READ) — саморефлексия агента, живой показ через agentd.
 - [x] Capability-токены, уровни READ/WRITE/DESTRUCTIVE/NETWORK
       (`caps.rs`: ed25519-подпись канон-байтов владельцем — верификация
       без таблицы выданных; подмена уровня, чужой ключ, срок бракуются;
@@ -572,6 +578,23 @@ REVEAL-эры с robust-агрегацией и чек-пойнтом); симу
       max(--caps, токен из --token FILE); каждый инструмент объявляет
       потребный уровень, гейт на tools/call).
 - [ ] Анти-фишинг-детекторы (AgentPhishing-тренированные) на входе
+  - [x] Шаг 1, rule-based скоринг (`phishing.rs`): Injection/Suspicious —
+      маркеры prompt-injection («ignore previous», «проигнорируй…»,
+      «you are now»), punycode-домены, гомоглифы (смешанные алфавиты
+      ВНУТРИ одного слова — «оfpen»; двуязычный текст не флагается).
+      Blocked — запросы секретов (.env, id_rsa, *.pem, credentials,
+      .ssh/, .aws/, wallet.dat, api_key…), системный промпт как секрет,
+      эксфильтрация (webhook.site, ngrok, nc -e, /dev/tcp/, | curl,
+      wget --post), системные пути (/etc/shadow, /proc/self/mem).
+      Секрет-пути ФС бракуются ДО открытия даже READ-агенту
+      (secret_path). Веса правил — точка прикрепления тренированной
+      модели AgentPhishing. Тесты: benign-корпус чист, фишинг-корпус
+      ≥12 векторов блокируется, гомоглифы, DoD-тест.
+      В `ToolWorld::call`: cli_run сканируется (command+args), Blocked →
+      isError «АНТИ-ФИШИНГ: …», Suspicious → пометка ⚠ [SUSPICIOUS: …];
+      живой опыт agentd: fs_read(.env)/credentials.json и curl на
+      webhook.site отвергнуты, echo с маркером инъекции помечен,
+      audit_tail показал все 6 записей.
 - [ ] Evolving Skills: накопление, воспроизведение, share через SKILL_SHARE
 
 **DoD:** ≥20 открытых CUA-задач (CUA-Lite-базовые), succ≥50%; фишинг-тест не выводит секреты;
