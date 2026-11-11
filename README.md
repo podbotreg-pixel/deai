@@ -26,19 +26,32 @@
 ```
 docs/                 архитектура, протокол, устойчивость, дорожная карта
 crates/
-  dinet-crypto/       SHA-256, DID, Merkle, Signer-трейт (ed25519 — точка прикрепления)
+  dinet-crypto/       SHA-256, DID, Merkle, CRC-32, ed25519-dalek подписи, X25519-маски
   dinet-proto/        wire-протокол v0 (детерминированный CBOR-lite), коды сообщений
   dinet-core/         конфигурация, планировщик ресурсов (лимиты CPU/RAM/батарея/сеть)
-  dinet-fl/           quant+error feedback, DP-клиппинг, trimmed mean / Krum, FedGraph-score
-  dinet-node/         узел: DiLoCo-расписание эр, robust-скрининг, fork-choice, симуляция роя
-  dinet-net/          пeer-to-peer слой (libp2p-интеграция — точка прикрепления)
-  dinet-node/         рой: эпохи DiLoCo, secure-agg, robust-скрининг, fork-choice,
-                      транспорт wire-кадров (in-memory mesh + файловый спул; libp2p —
-                      следующий backend через трейт `Transport`)
+  dinet-fl/           федеративная математика: quant+error feedback, DP-клиппинг,
+                      trimmed mean / Krum, FedGraph-score (std-only)
+  dinet-net/          сетевой слой-скелет: bootstrap-источники, роли, ставка репутации
+  dinet-registry/     реестр чек-пойнтов: append-only лог с нотарными печатями,
+                      кусочная репликация дельт (std-only)
+  dinet-node/         узел/рой: DiLoCo-эры, secure-agg, robust-скрининг, fork-choice,
+                      симуляция роя (in-memory mesh + файловый спул)
   dinet-memory/       локальная память: append-only KV-лог (std-only, замена SQLite)
-                      + hash-эмбеддинг RAG (замена sqlite-vec); libp2p/llama.cpp — v1
+                      + hash-эмбеддинг RAG (замена sqlite-vec)
   dinet-chat/         чат-сессия: история, RAG-контекст хода, буфер speak→learn;
-                      `ChatModel` — точка прикрепления llama.cpp (toy-v0 проверяет пайплайн)
+                      `ChatModel` — точка прикрепления llama.cpp
+  dinet-client/       клиент: чат → speak→learn → локальный fit → подписанный вклад
+                      в рой; webchat (браузерная оболочка) и clientswarm
+  dinet-p2p/          РЕАЛЬНАЯ сеть: libp2p (TCP+Noise+Yamux+gossipsub) под кадрами
+                      dinet-proto; GossipBridge реализует трейт Transport
+  dinet-train/        train-cpp: дообучение настоящей llama.cpp — LoRA-дельта головы,
+                      экспорт в adapter-GGUF
+  dinet-llama/        llama.cpp (GGUF Q4): `LlamaChatModel` — тот же трейт `ChatModel`
+  dinet-agent/        M2-АГЕНТ (std-only): MCP-сервер (stdio NDJSON, спека 2025-06-18)
+                      поверх FS-песочницы (jail) и CLI-allowlist; capability-токены
+                      READ/WRITE/DESTRUCTIVE/NETWORK; undo-журнал; анти-фишинг-детектор
+                      входа; полный аудит-журнал; Evolving Skills (SKILL_SHARE);
+                      CUA-Lite бенчмарк. bin: agentd, cua-bench
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
