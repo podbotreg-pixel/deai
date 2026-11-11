@@ -276,6 +276,16 @@ pub fn local_fit(
     rng: &mut Lcg,
 ) -> LocalFit {
     let mut a = adapter.clone();
+    // УЗЕЛ БЕЗ МАТЕРИАЛА (--net: присоединён по приглашению чужой эры,
+    // учителей-пар нет): 0-шагов, 0-дельта — сразу (иначе 0.0/0.0-деление
+    // шага градиента рождает NaN и портит долю узла).
+    if batch.is_empty() {
+        return LocalFit {
+            delta: vec![0.0; a.a.len() + a.b.len()],
+            raw_norm: 0.0,
+            steps: 0,
+        };
+    }
     for _ in 0..steps {
         let cur = ToyModel { base: base.clone(), adapter: a.clone() };
         let [ga, gb] = cur.pref_grad(batch, lambda);
@@ -385,6 +395,24 @@ mod tests {
         let v = x.as_vec();
         assert_eq!(v.len(), LoRAAdapter::num_params());
         assert!(v.iter().all(|&f| f == 0.0));
+    }
+
+    /// УЗЕЛ БЕЗ МАТЕРИАЛА (--net: вошёл в чужую эру без учителей): пустой
+    /// батч обязан дать 0-дельту, 0-шагов и БЕЗ NaN (иначе доля узла
+    /// отравляет masked-сумму роя).
+    #[test]
+    fn local_fit_empty_batch_zero_delta() {
+        let base = ToyBase::from_seed(7);
+        let ad = LoRAAdapter::lora_init(42);
+        let mut rng = Lcg::new(2026);
+        let f = local_fit(&base, &ad, &[], 150, 0.05, 2.0, 3.0, 0.01, &mut rng);
+        assert_eq!(f.steps, 0, "пустой батч не должен крутить шагов");
+        assert_eq!(f.raw_norm, 0.0);
+        assert_eq!(f.delta.len(), LoRAAdapter::num_params());
+        assert!(
+            f.delta.iter().all(|&x| x == 0.0),
+            "дельта пустого узла не ноль и не NaN"
+        );
     }
 
     #[test]

@@ -333,7 +333,7 @@ pub mod swarm_net {
         era_audit, era_collect_and_vote, era_publish, era_report, EraReport, Node, NodeId,
         PeerBook, SimConfig,
     };
-    use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyModel};
+    use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyBase, ToyModel};
     use dinet_fl::toy_llm::toy_world::honesty_batch;
     use dinet_node::transport::{MeshTransport, Transport};
     use std::sync::Barrier;
@@ -774,6 +774,251 @@ pub mod swarm_net {
             mean_acc_end,
         })
     }
+
+    // ---------------------------------------------------------------------------
+    // ЭРЫ КЛИЕНТОВ НА СЕТЕВЫХ БАРАХ (--net): без std::sync::Barrier — фазы
+    // сшиваются барами EraBar поверх моста (CH_BARRIER). Минёр стартует эры
+    // сам; прочие ждут приглашения (бар фазы 0) и входят в эру.
+    // ---------------------------------------------------------------------------
+    
+    /// Дождаться приглашения эры: бар фазы 0 ЧУЖОГО узла. Бары копятся в
+    /// энергонезависимом Node.bars (канал lossy) — приглашение не теряется,
+    /// даже если его промахнулись, пока узел был в предыдущей эре. Ждёт
+    /// эру СТРОГО НОВЕЕ `done` (None — любое). Возврат: (эра, минёр).
+    pub fn wait_invite(
+        mine: &mut [Node],
+        roster: &[NodeId],
+        bridge: &mut dyn Transport,
+        done: Option<u32>,
+    ) -> (u32, NodeId) {
+        use dinet_node::swarm::bar_absorb;
+        use dinet_node::transport::CH_BARRIER;
+        for _ in 0..200 {
+            let wire = bridge.collect(CH_BARRIER, mine[0].id);
+            bar_absorb(&mut mine[0], &roster, wire);
+            // самое старое НОВОЕ приглашение в накопителе
+            let invite = mine[0]
+                .bars
+                .iter()
+                .filter(|((n, m, p), v)| {
+                    *p == 0 && *m != mine[0].id && done.map_or(true, |d| *n > d) && !v.is_empty()
+                })
+                .map(|((n, m, _), _)| (*n, *m))
+                .min();
+            if let Some((n, m)) = invite {
+                return (n, m);
+            }
+            settled(60);
+        }
+        panic!("приглашение эры не приехало за 200 тиков (после {done:?})");
+    }
+
+    
+    /// Один клиент-узел на сетевых барах: состав волной, дальше фазовый ход
+    /// `run_net_era`. `empty` — узел БЕЗ материала (пустой журнал): он входит
+    /// по приглашению и отдает 0-дельту (маски его пар отменятся контуром).
+    struct NetBarOut {
+        id: u16,
+        roster: Vec<NodeId>,
+        /// каноны реестра (encode_record) узла
+        records: Vec<Vec<u8>>,
+        adapter: LoRAAdapter,
+    }
+    
+    fn netbar_worker(
+        id: u16,
+        mut bridge: GossipBridge,
+        eras: u32,
+        cfg: SimConfig,
+        seed: u64,
+        batchmaker: &BatchMaker,
+        empty: bool,
+        reg_path: &std::path::Path,
+    ) -> NetBarOut {
+        use dinet_node::swarm::run_net_era;
+        use dinet_registry::{encode_record, RegistryLog};
+    
+        let mut mine = vec![Node::new(id, 7, false)];
+        let mut book = PeerBook::empty();
+    
+        // --- СОСТАВ: волна заявок до тишины (та же, что у client_worker)
+        let mut quiet = 0u32;
+        for _ in 0..60 {
+            roster_announce(&mut mine[0], &mut bridge);
+            settled(70);
+            let fresh = roster_listen(&mut mine[0], &mut book, &mut bridge);
+            if fresh == 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            if quiet >= 5 {
+                break;
+            }
+        }
+        let roster = roster_now(id, &book);
+        mine[0].book = std::mem::take(&mut book); // фазы/приглашения декодят книгой узла
+    
+        // --- реестр клиента на диске (кворум печатей от состава волны)
+        let mut reg = RegistryLog::open(
+            reg_path,
+            dinet_node::registry_phase::notary_min(roster.len()),
+        )
+        .expect("реестр клиента открыт");
+    
+        let mut journal: Vec<Sample> = Vec::new();
+        mine[0].batch_override = Some(journal.clone());
+        // самая старая выполненная эра узла (joiner ждёт приглашения новее)
+        let mut done: Option<u32> = None;
+    
+        for era in 0..eras {
+            // материал: узел копит журнал тем же темпом, что client_worker;
+            // пустой узел несёт 0-журнал всегда (0-дельта)
+            if !empty {
+                journal.extend(batchmaker(id, era));
+                mine[0].batch_override = Some(journal.clone());
+            }
+            // минёр (id 0) стартует эры сам; прочие ждут приглашения
+            let (era_n, miner) = if id == 0 {
+                (era, 0)
+            } else {
+                wait_invite(&mut mine, &roster, &mut bridge, done)
+            };
+            let _rep = run_net_era(&mut mine, &roster, &mut bridge, era_n, miner, &cfg, seed, &mut reg);
+            done = Some(done.map_or(era_n, |d| d.max(era_n)));
+        }
+    
+        NetBarOut {
+            id,
+            roster,
+            records: reg.entries().iter().map(encode_record).collect(),
+            adapter: mine.pop().expect("узел").adapter,
+        }
+    }
+    
+    /// Результат сетевого клиент-роя на сетевых барах.
+    pub struct NetBarRun {
+        /// состав каждого узла — волна дала один список у всех
+        pub rosters: Vec<Vec<NodeId>>,
+        /// каноны реестров (encode_record) — бит-в-бит равны
+        pub ledgers: Vec<Vec<Vec<u8>>>,
+        /// итоговые адаптеры (реплики сошлись, включая узел без материала)
+        pub adapters: Vec<LoRAAdapter>,
+        pub mean_acc_start: f32,
+        pub mean_acc_end: f32,
+    }
+    
+    /// Драйвер: n сетевых клиентов прогоняют клиент-эры на СЕТЕВЫХ барах
+    /// (никакого общего барьера-нити). Минёр — id 0; последний узел БЕЗ
+    /// материала (0-дельта по приглашению). Инварианты проверяются Err-ом:
+    /// состав един, реестры бит-в-бит, реплики сошлись (и у пустого узла).
+    pub fn run_client_eras_netbar(
+        n: usize,
+        eras: u32,
+        reveal_every: u32,
+        batchmaker: BatchMaker,
+        log: bool,
+    ) -> Result<NetBarRun, String> {
+        if n < 3 {
+            return Err("рою нужны ≥3 клиента: ниже кворум не держится".into());
+        }
+        let cfg = SimConfig { reveal_every, ..SimConfig::default() };
+    
+        // мосты: каждый узел = свой ключ (seed [id;32]) на настоящем TCP
+        let mut bridges = Vec::new();
+        for id in 0..n as u16 {
+            bridges.push(GossipBridge::spawn(id, [id as u8; 32]).map_err(|e| format!("узел {id}: {e}"))?);
+        }
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    let a = bridges[j].addr.clone().unwrap();
+                    bridges[i].dial(a);
+                }
+            }
+        }
+        settled(1600); // graft (gossipsub heartbeat идёт по всем темам)
+    
+        // реестры клиентов — свои файлы в свежем каталоге рана
+        let run_dir =
+            std::env::temp_dir().join(format!("dinet-netbar-{}-{n}x{eras}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).map_err(|e| format!("реестр-каталог: {e}"))?;
+    
+        let (tx, rx) = std_mpsc::channel::<NetBarOut>();
+        let mut joins = Vec::new();
+        for id in 0..n as u16 {
+            let bm = batchmaker.clone();
+            let txc = tx.clone();
+            let reg_path = run_dir.join(format!("r{id}.dlog"));
+            let bridge = bridges.remove(0);
+            let cfg2 = cfg.clone();
+            let empty = usize::from(id) + 1 == n; // последний — без материала
+            joins.push(std::thread::spawn(move || {
+                let out = netbar_worker(id, bridge, eras, cfg2, 2026, &bm, empty, &reg_path);
+                let _ = txc.send(out);
+            }));
+        }
+        let mut outs = Vec::new();
+        for _ in 0..n {
+            outs.push(
+                rx.recv_timeout(std::time::Duration::from_secs(75))
+                    .map_err(|_| "узел не отчитался за 75с (воркер паникнул/завис?)".to_string())?,
+            );
+        }
+        for join in joins {
+            let _ = join.join();
+        }
+        outs.sort_by_key(|o| o.id);
+    
+        // Состав: волна дала один отсортированный список у всех
+        let want: Vec<NodeId> = (0..n as u16).collect();
+        for o in &outs {
+            if o.roster != want {
+                return Err(format!("узел {}: состав {:?} ≠ ожидаемого {want:?}", o.id, o.roster));
+            }
+        }
+        // Реестры: одна цепочка бит-в-бит, длина = reveal-эрам
+        let records0 = outs[0].records.clone();
+        for o in &outs {
+            if o.records != records0 {
+                return Err(format!("узел {}: реестр ≠ узла 0", o.id));
+            }
+        }
+        let reveal_count = (0..eras).filter(|e| (*e + 1) % cfg.reveal_every == 0).count();
+        if records0.len() != reveal_count {
+            return Err(format!("реестр: {} записей, ожидалось {reveal_count}", records0.len()));
+        }
+        // Реплики: сошлись (включая узел без материала)
+        let first = fx_bytes(&outs[0].adapter);
+        for o in &outs {
+            if fx_bytes(&o.adapter) != first {
+                return Err(format!("узел {}: реплика разошлась", o.id));
+            }
+        }
+    
+        let eval = honesty_batch(cfg.eval_size, 999_999);
+        let base = ToyBase::from_seed(7);
+        let acc = |a: &LoRAAdapter| {
+            dinet_node::swarm::accuracy(&ToyModel { base: base.clone(), adapter: a.clone() }, &eval)
+        };
+        let mean_acc_start = acc(&LoRAAdapter::lora_init(42));
+        let mean_acc_end = outs.iter().map(|o| acc(&o.adapter)).sum::<f32>() / n as f32;
+        if log {
+            eprintln!(
+                "сетевой клиент-рой на барах: {n} узлов × {eras} эр, mean acc \
+                 {mean_acc_start:.3}→{mean_acc_end:.3} (без барьера-нити)"
+            );
+        }
+    
+        Ok(NetBarRun {
+            rosters: outs.iter().map(|o| o.roster.clone()).collect(),
+            ledgers: outs.iter().map(|o| o.records.clone()).collect(),
+            adapters: outs.iter().map(|o| o.adapter.clone()).collect(),
+            mean_acc_start,
+            mean_acc_end,
+        })
+    }
 }
 
 use std::sync::mpsc as std_mpsc;
@@ -843,7 +1088,7 @@ pub struct GossipBridge {
     pub addr: Option<Multiaddr>,
 }
 
-const CH_N: usize = 10; // SHARES..CH_LAZY (0..9): мост маршрутизирует все каналы
+const CH_N: usize = 11; // SHARES..CH_BARRIER (0..10): мост маршрутизирует все каналы
 const TOPIC_BASE: &str = "dinet/v0";
 
 impl GossipBridge {
@@ -1139,6 +1384,51 @@ mod tests {
         assert!(
             run.ledgers.iter().all(|l| l.is_empty()),
             "masked-only рой не пишет реестр"
+        );
+    }
+
+    /// ПРОВЕРКА МАРШРУТА: канал 10 (CH_BARRIER) действительно летит между
+    /// мостами (без эр/узла — только транспорт).
+    #[test]
+    fn p2p_channel10_routes_between_bridges() {
+        use dinet_node::transport::Transport as _;
+        let mut b0 = GossipBridge::spawn(0, [0u8; 32]).expect("мост 0");
+        let mut b1 = GossipBridge::spawn(1, [1u8; 32]).expect("мост 1");
+        let a1 = b1.addr.clone().unwrap();
+        b0.dial(a1);
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let frame = signed_frame_bytes(
+            &Ed25519Signer::from_seed(&[0u8; 32]),
+            dinet_proto::MsgType::EraBar,
+            dinet_proto::Payload::EraBar { era_id: [7u8; 32], phase: 0 },
+        )
+        .expect("кадр");
+        b0.send(10, 0, None, &frame);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let got = b1.collect(10, 1);
+        assert!(!got.is_empty(), "бар канала 10 не долетел до пира");
+    }
+
+    /// --net НА СЕТЕВЫХ БАРАХ: никакого OS-барьера. Минёр (id 0) стартует
+    /// эры сам; прочие ждут приглашения (бар фазы 0); узел id 2 БЕЗ
+    /// материала обязан войти и отдать 0-дельту (полный контур масок
+    /// отменяется у роя). Реестры бит-в-бит, реплики сошлись.
+    #[test]
+    fn p2p_net_era_no_os_barrier_invite_join() {
+        let bm: swarm_net::BatchMaker =
+            Arc::new(|id, era| honesty_batch(40, 5_000 + id as u64 * 97 + era as u64 * 131 + 409));
+        let run = swarm_net::run_client_eras_netbar(3, 4, 3, bm, true)
+            .expect("клиент-эры на сетевых барах");
+        for r in &run.rosters {
+            assert_eq!(r, &vec![0, 1, 2], "состав не сошёлся");
+        }
+        assert!(run.ledgers.iter().all(|l| l.len() == 1), "один reveal — одна запись");
+        assert!(run.mean_acc_end >= 0.3, "рой обязан учиться",);
+        assert!(
+            run.mean_acc_end >= run.mean_acc_start,
+            "точность не деградировал: {} → {}",
+            run.mean_acc_start,
+            run.mean_acc_end
         );
     }
 }

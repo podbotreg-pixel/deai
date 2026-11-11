@@ -25,7 +25,7 @@
 //! машине.
 
 use crate::registry_phase::notary_min;
-use crate::swarm::{peer_book_ids, sign_frame, Node, NodeId};
+use crate::swarm::{book_back, book_take, sign_frame, Node, NodeId};
 use crate::transport::{CH_ANCHOR, Transport};
 use dinet_proto::{Frame, MsgType, Payload};
 
@@ -212,8 +212,11 @@ pub fn anchors_seal(
         }
     }
 
-    // 2) анкоры: принять штампы, сверить подписи РОЯ, ловить кворум
-    let book = peer_book_ids(all_ids);
+    // 2) анкоры: принять штампы, сверить подписи РОЯ, ловить кворум.
+    //    Книга: своя у v1-клиента (TOFU-волна), sim-вывод из id у пустой
+    //    (Box<dyn Verifier> не клонируется — перенос book_take/back).
+    let Some(first) = mine.first_mut() else { return vec![0; anchors.len()] };
+    let (book, was_own) = book_take(first, all_ids);
     let mut out = vec![0usize; anchors.len()];
     for (ai, a) in anchors.iter_mut().enumerate() {
         let aid = anchor_ids[ai];
@@ -228,6 +231,9 @@ pub fn anchors_seal(
             a.seal_stamp(head_seq, head_id, &f.sender, min);
         }
         out[ai] = a.commit_ready(min);
+    }
+    if let Some(n) = mine.first_mut() {
+        book_back(n, book, was_own);
     }
     out
 }
@@ -245,7 +251,10 @@ pub fn anchors_bonded(
     let anchor_ids: Vec<NodeId> = (0..anchors.len())
         .map(|i| all_ids.len() as NodeId + i as NodeId)
         .collect();
-    let book = peer_book_ids(all_ids); // рой-пуб-ключ → NodeId (адрес ответа)
+    // рой-пуб-ключ → NodeId (адрес ответа): своя книга v1-клиента или
+    // sim-вывод из id (Box<dyn Verifier> не клонируется — перенос)
+    let Some(first) = mine.first_mut() else { return vec![None; mine.len()] };
+    let (book, was_own) = book_take(first, all_ids);
 
     // 1) все узлы спрашивают (прямо каждому анкору)
     for idx in 0..mine.len() {
@@ -309,6 +318,9 @@ pub fn anchors_bonded(
         if let Some(((seq, id), _)) = best {
             bonds[idx] = Some(AnchorBond { seq, head_id: id });
         }
+    }
+    if let Some(n) = mine.first_mut() {
+        book_back(n, book, was_own);
     }
     bonds
 }

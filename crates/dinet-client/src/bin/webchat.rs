@@ -292,6 +292,12 @@ struct ChatState {
     /// LoRA-РЕЛЕЙ (общая память роя): чужих адаптеров собрано целиком.
     #[cfg(feature = "p2p")]
     lora_count: AtomicU64,
+    /// --net: эры роя идут СЕТЕВОГО моста (мой узел = один процессор эр);
+    /// inline-эры (teach/фон) отключены — материал копится для сетевой эры.
+    net_on: bool,
+    /// сетевых эр клиент участвовал/провёл (для /api/stats).
+    #[cfg(feature = "p2p")]
+    net_eras: AtomicU64,
 }
 
 fn now_ts() -> u64 {
@@ -392,9 +398,10 @@ fn bg_trainer(st: Arc<ChatState>, node_seed: [u8; 32]) {
             e.valid.len() - before
         };
 
-        // 3) эра по таймеру (без пользователя)
+        // 3) эра по таймеру (без пользователя); при --net материал ждёт
+        //    СЕТЕВОЙ эры (нить net-eras) — inline-эра выключена
         let ticks = st.bg_ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        if fresh > 0 {
+        if fresh > 0 && !st.net_on {
             era_tick(&st.era);
         }
         if new_exp > 0 || fresh > 0 {
@@ -954,7 +961,7 @@ fn web_feed(st: Arc<ChatState>, web_sgn: Ed25519Signer) {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "p2p")]
-fn p2p_info_thread(st: Arc<ChatState>, node_seed: [u8; 32], mut bridge: dinet_p2p::GossipBridge) {
+fn p2p_info_thread(st: Arc<ChatState>, node_seed: [u8; 32], mut bridge: dinet_p2p::GossipLink) {
     use dinet_client::infosync::{info_exchange_tick, InfoExchangeState};
 
     let key = Ed25519Signer::from_seed(&node_seed);
@@ -1058,6 +1065,186 @@ fn p2p_lora_thread(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// СЕТЕВЫЕ ЭРЫ (--net, M2): мой узел — равный процессор эр роя
+// ---------------------------------------------------------------------------
+
+/// Состав через Hello-волну (v1-ключи, TOFU), реестр клиента на диске
+/// (файл-сиблинг `<dir>.roy-checkpoints.dlog`: dir у webchat — файл-сессия,
+/// сиблинги не конфликтуют), ход эр — барами EraBar через мост
+/// (единый путь `run_net_era`). Минёр — младший id состава: стартует
+/// эры, когда материал чата прирос на `every` пар; остальные ждут
+/// приглашение (бар фазы 0) и входят. REVEAL-эра печатает запись в
+/// реестр, чек-пойнт в реплику чата и рой-KV (переживает рестарт).
+#[cfg(feature = "p2p")]
+fn net_eras_thread(
+    st: Arc<ChatState>,
+    node_seed: [u8; 32],
+    mut bridge: dinet_p2p::GossipBridge,
+) {
+    use dinet_node::join::{roster_announce, roster_listen, roster_now};
+    use dinet_node::registry_phase::notary_min;
+    use dinet_node::swarm::{run_net_era, SimConfig};
+    use dinet_p2p::swarm_net::wait_invite;
+    use dinet_registry::RegistryLog;
+
+    let key = Ed25519Signer::from_seed(&node_seed);
+    let me = u16::from_be_bytes([key.pubkey()[0], key.pubkey()[1]]);
+    // v1-ключ узла, книга состава через волну (узел ждёт соседей молча)
+    let mut node = Node::new(me, 7, false);
+    node.signer = Box::new(Ed25519Signer::from_seed(&node_seed));
+    // Волна состава: до стыковки РОЯ (≥3 пиров — кворум сетевых эр) при
+    // тишине 1с; cap 2.5 мин — стартовавший первым узел НЕ умирает,
+    // пока dialed-соседи поднимутся. Каждый ход: анонс + накоп чужих.
+    let mut quiet = 0u32;
+    for _ in 0..1200 {
+        let mut book = std::mem::take(&mut node.book);
+        roster_announce(&mut node, &mut bridge);
+        std::thread::sleep(Duration::from_millis(100));
+        let fresh = roster_listen(&mut node, &mut book, &mut bridge);
+        node.book = book;
+        quiet = if fresh == 0 { quiet + 1 } else { 0 };
+        let roster_len = roster_now(me, &node.book).len();
+        if roster_len >= 3 && quiet >= 10 {
+            break; // состав стабилен и полон: все успели услышать друг друга
+        }
+        if quiet >= 1500 {
+            break;
+        }
+    }
+    let roster = {
+        let book = std::mem::take(&mut node.book);
+        let r = roster_now(me, &book);
+        node.book = book;
+        r
+    };
+    if roster.len() < 2 {
+        eprintln!("[net] узел {me}: соседей нет (состав {roster:?}) — эры ждут волны");
+        return;
+    }
+    if roster.len() < 3 {
+        eprintln!("[net] узел {me}: состав {roster:?} неполон (<3) — недосытый кворум вероятен");
+    }
+    let reg_path = st.dir.with_extension("roy-checkpoints.dlog");
+    let mut reg = match RegistryLog::open(&reg_path, notary_min(roster.len())) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[net] реестр {reg_path:?}: {e}");
+            return;
+        }
+    };
+    let roi_path = std::path::Path::new(&st.dir).with_extension("roi");
+    let mut kv_net = match KvStore::open(&roi_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[net] рой-KV {roi_path:?}: {e}");
+            return;
+        }
+    };
+    let eras0 = kv_net
+        .get("net:eras")
+        .and_then(|b| (b.len() == 4).then(|| u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .unwrap_or(0);
+    let minion = *roster.iter().min().expect("состав непуст");
+    let cfg = SimConfig::default();
+    println!(
+        "[net] узел {me}: состав {roster:?} (минёр {minion}), эр в счётчике {eras0}, реестр {:?} (нотариев ≥ {})",
+        reg_path.display(),
+        notary_min(roster.len())
+    );
+
+    // Материал — пары чата; эра — при приросте ≥ `every` пар. Счётчик
+    // viewed сбрасывается на «первую эру при непустом материале».
+    let mut seen = usize::MAX;
+    let mut eras_cur = eras0;
+    let mut mine = vec![node];
+    loop {
+        std::thread::sleep(Duration::from_secs(st.bg_secs.max(1)));
+        let now = st.era.lock().expect("era lock").valid.len();
+        if seen == usize::MAX {
+            seen = now.saturating_sub(st.every.max(1) as usize);
+        }
+        if now.saturating_sub(seen) < st.every.max(1) as usize {
+            continue;
+        }
+        seen = now;
+        let pairs = { st.era.lock().expect("era lock").valid.clone() };
+        if pairs.is_empty() {
+            continue;
+        }
+        mine[0].batch_override = Some(pairs_to_batch(&pairs));
+
+        // ход эры: минёр ведёт (нумерацию продолжает со счётчика KV —
+        // переживает рестарт), остальные входят по приглашению
+        let (era_n, miner) = if me == minion {
+            (eras_cur, minion)
+        } else {
+            // джойнер ждёт приглашение эры НОВЕЕ последней проведённой:
+            // eras_cur=0 → checked_sub=None («любое», иначе приглашение
+            // эры 0 фильтруется порогом Some(0) и нить зря паникует)
+            let invite = wait_invite(&mut mine, &roster, &mut bridge, eras_cur.checked_sub(1));
+            eras_cur = eras_cur.max(invite.0 + 1);
+            (invite.0, invite.1)
+        };
+        let r = run_net_era(&mut mine, &roster, &mut bridge, era_n, miner, &cfg, 2026, &mut reg);
+        if me == minion {
+            eras_cur = eras_cur.saturating_add(1);
+        }
+        let _ = kv_net.put("net:eras", &eras_cur.saturating_add(1).to_le_bytes());
+        st.net_eras.fetch_add(1, Ordering::Relaxed);
+        let reveal = r.checkpoint_id.is_some();
+        println!(
+            "[net-эра {era_n}] {} вклад {} пар, acc {:.3}→{:.3}{}",
+            if reveal { "REVEAL" } else { "masked" },
+            r.contributors,
+            r.accuracy_before,
+            r.accuracy_after,
+            if reveal {
+                format!(
+                    ", чек-пойнт {} — записей в реестре {} ({:?})",
+                    hex8(&r.checkpoint_id.expect("reveal")),
+                    reg.len(),
+                    reg_path.display()
+                )
+            } else {
+                String::new()
+            }
+        );
+        // реплика чата: адаптер узла — уже применён сетевой эрой к mine[0]
+        {
+            let mut e = st.era.lock().expect("era lock");
+            e.node.adapter = mine[0].adapter.clone();
+            e.eras = e.eras.max(era_n + 1);
+            if reveal {
+                e.cps += 1;
+                let ab: Vec<u8> = mine[0]
+                    .adapter
+                    .as_vec()
+                    .iter()
+                    .fold(Vec::new(), |mut v, x| {
+                        v.extend_from_slice(&x.to_le_bytes());
+                        v
+                    });
+                let eras = u64::from(e.eras);
+                let cps = u64::from(e.cps);
+                let _ = kv_net.put("рой:adapter", &ab);
+                let _ = kv_net.put("рой:cps", &cps.to_le_bytes());
+                let _ = kv_net.put("рой:eras", &eras.to_le_bytes());
+                println!(
+                    "[net-эра {era_n}] чек-пойнт {} ПРИМЕНЁН К ЧАТУ",
+                    hex8(&r.checkpoint_id.expect("reveal"))
+                );
+            }
+        }
+    }
+}
+
+/// Краткий hex чек-пойнта (первые 8 байт) для печатей.
+#[cfg(feature = "p2p")]
+fn hex8(b: &[u8]) -> String {
+    b.iter().take(8).map(|x| format!("{x:02x}")).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1413,9 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                     let pairs = e.valid.len();
                     drop(e);
                     drop(g);
-                    if pairs as u32 % st.every.max(1) == 0 {
+                    if pairs as u32 % st.every.max(1) == 0 && !st.net_on {
+                        // при --net эры идут СЕТЕВОГО моста (нить net-eras);
+                        // материал копится в e.valid — inline-эра выключена
                         era_tick(&st.era);
                     }
                     respond(out, "200 OK", "text/plain", &format!("пара #{idx} записана; обучающих: {pairs}"));
@@ -1315,12 +1504,17 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
             let lora_n = st.lora_count.load(Ordering::Relaxed);
             #[cfg(not(feature = "p2p"))]
             let lora_n = 0u64;
+            // --net: сколько сетевых эр клиент провёл/в которые вошёл
+            #[cfg(feature = "p2p")]
+            let net_n = st.net_eras.load(Ordering::Relaxed);
+            #[cfg(not(feature = "p2p"))]
+            let net_n = 0u64;
             respond(
                 out,
                 "200 OK",
                 "text/plain",
                 &format!(
-                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}&lorap={lora_n}&trainl={trainl}",
+                    "turns={turns}&pairs={pairs}&memory={mem}&teacher={}&eras={}&cps={}&acc={acc:.3}&model={model_name}&bg={bg_ticks}&info={info_n}&web={web_hits}&rules={rules_n}&qrs={quorum_n}&p2p={p2p_took}&lorap={lora_n}&trainl={trainl}&net={net_n}",
                     e.valid.len(),
                     e.eras,
                     e.cps,
@@ -1341,7 +1535,8 @@ fn main() {
     #[cfg(feature = "llama")]
     let mut train_secs = 0u64;
     let mut p2p_on = false;
-    let mut dial_addr: Option<String> = None;
+    let mut net_on = false;
+    let mut dial_addrs: Vec<String> = Vec::new();
     #[cfg(feature = "p2p")]
     let mut lora_secs = 3u64;
     #[cfg(feature = "llama")]
@@ -1353,7 +1548,12 @@ fn main() {
             "--bg" => bg_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
             "--web" => web_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--p2p" => p2p_on = true,
-            "--dial" => dial_addr = args.next(),
+            "--net" => net_on = true,
+            "--dial" => {
+                if let Some(v) = args.next().filter(|v| !v.is_empty()) {
+                    dial_addrs.push(v);
+                }
+            }
             #[cfg(feature = "p2p")]
             "--lora-share" => lora_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(3),
             #[cfg(feature = "llama")]
@@ -1490,6 +1690,9 @@ fn main() {
         dir: PathBuf::from(&dir),
         #[cfg(feature = "p2p")]
         lora_count: AtomicU64::new(0),
+        net_on,
+        #[cfg(feature = "p2p")]
+        net_eras: AtomicU64::new(0),
     });
     // ФОН (M2-1): дообучение по таймеру — поток живёт, пока жив клиент.
     let st_bg = Arc::clone(&st);
@@ -1520,46 +1723,66 @@ fn main() {
     // — прийти к уже запущенному узлу. Раз в bg-период: анонсы своих
     // записей, аски отсутствующих, тела, приём с проверкой автора.
     #[cfg(feature = "p2p")]
-    if p2p_on {
+    if p2p_on || net_on {
         // мост — ОДИН на узел (один TCP-сварм); нитям отдаём раздельные
-        // ручки: infosync (CH_INFO) и LoRA-релей (CH_BLOB) — очереди
-        // каналов раздельные, publication/collect не мешают.
+        // ручки: infosync/LoRA — ссылки без loopback (свой кадр читают
+        // из сети), СЕТЕВЫЕ ЭРЫ (--net) — сам мост (loopback печатейagit).
         match dinet_p2p::GossipBridge::spawn(node_id, node_seed) {
             Err(e) => eprintln!("[p2p] мост не поднялся: {e}"),
             Ok(bridge) => {
                 if let Some(addr) = &bridge.addr {
                     println!(
                         "[p2p] мост узла {node_id} слушает {addr}{}",
-                        dial_addr.as_ref().map(|d| format!(", dial {d}")).unwrap_or_default()
+                        if dial_addrs.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", dial {}", dial_addrs.join(", "))
+                        }
                     );
                 }
-                if let Some(d) = dial_addr.clone() {
+                for d in &dial_addrs {
                     match d.parse() {
                         Ok(a) => bridge.dial(a),
-                        Err(e) => eprintln!("[p2p] dial некорректен: {e}"),
+                        Err(e) => eprintln!("[p2p] dial {d} некорректен: {e}"),
                     }
                 }
-                let st_p2p = Arc::clone(&st);
                 let link = bridge.link();
-                std::thread::Builder::new()
-                    .name("info-p2p".into())
-                    .spawn(move || p2p_info_thread(st_p2p, node_seed, bridge))
-                    .expect("p2p thread");
-                // LoRA-релей: свой период (--lora-share, 0 = выкл);
-                // узел без --model тоже участвует (сид/релей чужого).
-                if lora_secs > 0 {
-                    println!("lora-релей: раз в {lora_secs} сек — {dir}.lora.gguf ↔ торрент роя");
-                    let st_lora = Arc::clone(&st);
+                if p2p_on {
+                    let st_p2p = Arc::clone(&st);
                     std::thread::Builder::new()
-                        .name("lora-p2p".into())
-                        .spawn(move || p2p_lora_thread(st_lora, link, node_seed, lora_secs))
-                        .expect("lora thread");
+                        .name("info-p2p".into())
+                        .spawn(move || p2p_info_thread(st_p2p, node_seed, link))
+                        .expect("p2p thread");
+                    // LoRA-релей: свой период (--lora-share, 0 = выкл);
+                    // узел без --model тоже участвует (сид/релей чужого).
+                    if lora_secs > 0 {
+                        println!("lora-релей: раз в {lora_secs} сек — {dir}.lora.gguf ↔ торрент роя");
+                        let st_lora = Arc::clone(&st);
+                        let link2 = bridge.link();
+                        std::thread::Builder::new()
+                            .name("lora-p2p".into())
+                            .spawn(move || p2p_lora_thread(st_lora, link2, node_seed, lora_secs))
+                            .expect("lora thread");
+                    }
+                }
+                // СЕТЕВЫЕ ЭРЫ (--net): мой узел — равный процессор эр роя.
+                if net_on {
+                    let st_net = Arc::clone(&st);
+                    std::thread::Builder::new()
+                        .name("net-eras".into())
+                        .spawn(move || net_eras_thread(st_net, node_seed, bridge))
+                        .expect("net thread");
                 }
             }
         }
     }
     #[cfg(not(feature = "p2p"))]
-    let _ = (p2p_on, dial_addr);
+    {
+        if net_on {
+            eprintln!("--net недоступен: клиент собран без фичи p2p (cargo build --features p2p)");
+        }
+        let _ = (p2p_on, dial_addrs);
+    }
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {

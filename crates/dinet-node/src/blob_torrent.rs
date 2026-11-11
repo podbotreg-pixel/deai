@@ -17,7 +17,7 @@
 //! (SHA-256 пре-имидж). «Отравленный» склад узла просто не совпадает
 //! по id — такой узел молчит.
 
-use crate::swarm::{decode_frames, peer_book_ids, sign_frame, Node, NodeId};
+use crate::swarm::{decode_with_book, sign_frame, Node, NodeId};
 use crate::transport::{CH_BLOB, Transport};
 use dinet_proto::{MsgType, Payload};
 use dinet_registry::{DeltaManifest, RegistryLog, DEFAULT_CHUNK_LEN};
@@ -223,9 +223,8 @@ pub fn torrent_blobs(
         for idx in 0..mine.len() {
             let me = mine[idx].id;
             let Some(t) = target[idx] else { continue };
-            let book = peer_book_ids(all_ids);
             let wire = transport.collect(CH_BLOB, mine[idx].id);
-            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            let payloads = decode_with_book(&mut mine[idx], all_ids, wire);
             for (nid, pl) in payloads {
                 if nid == me {
                     continue; // loopback своей публикации

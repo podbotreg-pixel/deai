@@ -23,6 +23,7 @@ dinet-p2p = { path = "../dinet-p2p", optional = true }
 
 [features]
 llama = ["dep:dinet-llama"]
+# dinet-registry — общий dep (не optional): реестр клиента нужен и без p2p
 p2p = ["dep:dinet-p2p"]
 
 [[bin]]

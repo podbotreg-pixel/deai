@@ -170,10 +170,10 @@ pub fn hello_join(
 // ---------------------------------------------------------------------------
 // Консенсус состава (v0-M2): взаимная Hello-волна + самосертификация id.
 // Состав роя — отсортированный набор объявленных NodeId. Заявка
-// самосертифицируется: кадр подписан собственным ключом, и pk(seed[id])
-// == sender — чужой id под своим ключом не пройдёт (id выводится из
-// ключей sim-вывода; v1 — настоящие ключи клиентов: заявка обязана
-// совпадать с владельцем ключа, правила сверки те же).
+// самосертифицируется: кадр подписан собственным ключом, и ОДНА из
+// схем вывода id сходится — либо sim (pk(seed[id]) == sender), либо
+// v1 webchat (id = две первые байта pubkey). Чужой id под своим
+// ключом не пройдёт ни одной: владелец ключа обязан быть владельцем id.
 // ---------------------------------------------------------------------------
 
 /// PK, который sim-узел `id` получит из seed `[id;32]` (тот же вывод, что
@@ -218,7 +218,13 @@ pub fn roster_listen(
             continue;
         };
         if f.sender == me {
-            continue; // свой loopback: id себя знаю и без волны
+            // свой loopback: id себя знаю и без волны, НО в книгу заносим —
+            // фазы эр проверяют loopback-кадры СВОЕЙ книгой (мост отражает
+            // собственные публикации подписке узла)
+            if !book.knows(&f.sender) {
+                book.enroll(f.sender, Some(node.id));
+            }
+            continue;
         }
         let body = match f.encode_payload() {
             Ok(b) => b,
@@ -238,8 +244,16 @@ pub fn roster_listen(
                 continue;
             }
         };
-        // подпись ТОЛЬКО ключом sender + самосертификация заявленного id
-        if !ver.verify(&body, &f.sig) || pk_of_nid(*port) != f.sender {
+        // подпись ТОЛЬКО ключом sender; id самосертифицируется ОДНОЙ из
+        // двух схем вывода (обе бракуют чужой id под чужим ключом):
+        // sim — pk(seed[id]) == sender-ключ; v1 webchat — id = be16(pub[0..2])
+        if !ver.verify(&body, &f.sig) {
+            node.rejected_frames += 1;
+            continue;
+        }
+        let selfcert =
+            pk_of_nid(*port) == f.sender || u16::from_be_bytes([f.sender[0], f.sender[1]]) == *port;
+        if !selfcert {
             node.rejected_frames += 1; // чужой id под своим ключом: брак
             continue;
         }
@@ -449,5 +463,29 @@ mod tests {
         roster_announce(&mut honest, &mut mesh);
         assert_eq!(roster_listen(&mut listener, &mut book, &mut mesh), 1);
         assert_eq!(roster_now(0, &book), vec![0, 3]);
+    }
+
+    /// v1-ВЫВОД id: ключ СГЕНЕРИРОВАН от энтропии ОС (не sim-вывод из id),
+    /// id = две первые байты pubkey — волна самосертифицирует такой вывод
+    /// (правило webchat --net) и заносит отправителя с РОЕВЫМ адресом id.
+    #[test]
+    fn roster_accepts_v1_derived_id() {
+        let mut listener = SwarmNode::new(0, 7, false);
+        let mut book = PeerBook::empty();
+        let mut mesh = MeshTransport::new(2);
+
+        // v1-клиент: приватный ключ случайный, id вывел владелец ключа
+        let mut v1 = SwarmNode::new(0, 7, false);
+        v1.signer = Box::new(Ed25519Signer::generate().expect("генерация"));
+        let pk = v1.signer.pubkey();
+        let id = u16::from_be_bytes([pk[0], pk[1]]);
+        v1.id = id;
+        roster_announce(&mut v1, &mut mesh);
+
+        let fresh = roster_listen(&mut listener, &mut book, &mut mesh);
+        assert_eq!(fresh, 1, "v1-вывод id не самосертифицировался");
+        assert!(book.knows(&pk), "ключ v1-узла не в книге");
+        // роевой адрес заявленного id известен книге (адрес ответа)
+        assert_eq!(book.nid_by_sender.get(&pk), Some(&id));
     }
 }

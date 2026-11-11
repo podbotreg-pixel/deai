@@ -21,7 +21,7 @@
 //! 4. все collect → тело проверяется (id == sha256(canon), подпись
 //!    автора) и только тогда ставится в InfoStore.
 
-use crate::swarm::{decode_frames, peer_book_ids, sign_frame, Node, NodeId};
+use crate::swarm::{decode_with_book, sign_frame, Node, NodeId};
 use crate::transport::{CH_INFO, Transport};
 use dinet_crypto::Verifier;
 use dinet_proto::{MsgType, Payload};
@@ -430,9 +430,8 @@ pub fn infosphere_sync(
     //    себя absent-id по источникам; затем ВСЕ разом шлют asks
     let mut ask_bufs: Vec<Vec<(NodeId, Vec<[u8; 32]>)>> = (0..mine.len()).map(|_| Vec::new()).collect();
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let wire = transport.collect(CH_INFO, mine[idx].id);
-        let frames = decode_frames(&mut mine[idx], &book, wire);
+        let frames = decode_with_book(&mut mine[idx], all_ids, wire);
         let me = mine[idx].id;
         for (nid, pl) in frames {
             if nid == me {
@@ -464,9 +463,8 @@ pub fn infosphere_sync(
     let mut body_bufs: Vec<Vec<(NodeId, Vec<[u8; 32]>)>> =
         (0..mine.len()).map(|_| Vec::new()).collect();
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let wire = transport.collect(CH_INFO, mine[idx].id);
-        let frames = decode_frames(&mut mine[idx], &book, wire);
+        let frames = decode_with_book(&mut mine[idx], all_ids, wire);
         let me = mine[idx].id;
         for (nid, pl) in frames {
             if nid == me {
@@ -503,9 +501,8 @@ pub fn infosphere_sync(
         .map(|idx| InfoSyncReport { known: knowns[idx], learned: 0 })
         .collect::<Vec<_>>();
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let wire = transport.collect(CH_INFO, mine[idx].id);
-        let frames = decode_frames(&mut mine[idx], &book, wire);
+        let frames = decode_with_book(&mut mine[idx], all_ids, wire);
         for (_nid, pl) in frames {
             if let Payload::InfoBody { info_id, kind, ts, author, sig, value } = pl {
                 let rec = InfoRec {

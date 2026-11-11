@@ -121,6 +121,8 @@ const T_INFO_VALUE: u8 = 47;
 const T_INFO_VLEN: u8 = 48;
 const T_INFO_SEALER: u8 = 49;
 const T_INFO_SEAL: u8 = 50;
+/// Сетевой барьер фазы: номер фазы эры (0 = приглашение к эре).
+const T_PHASE: u8 = 51;
 const T_DELTA: u8 = 31;
 const T_NORM: u8 = 32;
 
@@ -169,6 +171,9 @@ pub enum MsgType {
     InfoBody = 0x5B,
     /// инфосфера: со-подпись записи другим узлом (кворумная печать).
     InfoSeal = 0x5C,
+    /// Сетевой барьер фазы эры (--net: фазы многопроцессных клиентов
+    /// сшиваются волнами подписанных баров — общего барьера-нити нет).
+    EraBar = 0x5D,
 }
 
 impl MsgType {
@@ -202,6 +207,7 @@ impl MsgType {
             0x5A => MsgType::InfoAsk,
             0x5B => MsgType::InfoBody,
             0x5C => MsgType::InfoSeal,
+            0x5D => MsgType::EraBar,
             _ => return None,
         })
     }
@@ -273,6 +279,9 @@ pub enum Payload {
     /// инфосфера: со-подпись записи (кворумная печать инструкций).
     InfoSeal { info_id: [u8; 32], sealer: [u8; 32], seal: Vec<u8> },
     SkillShare { skill_hash: [u8; 32], abi_version: u16, body: Vec<u8> },
+    /// Сетевой барьер фазы эры: хэш эры + номер фазы (пересылается по
+    /// CH_BARRIER); подписан ключом узла, как любой wire-кадр.
+    EraBar { era_id: [u8; 32], phase: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,6 +460,10 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.b32(T_SHASH, skill_hash);
             e.num(T_ABI, *abi_version as u32);
             e.bytes(T_BODY, body);
+        }
+        Payload::EraBar { era_id, phase } => {
+            e.b32(T_ERA, era_id);
+            e.num(T_PHASE, *phase as u32);
         }
     }
     e.buf
@@ -743,6 +756,10 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             skill_hash: d.b32(T_SHASH)?,
             abi_version: d.u16(T_ABI)?,
             body: d.bytes(T_BODY, MAX_SKILL_SHARE_PAYLOAD)?,
+        }),
+        MsgType::EraBar => Ok(Payload::EraBar {
+            era_id: d.b32(T_ERA)?,
+            phase: d.u8(T_PHASE)?,
         }),
     }
 }

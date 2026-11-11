@@ -33,6 +33,9 @@ pub const CH_HELLO: u8 = 7;
 pub const CH_INFO: u8 = 8;
 /// Ротируемые роли v1.3: LazyAudit-вердикты аудиторов (E после D-аудита).
 pub const CH_LAZY: u8 = 9;
+/// Сетевой барьер фаз (--net: многопроцессные клиенты сшивают фазы
+/// волнами подписанных баров; общего барьера-нити у них нет).
+pub const CH_BARRIER: u8 = 10;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

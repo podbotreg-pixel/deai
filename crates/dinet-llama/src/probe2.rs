@@ -906,6 +906,12 @@ mod impl_probe2 {
         let tmp = std::env::temp_dir().join(format!("dinet-moves-{}.gguf", std::process::id()));
         dinet_train::save_adapter_pieces(&arch, &tmp, &[piece]).expect("adapter пишется");
         let with = eng.run_with_lora(&toks, &tmp).expect("проход с адаптером");
+        // Режим заготовки артефакта: DI_NET_ADAPTER_SAVE=<path> — копия
+        // тренир-адаптера остаётся (для lora_delta_parity_gated и webchat).
+        if let Ok(dst) = std::env::var("DI_NET_ADAPTER_SAVE") {
+            std::fs::copy(&tmp, &dst).expect("адаптер не метнулся");
+            eprintln!("адаптер сохранён в {dst}");
+        }
         let _ = std::fs::remove_file(&tmp);
 
         // позиция p предсказывает токен p+1: «ди» — ПОСЛЕДНЯЯ цель —

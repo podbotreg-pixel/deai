@@ -16,7 +16,7 @@
 
 use crate::blob_torrent::delta_f32_id;
 use crate::swarm::{
-    decode_frames, era_hash32, peer_book_ids, sign_frame, MidNode, Node, NodeId, SimConfig,
+    decode_with_book, era_hash32, sign_frame, MidNode, Node, NodeId, SimConfig,
 };
 use crate::transport::{CH_NOTARY, Transport};
 use dinet_crypto::Verifier;
@@ -138,7 +138,6 @@ pub fn era_notary_collect(
             continue;
         };
         let my_canon = my_entry.encode();
-        let book = peer_book_ids(all_ids);
         let min = notary_min(all_ids.len());
         // Печати распределены во времени (мост асинхронен) — копим до кворума
         // попытками: каждая попытка дрейнит канал, накопленное ЕСЛИ остаётся
@@ -147,7 +146,7 @@ pub fn era_notary_collect(
         let mut seals: Vec<Seal> = Vec::new();
         for attempt in 0..NOTARY_ATTEMPTS {
             let wire = transport.collect(CH_NOTARY, mine[idx].id);
-            let payloads = decode_frames(&mut mine[idx], &book, wire);
+            let payloads = decode_with_book(&mut mine[idx], all_ids, wire);
             for (_nid, pl) in payloads.iter() {
                 let Payload::NotarySeal { entry_bytes, seal_pubkey, seal_sig } = pl else {
                     mine[idx].rejected_frames += 1;
@@ -183,9 +182,10 @@ pub fn era_notary_collect(
                 }
                 seals.push(Seal { pubkey: pk, sig });
             }
-            if seals.len() >= min {
-                break;
-            }
+            // НЕ ПРОРЫВАЕМСЯ на кворуме: собрать ВСЁ окно. Кворумная
+            // запись «какие успели» даёт разные наборы печатей разным
+            // узлам (поздняя печать arrives после чьего-то append) —
+            // реестры расходятся. Полное окно делает наборы равными.
             if attempt + 1 < NOTARY_ATTEMPTS {
                 std::thread::sleep(std::time::Duration::from_millis(NOTARY_ATTEMPT_MS));
             }

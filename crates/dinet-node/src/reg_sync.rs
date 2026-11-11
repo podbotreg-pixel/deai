@@ -15,7 +15,7 @@
 //! первого сбоя, то остаётся (append-only монотонность), проваленный
 //! оффер дальше не читается.
 
-use crate::swarm::{decode_frames, peer_book_ids, sign_frame, Node, NodeId};
+use crate::swarm::{decode_with_book, sign_frame, Node, NodeId};
 use crate::transport::{CH_REG, Transport};
 use dinet_proto::{MsgType, Payload};
 use dinet_registry::{decode_record, encode_record, RegistryLog};
@@ -47,10 +47,9 @@ pub fn reg_sync(
     //    оффера в чужом inbox на этот момент), декод, разбор отдельно
     let mut frames: Vec<Vec<(NodeId, Payload)>> = (0..mine.len()).map(|_| Vec::new()).collect();
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let wire = transport.collect(CH_REG, mine[idx].id);
         let me = mine[idx].id;
-        frames[idx] = decode_frames(&mut mine[idx], &book, wire)
+        frames[idx] = decode_with_book(&mut mine[idx], all_ids, wire)
             .into_iter()
             .filter(|(nid, _)| *nid != me)
             .collect();
@@ -98,9 +97,8 @@ pub fn reg_sync(
     // 3) отставшие принимают приезжавшие офферы: append сам фильтрует
     //    подделки; поздние RegAsk больше никому не нужны
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let wire = transport.collect(CH_REG, mine[idx].id);
-        let payloads = decode_frames(&mut mine[idx], &book, wire);
+        let payloads = decode_with_book(&mut mine[idx], all_ids, wire);
         for (_nid, pl) in payloads {
             if let Payload::RegOffer { records } = pl {
                 accept_records(&mut mine[idx], &mut regs[idx], &records);

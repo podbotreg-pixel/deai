@@ -27,7 +27,9 @@ use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyBase, ToyModel};
 use dinet_fl::{krum_select, norm2, Lcg};
 use dinet_proto::{Frame, MsgType, Payload, SENDER_LEN};
 
+use crate::registry_phase::{era_notary_collect, era_notary_seal};
 use crate::transport::{Transport, CH_ANNOUNCE, CH_LAZY, CH_SHARES, CH_VOTES};
+use dinet_registry::RegistryLog;
 
 /// Сетевой мост асинхронен: сборы фаз ждут ожидаемый состав кадр-за-кадром
 /// (собранное остаётся, повторный collect достаёт поздних). Синхронные
@@ -102,6 +104,20 @@ pub struct Node {
     /// dinet_crypto::x25519_from_ed25519_seed). Sim-узлы оставляют None —
     /// ключи выводятся из id в peer_keys (см. peer_keys).
     pub x_sk: Option<dinet_crypto::X25519Key>,
+    /// КНИГА КЛЮЧЕЙ узла (v1: TOFU-волна состава --net заполняет реальными
+    /// pubkey, id = произвол владельца ключа, самосертированный роя-адрес).
+    /// Sim-узлы держат ПУСТУЮ — фазы тогда выводят книгу детерминировано
+    /// из id (peer_book_ids), прежнее поведение по умолчанию. Книга не
+    /// Clone (Box<dyn Verifier>) — на местах вызова decode переносится
+    /// std::mem::take'ом (см. decode_with_book).
+    pub book: PeerBook,
+    /// ПОСТОЯННЫЙ АККУМУЛЯТОР БАРОВ (эра, минёр, фаза) → кто отозвался.
+    /// Каналы lossy (любой collect сносит всё, что не совпало с текущим
+    /// (бар, фаза)) — накопитель делает бары ДОЛГОВЕЧНЫМИ: чужофазные
+    /// и чужоэрные бары переждают свой момент и достаются соседним фазам
+    /// и будущим приглашениям (иначе приглашение эры N теряется в хвосте
+    /// эры N-1, состав расходится). Чистится по завершении эры (run_net_era).
+    pub bars: BTreeMap<(u32, NodeId, u8), Vec<NodeId>>,
 }
 
 impl Node {
@@ -124,6 +140,8 @@ impl Node {
             // реальный клиент (webchat) перезаписывает из своего SEED;
             // sim — fallback-вывод из id в peer_keys
             x_sk: None,
+            book: PeerBook::empty(),
+            bars: BTreeMap::new(),
         }
     }
 
@@ -141,6 +159,7 @@ impl Node {
 
 /// PeerBook: sender (публичный ключ кадра) → проверка подписи.
 /// Только публичные ключи — чужих секретов узел не знает никогда.
+#[derive(Default)]
 pub struct PeerBook {
     pub(crate) verifiers: BTreeMap<[u8; SENDER_LEN], Box<dyn Verifier>>,
     /// sim-привязка pubkey → NodeId (v1: NodeId сам выводит из DID/DHT)
@@ -194,6 +213,213 @@ impl PeerBook {
     pub fn is_empty(&self) -> bool {
         self.verifiers.is_empty()
     }
+}
+
+/// decode по книге УЗЛА: у v1-клиента (--net webchat) своя книга
+/// (TOFU-волна состава), у sim-узла пустая → детерминированный вывод
+/// из id (peer_book_ids, прежнее поведение). Книга не Clone
+/// (Box<dyn Verifier>) — на время вызова переносится из/в узла
+/// std::mem::take'ом, после разбора вправляется на место строго та же.
+pub(crate) fn decode_with_book(
+    me: &mut Node,
+    all_ids: &[NodeId],
+    wire: Vec<Vec<u8>>,
+) -> Vec<(NodeId, Payload)> {
+    let saved = std::mem::take(&mut me.book);
+    if saved.is_empty() {
+        // sim: книга выводится из id, поле узла остаётся пустым (было так)
+        let book = peer_book_ids(all_ids);
+        decode_frames(me, &book, wire)
+    } else {
+        // v1: своя книга — на время разбора вынута, после вправлена
+        let book = saved;
+        let out = decode_frames(me, &book, wire);
+        me.book = book;
+        out
+    }
+}
+
+/// КНИГА узла для ручного разбора чужих кадров (вне decode_frames):
+/// своя у v1-клиента (TOFU-волна), sim-вывод из id у пустой. Возврат —
+/// (книга, была ли книга СВОЯ); `book_back` вправляет исходное обратно.
+/// Box<dyn Verifier> не клонируется — перенос на стеке, возврат строго.
+pub(crate) fn book_take(me: &mut Node, all_ids: &[NodeId]) -> (PeerBook, bool) {
+    let own = std::mem::take(&mut me.book);
+    if own.is_empty() {
+        (peer_book_ids(all_ids), false)
+    } else {
+        (own, true)
+    }
+}
+
+/// Вправить книгу узла после ручного разбора (парная к book_take):
+/// было СВОЁ — вернуть его; было ПУСТОЕ (sim-вывод) — не трогать вовсе:
+/// в поле мог успеть дописаться новый знакомый (roster-волна в том же
+/// потоке уже после take) — затирать его свежим пополнением нельзя.
+pub(crate) fn book_back(me: &mut Node, book: PeerBook, was_own: bool) {
+    if was_own {
+        me.book = book;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// СЕТЕВОЙ БАРЬЕР ФАЗЫ (--net): общий барьер-нити у многопроцессных
+// клиентов невозможен — фазы сшиваются волнами подписанных баров
+// (EraBar 0x5D поверх CH_BARRIER). GossipLink не даёт loopback —
+// СВОЙ голос вещающий узел считает прямо здесь (push себя).
+// ---------------------------------------------------------------------------
+
+/// Закодировать --net-бар: [u32 BE эра-номер][u16 BE минёр][0×26].
+/// Бар подписан ключом узла (кадр), состав самосертифицирован волной.
+pub fn era_bar_id(era: u32, miner: NodeId) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[..4].copy_from_slice(&era.to_be_bytes());
+    id[4..6].copy_from_slice(&miner.to_be_bytes());
+    id
+}
+
+/// Разбор --net-бара: (эра-номер, минёр); None — посторонние байты.
+pub fn era_bar_split(era_id: &[u8; 32]) -> Option<(u32, NodeId)> {
+    if era_id[6..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let n = u32::from_be_bytes([era_id[0], era_id[1], era_id[2], era_id[3]]);
+    let m = u16::from_be_bytes([era_id[4], era_id[5]]);
+    Some((n, m))
+}
+
+/// Бар ОДНОЙ ФАЗЫ (фаза 0 — приглашение к эре). Полного состава НЕ ждёт:
+/// приглашение должно ловиться и узлами БЕЗ материала (net_wait_bar).
+pub fn net_bar_one(
+    me: &mut Node,
+    transport: &mut dyn Transport,
+    era_id: [u8; 32],
+    phase: u8,
+) {
+    let frame = sign_frame(me, MsgType::EraBar, Payload::EraBar { era_id, phase });
+    transport.send(crate::transport::CH_BARRIER, me.id, None, &frame);
+}
+
+/// Полный барьер фазы: вещает СВОЙ бар (свой голос учтён — loopback нет)
+/// и копит бары прочих до полного состава (окна WIRE_ATTEMPTS).
+/// Возврат true — полный состав отдался этой фазе (иначе — идти с
+/// частичным: эра продолжается, кворумы фаз решают последние).
+pub fn net_bar(
+    me: &mut Node,
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era_id: [u8; 32],
+    phase: u8,
+) -> bool {
+    net_bar_one(me, transport, era_id, phase);
+    net_wait_bar(me, all_ids, transport, era_id, phase)
+}
+
+// ---------------------------------------------------------------------------
+// СЕТЕВАЯ ЭРА (--net): ход фаз А..F с сетевыми барами вместо общего
+// барьера-нити. Единый путь многопроцессного клиента: интернет-чат
+// `--net` и p2p-драйвер эр зовут один и тот же `run_net_era`.
+// Перед вызовом: состав settle'нут волной (книга узла заполнена), `era`
+// и `miner` — с бар-фазы-0 (собственное решение минёра или принятое
+// приглашение). cfg у всех участников ОДИН (reveal_every = ритм reveal).
+// ---------------------------------------------------------------------------
+
+/// Один сетевой узел проходит фазу эры целиком (в процессе ровно один
+/// узел); границами фаз вещает/копит бары. Фазам без разницы, минёр узел
+/// или вошедший: каждый отмечает своё участие барами, чужие бары той же
+/// (эта эра, эта фаза) лишь ускоряют сбор состава. Возврат — отчёт эры.
+pub fn run_net_era(
+    mine: &mut [Node],
+    roster: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    miner: NodeId,
+    cfg: &SimConfig,
+    seed: u64,
+    reg: &mut RegistryLog,
+) -> EraReport {
+    assert_eq!(mine.len(), 1, "сетевая эра многопроцессного клиента: 1 узел");
+    let bar_id = era_bar_id(era, miner);
+
+    // фаза 0: минёр вещает приглашение (при начале эры), вошедший просто
+    // отмечает участие — идемпотентно, лишний бар безвреден
+    net_bar(&mut mine[0], roster, transport, bar_id, 0);
+
+    // --- ФАЗА A: локальный fit + публикация доли
+    let _ = era_publish(mine, roster, transport, era, cfg, seed);
+    net_bar(&mut mine[0], roster, transport, bar_id, 1);
+
+    // --- ФАЗЫ B+C: сбор долей → скрининг → (reveal) голоса; (masked) роли
+    let mids = era_collect_and_vote(mine, roster, transport, era, cfg, None);
+    net_bar(&mut mine[0], roster, transport, bar_id, 2);
+
+    // --- ФАЗА D: кворум/анонс (reveal), AggCommit + LazyAudit (masked)
+    let mids = era_audit(mine, roster, transport, era, cfg, mids);
+    net_bar(&mut mine[0], roster, transport, bar_id, 3);
+
+    // --- ФАЗА E: отчёт (счётчики аудита дописываются в mids)
+    let mut mids = mids;
+    let mut reps = era_report(mine, roster, transport, era, cfg, &mut mids);
+    net_bar(&mut mine[0], roster, transport, bar_id, 4);
+
+    // --- ФАЗА F: печать reveal-эры в реестр клиента (шов между рассылкой
+    //     и сбором печатей держит бар: мост асинхронен)
+    if (era + 1) % cfg.reveal_every == 0 {
+        era_notary_seal(mine, roster, transport, era, cfg, &mids, std::slice::from_mut(reg));
+        net_bar(&mut mine[0], roster, transport, bar_id, 5);
+        era_notary_collect(mine, roster, transport, era, cfg, &mids, std::slice::from_mut(reg));
+    }
+    net_bar(&mut mine[0], roster, transport, bar_id, 6);
+    // Бар-дальнобойщик этой эры отработал: записи эры ≤ текущей ушли,
+    // будущие эры живут до их времени (накопитель не растёт).
+    mine[0].bars.retain(|(en, _, _), _| *en > era);
+    reps.pop().expect("фаза E всегда даёт отчёт своего узла")
+}
+
+/// ПРИЁМ барьера (вещать нельзя: узел без материала ждёт приглашения
+/// фазы 0 от минёра эры). Копит подписанные бары до полного состава;
+/// числа баров не накапливаются сквозь эры — каждая эра чистый счёт.
+pub fn net_wait_bar(
+    me: &mut Node,
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era_id: [u8; 32],
+    phase: u8,
+) -> bool {
+    let (n, m) = era_bar_split(&era_id).expect("бар-ключ от era_bar_id (эра, минёр)");
+    let want = all_ids.len().max(1);
+    for attempt in 0..WIRE_ATTEMPTS {
+        bar_absorb(me, all_ids, transport.collect(crate::transport::CH_BARRIER, me.id));
+        // свой голос учтён сам (GossipLink не отражает собственные кадры)
+        if bars_ready(me, n, m, phase, want) {
+            return true;
+        }
+        if attempt + 1 < WIRE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
+        }
+    }
+    bars_ready(me, n, m, phase, want)
+}
+
+/// Пополнить накопитель баров (БЕЗ потерь: любой увиденный бар остаётся
+/// в Node.bars — чужофазные и чужоэрные переждают свой момент: их достают
+/// соседние фазы и будущие приглашения; раньше дрейн их уничтожал).
+pub fn bar_absorb(me: &mut Node, all_ids: &[NodeId], wire: Vec<Vec<u8>>) {
+    for (nid, pl) in decode_with_book(me, all_ids, wire) {
+        if let Payload::EraBar { era_id, phase } = pl {
+            if let Some((en, em)) = era_bar_split(&era_id) {
+                let v = me.bars.entry((en, em, phase)).or_default();
+                if !v.contains(&nid) {
+                    v.push(nid);
+                }
+            }
+        }
+    }
+}
+
+/// Полный состав фазы (эра `n`, минёр `m`, фаза `phase`) в накопителе?
+fn bars_ready(me: &Node, n: u32, m: NodeId, phase: u8, want: usize) -> bool {
+    me.bars.get(&(n, m, phase)).map_or(false, |v| v.len() + 1 >= want)
 }
 
 /// PeerBook по узлам этого процесса (тесты).
@@ -317,7 +543,7 @@ pub(crate) fn sign_frame(node: &Node, mt: MsgType, payload: Payload) -> Vec<u8> 
 
 /// Разобрать входящие кадры: verify → Payload. Подделка = отбраковка.
 /// Возвращает (NodeId, payload); reject учитывается в me.rejected_frames.
-pub(crate) fn decode_frames(
+pub fn decode_frames(
     me: &mut Node,
     book: &PeerBook,
     wire: Vec<Vec<u8>>,
@@ -585,13 +811,12 @@ pub fn era_collect_and_vote(
     let ehash = era_hash32(era);
     let mut mids = Vec::with_capacity(mine.len());
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let mut payloads: Vec<(NodeId, Payload)> = Vec::new();
         // Мост асинхронен: копим вклады до полного состава (отобранные
         // остаются — повторные collect'ы достают только поздних).
         for attempt in 0..WIRE_ATTEMPTS {
             let wire = transport.collect(CH_SHARES, mine[idx].id);
-            payloads.extend(decode_frames(&mut mine[idx], &book, wire));
+            payloads.extend(decode_with_book(&mut mine[idx], all_ids, wire));
             let rel = payloads.iter().filter(|(_, p)| era_input(p, ehash, was_reveal)).count();
             if rel >= all_ids.len() {
                 break;
@@ -743,7 +968,6 @@ pub fn era_audit(
     // --- Фаза D
     for idx in 0..mine.len() {
         if was_reveal {
-            let book = peer_book_ids(all_ids);
             // Кворум учитывает только голоса за МОЙ кандидат эры (кадр
             // EvalVote не знает era_id — чек-пойнт-id даёт эпоху): заодно
             // отсекаются хвосты чужих голосов прошлых эр (FileSpool в
@@ -755,7 +979,7 @@ pub fn era_audit(
             // мост асинхронен: копим голоса до полного состава роя
             for attempt in 0..WIRE_ATTEMPTS {
                 let wire = transport.collect(CH_VOTES, mine[idx].id);
-                let payloads = decode_frames(&mut mine[idx], &book, wire);
+                let payloads = decode_with_book(&mut mine[idx], all_ids, wire);
                 for (_nid, pl) in payloads.iter() {
                     if let Payload::EvalVote { checkpoint_id, pass_at_k, .. } = pl {
                         if Some(checkpoint_id) == my_hash.as_ref() {
@@ -801,12 +1025,11 @@ pub fn era_audit(
         } else {
             // masked-эра: собрать AggCommit агрегатора; lazy-аудитор (10%)
             // ПЕРЕСЧИТЫВАЕТ masked-сумму из СВОИХ share'ов и выносит вердикт.
-            let book = peer_book_ids(all_ids);
             let mut agg_hash = None;
             // мост асинхронен: ждём AggCommit агрегатора ЭТОЙ эры
             for attempt in 0..WIRE_ATTEMPTS {
                 let wire = transport.collect(CH_VOTES, mine[idx].id);
-                let payloads = decode_frames(&mut mine[idx], &book, wire);
+                let payloads = decode_with_book(&mut mine[idx], all_ids, wire);
                 for (_nid, pl) in payloads.iter() {
                     if let Payload::AggCommit { era_id, agg_result_hash, .. } = pl {
                         if *era_id == ehash {
@@ -870,14 +1093,13 @@ pub fn era_report(
     // --- Фаза E: отчёт
     let mut reports = Vec::with_capacity(mine.len());
     for idx in 0..mine.len() {
-        let book = peer_book_ids(all_ids);
         let announcements_valid: Vec<[u8; 32]>;
         if was_reveal {
             // мост асинхронен: копим анонсы чек-пойнта до полного состава
             let mut announcements: Vec<[u8; 32]> = Vec::new();
             for attempt in 0..WIRE_ATTEMPTS {
                 let announces = transport.collect(CH_ANNOUNCE, mine[idx].id);
-                let payloads = decode_frames(&mut mine[idx], &book, announces);
+                let payloads = decode_with_book(&mut mine[idx], all_ids, announces);
                 for (_nid, pl) in payloads.iter() {
                     if let Payload::CheckpointAnnounce { id, era_id, .. } = pl {
                         if *era_id == ehash {
@@ -903,7 +1125,7 @@ pub fn era_report(
             // мост асинхронен: копим вердикты до полной панели аудиторов
             for attempt in 0..WIRE_ATTEMPTS {
                 let wire = transport.collect(CH_LAZY, mine[idx].id);
-                let payloads = decode_frames(&mut mine[idx], &book, wire);
+                let payloads = decode_with_book(&mut mine[idx], all_ids, wire);
                 for (_nid, pl) in payloads.iter() {
                     if let Payload::LazyAudit { checkpoint_id, verdict, .. } = pl {
                         if let Some(h) = mids[idx].agg_hash {
@@ -1032,24 +1254,42 @@ fn apply_delta(replica: LoRAAdapter, agg_delta: &[f32]) -> LoRAAdapter {
     out
 }
 
-/// X25519-ключи роя: sk — ЛИЧНЫЙ x_sk узла (v1: из ed25519-ключа, один
-/// личный ключ на всё; sim-узлы с None — fallback-вывод из id), pk пары —
+/// X25519-ключи роя: sk — ТОЛЬКО свой (x_sk реального клиента; маски пары
+/// вычисляет сам создатель, чужого sk он никогда не знает), pk пары —
 /// Монтгомери-конверсия Ed25519-pubkey (в кадре он уже летит как sender).
+/// Приоритет вывода: 1) real x_sk узла (v1-ключ webchat), 2) Ed25519-pubkey
+/// из КНИГИ узла (TOFU-волна состава --net) через x25519_pk_from_ed25519,
+/// 3) sim-вывод из id (книга пуста — прежнее поведение).
 fn peer_keys(
     all_ids: &[NodeId],
     reals: &[Node], // узлы с реальными личными ключами (клиенты роя)
 ) -> BTreeMap<NodeId, dinet_crypto::X25519Key> {
-    let real: BTreeMap<NodeId, &dinet_crypto::X25519Key> = reals
-        .iter()
-        .filter_map(|n| n.x_sk.as_ref().map(|k| (n.id, k)))
-        .collect();
+    let mut sk_own: BTreeMap<NodeId, dinet_crypto::X25519Key> = BTreeMap::new();
+    let mut pk_book: BTreeMap<NodeId, [u8; 32]> = BTreeMap::new();
+    for n in reals {
+        if let Some(k) = &n.x_sk {
+            sk_own.insert(n.id, k.clone());
+        }
+        // книги согласованы волной (каждая — весь состав): заносим только
+        // ещё неизвестных — первый написавший и остаётся
+        for (&pk_b, &nid) in n.book.nid_by_sender.iter() {
+            pk_book.entry(nid).or_insert(pk_b);
+        }
+    }
     all_ids
         .iter()
         .map(|&id| {
-            let k = real
-                .get(&id)
-                .map(|r| (*r).clone())
-                .unwrap_or_else(|| dinet_crypto::x25519_from_ed25519_seed(&[id as u8; 32]));
+            let k = if let Some(k) = sk_own.get(&id) {
+                k.clone()
+            } else if let Some(&ed) = pk_book.get(&id) {
+                // маска пары требует только pk чужого: DH(мой_sk, peer_pk)
+                match dinet_crypto::x25519_pk_from_ed25519(&ed) {
+                    Some(pk) => dinet_crypto::X25519Key { sk: [0u8; 32], pk },
+                    None => dinet_crypto::x25519_from_ed25519_seed(&[id as u8; 32]),
+                }
+            } else {
+                dinet_crypto::x25519_from_ed25519_seed(&[id as u8; 32])
+            };
             (id, k)
         })
         .collect()
@@ -1390,5 +1630,84 @@ mod tests {
             reps.iter().all(|r| r.checkpoint_id.is_some()),
             "1-node сеть не останавливается"
         );
+    }
+
+    /// Код --net-бара: эра-номер и минёр — бит-в-бит roundtrip; посторонние
+    /// байты в хвосте бракуются (бар с чужим payload не эра).
+    #[test]
+    fn era_bar_id_roundtrip() {
+        let id = era_bar_id(7, 9021);
+        assert_eq!(era_bar_split(&id), Some((7, 9021)));
+        let mut other = id;
+        other[20] = 1;
+        assert!(era_bar_split(&other).is_none(), "мусор в хвосте принят");
+        // нулевой номер и минёр-ноль допустимы
+        assert_eq!(era_bar_split(&era_bar_id(0, 0)), Some((0, 0)));
+    }
+
+    /// СЕТЬ-БАРЬЕР: три in-process узла синхронизируют фазу MeshTransport'ом.
+    /// В реальном рое узлы бегут параллельно (свой мост у каждого); в тесте
+    /// вещание всех — прежде ожиданий (последовательность тест-раннера).
+    /// Чужие эры/фазы не учитываются — счёт эры/фазы строгий.
+    #[test]
+    fn net_bar_full_roster_and_phase_filter() {
+        use crate::transport::MeshTransport;
+        let mut nodes: Vec<Node> = (0..3).map(|i| Node::new(i, 7, false)).collect();
+        let ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
+        let mut t = MeshTransport::new(3);
+        let era = era_bar_id(4, 2);
+        let other = era_bar_id(5, 0);
+
+        // ЧУЖАЯ эра баров не имеет: барьер пуст
+        let empty = net_wait_bar(&mut nodes[0], &ids, &mut t, other, 3);
+        assert!(!empty, "посторонняя эра не должна проходить барьер");
+
+        // полный состав фазы 3 эры 4: все вещают, все дожидаются
+        for n in nodes.iter_mut() {
+            net_bar_one(n, &mut t, era, 3);
+        }
+        let full = nodes
+            .iter_mut()
+            .map(|n| net_wait_bar(n, &ids, &mut t, era, 3))
+            .collect::<Vec<_>>();
+        assert_eq!(full, vec![true, true, true], "фаза не собрала состав");
+
+        // фаза 0 ДРУГОЙ эры: приглашение тоже проходит барьер полного состава
+        for n in nodes.iter_mut() {
+            net_bar_one(n, &mut t, other, 0);
+        }
+        let full = nodes
+            .iter_mut()
+            .map(|n| net_wait_bar(n, &ids, &mut t, other, 0))
+            .collect::<Vec<_>>();
+        assert_eq!(full, vec![true, true, true], "фаза 0 не собралась");
+
+        // фаза 1 эры 4 не приходит после сбора фазы 0 эры 5: счёт эры строгий
+        for n in nodes.iter_mut() {
+            net_bar_one(n, &mut t, other, 1);
+        }
+        let wrong = net_wait_bar(&mut nodes[0], &ids, &mut t, era, 0);
+        assert!(!wrong, "бары чужой эры текут в барьер прошлой");
+    }
+
+    /// Книга-вывод работает и НА БАРЬЕРАХ: бары подписаны sim-ключами,
+    /// decode_with_book выводит книгу из id (узел без книги — прежнее
+    /// поведение по умолчанию).
+    #[test]
+    fn net_bar_works_with_derived_sim_book() {
+        use crate::transport::MeshTransport;
+        let mut nodes: Vec<Node> = (0..2).map(|i| Node::new(i, 7, false)).collect();
+        let ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
+        assert!(nodes.iter().all(|n| n.book.is_empty()), "sim без книги");
+        let mut t = MeshTransport::new(2);
+        let era = era_bar_id(0, 0);
+        for n in nodes.iter_mut() {
+            net_bar_one(n, &mut t, era, 1);
+        }
+        let full = nodes
+            .iter_mut()
+            .map(|n| net_wait_bar(n, &ids, &mut t, era, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(full, vec![true, true], "sim-барьер сломан");
     }
 }
