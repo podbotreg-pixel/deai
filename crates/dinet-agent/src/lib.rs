@@ -10,6 +10,7 @@ pub mod journal;
 pub mod json;
 pub mod mcp;
 pub mod phishing;
+pub mod skills;
 pub mod tools;
 
 pub use audit::{Audit, AuditRec};
@@ -18,4 +19,5 @@ pub use jail::Jail;
 pub use journal::{Inverse, Journal};
 pub use mcp::Server;
 pub use phishing::Verdict;
+pub use skills::{Skill, SkillStep, SkillStore};
 pub use tools::{AllowRule, ToolWorld};

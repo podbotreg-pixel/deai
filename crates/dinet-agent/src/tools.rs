@@ -8,6 +8,9 @@ use crate::caps::CapLevel;
 use crate::jail::Jail;
 use crate::journal::{Inverse, Journal};
 use crate::phishing::{self, Verdict};
+use crate::json::Json;
+use crate::skills::{Skill, SkillStep, SkillStore, MAX_STEPS};
+use dinet_crypto::Ed25519Signer;
 use std::path::PathBuf;
 
 /// Какие права нужны инструменту и в каком scope он работает.
@@ -49,6 +52,31 @@ pub const TOOLS: &[(&str, Need, &str)] = &[
         "Последние записи аудита (все вызовы инструментов пишутся). Аргументы: n (число, по умолчанию 10).",
     ),
     (
+        "skill_save",
+        Need { level: CapLevel::Write },
+        "Сохранить последовательность вызовов как навык (Evolving Skills). Аргументы: name, steps[{tool,args}].",
+    ),
+    (
+        "skill_run",
+        Need { level: CapLevel::Read },
+        "Проиграть навык: каждый шаг идёт через те же гейты и аудит. Аргументы: name.",
+    ),
+    (
+        "skill_share",
+        Need { level: CapLevel::Read },
+        "Экспорт навыка конвертом SKILL_SHARE v1 (подписан автором). Аргументы: name.",
+    ),
+    (
+        "skill_import",
+        Need { level: CapLevel::Write },
+        "Импорт конверта SKILL_SHARE (подпись автора обязательна; старее — не заменяет). Аргументы: skill (объект или строка-конверт).",
+    ),
+    (
+        "skill_list",
+        Need { level: CapLevel::Read },
+        "Имена навыков с версиями и счётчиком успехов.",
+    ),
+    (
         "cli_run",
         Need { level: CapLevel::Network },
         "Запустить разрешённую команду из allowlist. Аргументы: command, args[].",
@@ -75,12 +103,15 @@ impl ToolOut {
     }
 }
 
-/// Мир инструментов: джейл + allowlist + undo-журнал + аудит.
+/// Мир инструментов: джейл + allowlist + undo-журнал + аудит + навыки + ключ.
 pub struct ToolWorld {
     pub jail: Jail,
     pub allow: Vec<AllowRule>,
     pub journal: Journal,
     pub audit: Audit,
+    pub skills: SkillStore,
+    /// Ключ агента: подписывает навыки (Evolving Skills, SKILL_SHARE).
+    pub signer: Ed25519Signer,
     /// Лимит вывода cli (байт) — журнал/чат не рвём.
     pub cli_out_limit: usize,
 }
@@ -105,7 +136,11 @@ impl ToolWorld {
         let jail = Jail::open(dir)?;
         let journal = Journal::open(&dir.join("agent-undo.roi"))?;
         let audit = Audit::open(&dir.join("agent-audit.roi"))?;
-        Ok(ToolWorld { jail, allow, journal, audit, cli_out_limit: 64 * 1024 })
+        let skills = SkillStore::open(&dir.join("agent-skills.roi"))?;
+        // ключ агента: из джейла (создаётся с правами 0600 при первом старте)
+        let seed = dinet_crypto::load_or_create_seed(&dir.join("agent-key.seed"))?;
+        let signer = Ed25519Signer::from_seed(&seed);
+        Ok(ToolWorld { jail, allow, journal, audit, skills, signer, cli_out_limit: 64 * 1024 })
     }
 
     /// ---------- fs_read ----------
@@ -337,6 +372,17 @@ impl ToolWorld {
             },
             "undo" => self.undo(),
             "audit_tail" => self.audit_tail(arg_int(args, "n").unwrap_or(10)),
+            "skill_save" => self.skill_save(arg_str(args, "name"), steps_from(args)),
+            "skill_run" => match arg_str(args, "name") {
+                Some(n) => self.skill_run(granted, &n),
+                None => ToolOut::err("нужен name".into()),
+            },
+            "skill_share" => match arg_str(args, "name") {
+                Some(n) => self.skill_share(&n),
+                None => ToolOut::err("нужен name".into()),
+            },
+            "skill_import" => self.skill_import(args.get("skill")),
+            "skill_list" => self.skill_list(),
             "cli_run" => {
                 let cmd = match arg_str(args, "command") {
                     Some(c) => c,
@@ -400,6 +446,130 @@ impl ToolWorld {
             .collect();
         ToolOut::ok(lines.join("\n"))
     }
+
+    /// ---------- Evolving Skills ----------
+    /// Сохранить последовательность шагов как навык (версия = локальная+1).
+    fn skill_save(&mut self, name: Option<String>, steps: Result<Vec<SkillStep>, String>) -> ToolOut {
+        let Some(name) = name else {
+            return ToolOut::err("нужен name".into());
+        };
+        let steps = match steps {
+            Ok(s) => s,
+            Err(e) => return ToolOut::err(e),
+        };
+        let version = self.skills.get(&name).map(|s| s.version + 1).unwrap_or(1);
+        let skill = Skill::mint(&self.signer, &name, version, steps);
+        match self.skills.put(&skill) {
+            Ok(true) => ToolOut::ok(format!(
+                "навык {:?} v{} сохранён (шагов {})",
+                name,
+                skill.version,
+                skill.steps.len()
+            )),
+            Ok(false) => ToolOut::err(format!("навык {:?}: версия {} не новее локальной", name, version)),
+            Err(e) => ToolOut::err(e),
+        }
+    }
+
+    /// Проиграть навык: КАЖДЫЙ шаг через self.call — гейты, анти-фишинг
+    /// и аудит применяются полностью. Успех только если все шаги ok.
+    fn skill_run(&mut self, granted: CapLevel, name: &str) -> ToolOut {
+        let Some(skill) = self.skills.get(name) else {
+            return ToolOut::err(format!("навык {name:?} не найден"));
+        };
+        let mut lines = Vec::new();
+        for (i, step) in skill.steps.iter().enumerate() {
+            let out = self.call(granted, &step.tool, &step.args);
+            let mut text = out.text;
+            if text.len() > 120 {
+                let mut cut = 120;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            let first = text.lines().next().unwrap_or("").to_string();
+            if out.is_error {
+                return ToolOut::err(format!(
+                    "навык {name:?}: шаг {} из {} ({}) НЕ ВЫПОЛНЕН: {}",
+                    i + 1,
+                    skill.steps.len(),
+                    step.tool,
+                    first
+                ));
+            }
+            lines.push(format!("{}. {} → {}", i + 1, step.tool, first));
+        }
+        match self.skills.record_success(name) {
+            Ok(n) => lines.push(format!("успехов навыка: {n}")),
+            Err(e) => return ToolOut::err(e),
+        }
+        ToolOut::ok(lines.join("\n"))
+    }
+
+    /// Экспорт конвертом SKILL_SHARE v1.
+    fn skill_share(&self, name: &str) -> ToolOut {
+        match self.skills.get(name) {
+            Some(sk) => ToolOut::ok(sk.envelope()),
+            None => ToolOut::err(format!("навык {name:?} не найден")),
+        }
+    }
+
+    /// Импорт конверта: подпись автора обязательна; правило версий.
+    fn skill_import(&mut self, skill_arg: Option<&Json>) -> ToolOut {
+        let Some(raw) = skill_arg else {
+            return ToolOut::err("нужен skill (объект конверта или строка)".into());
+        };
+        let parsed = match raw {
+            Json::Obj(_) => Skill::from_json(raw),
+            Json::Str(text) => Skill::from_envelope(text),
+            _ => Err("skill — объект или строка-конверт".into()),
+        };
+        let skill = match parsed {
+            Ok(s) => s,
+            Err(e) => return ToolOut::err(format!("SKILL_SHARE не принят: {e}")),
+        };
+        let (name, version) = (skill.name.clone(), skill.version);
+        match self.skills.put(&skill) {
+            Ok(true) => {
+                self.audit
+                    .log("skill_import", "", true, &format!("навык {name:?} v{version}"), now_secs())
+                    .ok();
+                ToolOut::ok(format!("навык {name:?} v{version} импортирован (шагов {})", skill.steps.len()))
+            }
+            Ok(false) => {
+                let local = self.skills.get(&name).map(|s| s.version).unwrap_or(0);
+                ToolOut::ok(format!(
+                    "навык {name:?} v{version} СТАРЕЕ локальной v{local} — не заменён"
+                ))
+            }
+            Err(e) => ToolOut::err(e),
+        }
+    }
+
+    /// Список навыков.
+    fn skill_list(&self) -> ToolOut {
+        let names = self.skills.names();
+        if names.is_empty() {
+            return ToolOut::ok("(нет навыков)".into());
+        }
+        let lines: Vec<String> = names
+            .iter()
+            .filter_map(|n| {
+                self.skills.get(n).map(|s| {
+                    format!(
+                        "{} v{} шагов={} успехов={} автор={}",
+                        s.name,
+                        s.version,
+                        s.steps.len(),
+                        s.success,
+                        &crate::skills::hex(&s.author)[..16]
+                    )
+                })
+            })
+            .collect();
+        ToolOut::ok(lines.join("\n"))
+    }
 }
 
 fn clip(s: &str, limit: usize) -> String {
@@ -423,6 +593,36 @@ fn arg_int(args: &crate::json::Json, key: &str) -> Option<usize> {
         Some(crate::json::Json::Int(n)) if *n >= 0 => Some(*n as usize),
         _ => None,
     }
+}
+
+/// Шаги навыка из аргументов: steps: [{tool, args}] — tool обязан быть
+/// известным инструментом, args — объектом.
+fn steps_from(args: &Json) -> Result<Vec<SkillStep>, String> {
+    let Some(Json::Arr(items)) = args.get("steps") else {
+        return Err("нужен steps (массив {tool, args})".into());
+    };
+    if items.is_empty() {
+        return Err("пустой навык".into());
+    }
+    if items.len() > MAX_STEPS {
+        return Err(format!("шагов {} > {MAX_STEPS}", items.len()));
+    }
+    let mut out = Vec::new();
+    for it in items {
+        let tool = it
+            .get("tool")
+            .and_then(|j| j.as_str())
+            .ok_or_else(|| "шаг без tool".to_string())?;
+        if need(tool).is_none() {
+            return Err(format!("неизвестный инструмент {tool:?} в шаге"));
+        }
+        let args_v = it.get("args").cloned().unwrap_or(Json::Obj(Vec::new()));
+        if !matches!(args_v, Json::Obj(_)) {
+            return Err(format!("args шага {tool:?} не объект"));
+        }
+        out.push(SkillStep { tool: tool.to_string(), args: args_v });
+    }
+    Ok(out)
 }
 
 fn now_secs() -> u64 {
@@ -606,6 +806,131 @@ mod tests {
         let out = w.call(CapLevel::Read, "audit_tail", &args_of(r#"{"n":1}"#));
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains("#"), "{}", out.text);
+    }
+
+    // ---------- Evolving Skills ----------
+
+    #[test]
+    fn skill_save_run_restores_file() {
+        let mut w = tmp_world("skillrun");
+        // эталон: запись + чтение
+        w.call(CapLevel::Write, "fs_write", &args_of(r#"{"path":"док/заметка.txt","content":"план"}"#));
+        assert_eq!(w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":"док/заметка.txt"}"#)).text, "план");
+        // накопление: те же шаги → навык
+        let out = w.call(
+            CapLevel::Write,
+            "skill_save",
+            &args_of(
+                r#"{"name":"заметка","steps":[
+                    {"tool":"fs_write","args":{"path":"док/заметка.txt","content":"план"}},
+                    {"tool":"fs_read","args":{"path":"док/заметка.txt"}}]}"#,
+            ),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("v1"), "{}", out.text);
+        // файл пропал → воспроизведение вернуло
+        w.call(CapLevel::Destructive, "fs_delete", &args_of(r#"{"path":"док/заметка.txt"}"#));
+        assert!(w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":"док/заметка.txt"}"#)).is_error);
+        let out = w.call(CapLevel::Destructive, "skill_run", &args_of(r#"{"name":"заметка"}"#));
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("успехов навыка: 1"), "{}", out.text);
+        assert_eq!(
+            w.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":"док/заметка.txt"}"#)).text,
+            "план"
+        );
+        // share → конверт с kind/version/author/sig
+        let out = w.call(CapLevel::Read, "skill_share", &args_of(r#"{"name":"заметка"}"#));
+        assert!(out.text.contains("SKILL_SHARE"), "{}", out.text);
+        // список
+        let out = w.call(CapLevel::Read, "skill_list", &args_of("{}"));
+        assert!(out.text.contains("заметка v1"), "{}", out.text);
+    }
+
+    #[test]
+    fn skill_replay_respects_gates() {
+        let mut w = tmp_world("skillgate");
+        // DoD: навык с шагом-секретом НЕ выводит секрет при replay
+        let out = w.call(
+            CapLevel::Destructive,
+            "skill_save",
+            &args_of(r#"{"name":"вредный","steps":[{"tool":"fs_read","args":{"path":".env"}}]}"#),
+        );
+        assert!(!out.is_error, "сохранить можно, играть нельзя: {}", out.text);
+        let out = w.call(CapLevel::Destructive, "skill_run", &args_of(r#"{"name":"вредный"}"#));
+        assert!(out.is_error, "анти-фишинг обязан браковать шаг");
+        assert!(out.text.contains("АНТИ-ФИШИНГ"), "{}", out.text);
+        // счётчик успехов не вырос
+        assert_eq!(w.skills.get("вредный").unwrap().success, 0);
+        // шаг выше уровня агента: fs_delete требует DESTRUCTIVE, агент WRITE
+        let out = w.call(
+            CapLevel::Write,
+            "skill_save",
+            &args_of(r#"{"name":"стиралка","steps":[{"tool":"fs_delete","args":{"path":"x"}}]}"#),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        let out = w.call(CapLevel::Write, "skill_run", &args_of(r#"{"name":"стиралка"}"#));
+        assert!(out.is_error, "гейт уровня на шаге обязателен");
+        assert!(out.text.contains("требует"), "{}", out.text);
+        // неизвестный инструмент в шаге не сохранится вовсе
+        let out = w.call(
+            CapLevel::Write,
+            "skill_save",
+            &args_of(r#"{"name":"мусор","steps":[{"tool":"net_fly","args":{}}]}"#),
+        );
+        assert!(out.is_error, "{}", out.text);
+    }
+
+    #[test]
+    fn skill_share_import_between_worlds() {
+        let mut a = tmp_world("shareA");
+        a.call(CapLevel::Write, "fs_write", &args_of(r#"{"path":"x.txt","content":"1"}"#));
+        a.call(
+            CapLevel::Write,
+            "skill_save",
+            &args_of(r#"{"name":"ритуал","steps":[{"tool":"fs_write","args":{"path":"x.txt","content":"1"}}]}"#),
+        );
+        let env = a.call(CapLevel::Read, "skill_share", &args_of(r#"{"name":"ритуал"}"#)).text;
+
+        // чужой мир: импорт валидного конверта
+        let mut b = tmp_world("shareB");
+        let out = b.call(CapLevel::Write, "skill_import", &args_of(&format!(r#"{{"skill":"{}"}}"#, env.replace('\\', "\\\\").replace('"', "\\\""))));
+        // строковый конверт тоже принимается
+        assert!(out.text.contains("импортирован"), "{}", out.text);
+        let out = b.call(CapLevel::Destructive, "skill_run", &args_of(r#"{"name":"ритуал"}"#));
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(b.call(CapLevel::Read, "fs_read", &args_of(r#"{"path":"x.txt"}"#)).text, "1");
+
+        // подделанный конверт бракуется (имя изменено → подпись не бьётся)
+        let evil = env.replace("ритуал", "ритуалX");
+        let out = b.call(
+            CapLevel::Write,
+            "skill_import",
+            &args_of(&format!(r#"{{"skill":{}}}"#, crate::json::Json::Str(evil.clone()).to_string())),
+        );
+        assert!(out.is_error, "подделка не импортируется: {}", out.text);
+        assert!(out.text.contains("подпись"), "{}", out.text);
+    }
+
+    #[test]
+    fn skills_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!("dinet-skillpersist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut w = ToolWorld::open(&dir, vec![AllowRule::new("echo")]).expect("мир");
+            w.call(
+                CapLevel::Write,
+                "skill_save",
+                &args_of(r#"{"name":"живучий","steps":[{"tool":"fs_list","args":{}}]}"#),
+            );
+        }
+        let w2 = ToolWorld::open(&dir, vec![AllowRule::new("echo")]).expect("реopen");
+        let sk = w2.skills.get("живучий").expect("навык пережил рестарт");
+        assert_eq!(sk.version, 1);
+        assert!(sk.verify(), "подпись жива");
+        let mut w3 = ToolWorld::open(&dir, vec![AllowRule::new("echo")]).expect("reopen2");
+        let out = w3.call(CapLevel::Read, "skill_list", &args_of("{}"));
+        assert!(out.text.contains("живучий"), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn now_secs() -> u64 {

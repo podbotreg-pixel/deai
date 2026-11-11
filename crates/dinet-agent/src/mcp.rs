@@ -135,6 +135,33 @@ fn tools_list() -> Json {
                     vec![],
                 ),
                 "undo" => (vec![], vec![]),
+                "skill_save" => (
+                    vec![
+                        ("name".into(), Json::Obj(vec![
+                            ("type".into(), Json::Str("string".into())),
+                        ])),
+                        ("steps".into(), Json::Obj(vec![
+                            ("type".into(), Json::Str("array".into())),
+                            ("items".into(), Json::Obj(vec![
+                                ("type".into(), Json::Str("object".into())),
+                                ("properties".into(), Json::Obj(vec![
+                                    ("tool".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))])),
+                                    ("args".into(), Json::Obj(vec![("type".into(), Json::Str("object".into()))])),
+                                ])),
+                            ])),
+                        ])),
+                    ],
+                    vec![Json::Str("name".into()), Json::Str("steps".into())],
+                ),
+                "skill_run" | "skill_share" => (
+                    vec![("name".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))]))],
+                    vec![Json::Str("name".into())],
+                ),
+                "skill_import" => (
+                    vec![("skill".into(), Json::Obj(vec![("type".into(), Json::Str("object".into()))]))],
+                    vec![Json::Str("skill".into())],
+                ),
+                "skill_list" => (vec![], vec![]),
                 "audit_tail" => (
                     vec![("n".into(), Json::Obj(vec![
                         ("type".into(), Json::Str("integer".into())),
@@ -306,13 +333,14 @@ mod tests {
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#]);
         assert!(resp.is_empty(), "уведомления молчат");
 
-        // tools/list: семь инструментов (5 FS/CLI + undo + audit_tail)
+        // tools/list: двенадцать инструментов
+        // (5 FS/CLI + undo + audit_tail + 5 навыковых)
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
         let tools = resp[0].get("result").unwrap().get("tools").and_then(|j| match j {
             Json::Arr(v) => Some(v.len()),
             _ => None,
         });
-        assert_eq!(tools, Some(7));
+        assert_eq!(tools, Some(12));
 
         // fs_write → fs_read
         let resp = feed(
