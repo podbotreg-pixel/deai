@@ -1,0 +1,15 @@
+[package]
+name = "dinet-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Агент DI-NET (M2): MCP-сервер (stdio NDJSON) поверх FS-песочницы и CLI-allowlist; capability-токены READ/WRITE/DESTRUCTIVE/NETWORK + undo-журнал"
+
+[dependencies]
+dinet-crypto = { path = "../dinet-crypto" }
+dinet-memory = { path = "../dinet-memory" }
+
+[[bin]]
+name = "agentd"
+path = "src/bin/agentd.rs"

@@ -544,8 +544,33 @@ REVEAL-эры с robust-агрегацией и чек-пойнтом); симу
 ## M2 — Агент (8 недель)
 
 - [ ] MCP-серверы по платформам: FS-песочница, CLI-allowlist, браузер-CDP, UIA/AX/AT-SPI
+  - [x] Шаг 1 (`dinet-agent`, std-only): MCP-сервер JSON-RPC 2.0 поверх
+      stdio NDJSON (спека 2025-06-18: initialize → notifications/initialized →
+      tools/list → tools/call; ошибки инструмента внутри результата
+      isError:true, протокольные −32700/−32600/−32601). Инструменты:
+      fs_read/fs_list/fs_write/fs_delete (в `Jail`: канонизация корня,
+      `..`-обход, абсолютные пути и симлинки наружу бракуются — проверка
+      ближайшего существующего предка), cli_run (allowlist, spawn без
+      sh -c, cwd=джейл, лимит вывода), undo. Тесты 27: json (экейпы,
+      сурогатные пары, глубина ≤64), caps (подпись/подмена/срок/круг),
+      jail (обход, симлинк-побег), journal (круг, переживает рестарт),
+      tools (гейты, write→read→undo, delete→undo возвращает байты,
+      allowlist rm/sh бракуются), mcp e2e (хэндшейк→6 инструментов→
+      write/read/delete/undo→файл вернулся; протокольные ошибки).
+      Живой опыт agentd: хэндшейк, «док/привет.txt» записан/удалён/
+      undo-восстановлен (20 байт), cli_run echo по allowlist, rm и
+      `../побег.txt` отбракованы, cli_run у DESTRUCTIVE-агента отвергнут.
 - [ ] PAPAV-цикл + undo-журнал + Recovery (ReTrace-принцип)
-- [ ] Capability-токены, уровни READ/WRITE/DESTRUCTIVE/NETWORK
+  - [x] Шаг 1: undo-журнал (`journal.rs`) — инверсия пишется ДО действия
+      (dinet-memory KvStore: CRC, обрыв хвоста обрезается); undo снимает
+      вершину (восстановить байты / удалить файл). Recovery = reopen
+      (seq переживает рестарт, тест).
+- [x] Capability-токены, уровни READ/WRITE/DESTRUCTIVE/NETWORK
+      (`caps.rs`: ed25519-подпись канон-байтов владельцем — верификация
+      без таблицы выданных; подмена уровня, чужой ключ, срок бракуются;
+      переносимый формат LEVEL|expires|scopes|pubkey|sig; agentd берёт
+      max(--caps, токен из --token FILE); каждый инструмент объявляет
+      потребный уровень, гейт на tools/call).
 - [ ] Анти-фишинг-детекторы (AgentPhishing-тренированные) на входе
 - [ ] Evolving Skills: накопление, воспроизведение, share через SKILL_SHARE
 
