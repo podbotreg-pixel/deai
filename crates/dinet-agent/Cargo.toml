@@ -13,3 +13,7 @@ dinet-memory = { path = "../dinet-memory" }
 [[bin]]
 name = "agentd"
 path = "src/bin/agentd.rs"
+
+[[bin]]
+name = "cua-bench"
+path = "src/bin/cua-bench.rs"

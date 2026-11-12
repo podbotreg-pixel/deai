@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod caps;
+pub mod cua;
 pub mod jail;
 pub mod journal;
 pub mod json;

@@ -88,7 +88,7 @@ pub fn need(tool: &str) -> Option<Need> {
 }
 
 /// Итог действия: текст для content + была ли ошибка уровня инструмента.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolOut {
     pub text: String,
     pub is_error: bool,
