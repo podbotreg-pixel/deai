@@ -82,6 +82,10 @@ fn main() {
         caps_level.as_str(),
         world.allow.len()
     ));
+    println_stderr(match &world.model {
+        Some(_) => "[agentd] модель AgentPhishing загружена (второе мнение)",
+        None => "[agentd] модель AgentPhishing не найдена — только правила v1",
+    });
 
     let mut server = Server::new(world, caps_level);
     let mut input = BufReader::new(std::io::stdin().lock());

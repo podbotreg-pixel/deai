@@ -123,6 +123,10 @@ printf '%s\n' \
                              # ВСЕ вызовы (включая отказы и чтения) — в agent-audit.roi;
                              # навыки подписаны ключом агента (agent-key.seed, 0600) и
                              # переносятся конвертом SKILL_SHARE v1 (подделка отбрасывается)
+# обучение модели анти-фишинга AgentPhishing v1 (логрегресс на детерминированном
+# корпусе); agentd подхватывает файл agent-phishing.model из джейла автоматически —
+# модель = «второе мнение» (поднять до Suspicious), блокируют по-прежнему правила:
+cargo run -p dinet-agent --bin phishing-train -- /tmp/opencode/agent-jail/agent-phishing.model
 # CUA-Lite бенчмарк: открытые задачи агенту поверх ToolWorld (v0-политика — точка
 # прикрепления LLM; сам набор задач и чекеров — то, что измеряется):
 cargo run -p dinet-agent --bin cua-bench
@@ -145,7 +149,8 @@ cargo run -p dinet-agent --bin cua-bench
   многоузловые эры через мост, LoRA-диссеминация через рой; webchat: браузерный
   чат с сетевыми эрами (`--net`) и настоящей llama.cpp (`--features llama`).
 - **M2-Агент в пути** — MCP-сервер (12 инструментов), capability-токены, undo-журнал,
-  анти-фишинг (rules v1), полный аудит, Evolving Skills (SKILL_SHARE v1),
-  CUA-Lite харнесс — рабочие и живо-проверяемые; далее браузер-CDP/UIA-серверы,
-  анти-фишинг шаг 2 (тренированная модель), DoD-бенчмарк с LLM-политикой.
+  анти-фишинг (rules v1 + тренированная модель AgentPhishing v1: логрегресс ловит
+  перефразировки — «второе мнение», поднимает до Suspicious), полный аудит,
+  Evolving Skills (SKILL_SHARE v1), CUA-Lite харнесс — рабочие и живо-проверяемые;
+  далее браузер-CDP/UIA-серверы, DoD-бенчмарк с LLM-политикой.
 - Все крейсы зелёные (тесты), warnings 0, AGPL-3.0 ядро. Подробности — `docs/ROADMAP.md`.

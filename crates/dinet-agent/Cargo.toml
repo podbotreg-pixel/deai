@@ -17,3 +17,7 @@ path = "src/bin/agentd.rs"
 [[bin]]
 name = "cua-bench"
 path = "src/bin/cua-bench.rs"
+
+[[bin]]
+name = "phishing-train"
+path = "src/bin/phishing-train.rs"
