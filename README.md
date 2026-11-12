@@ -49,9 +49,11 @@ crates/
   dinet-llama/        llama.cpp (GGUF Q4): `LlamaChatModel` — тот же трейт `ChatModel`
   dinet-agent/        M2-АГЕНТ (std-only): MCP-сервер (stdio NDJSON, спека 2025-06-18)
                       поверх FS-песочницы (jail) и CLI-allowlist; capability-токены
-                      READ/WRITE/DESTRUCTIVE/NETWORK; undo-журнал; анти-фишинг-детектор
-                      входа; полный аудит-журнал; Evolving Skills (SKILL_SHARE);
-                      CUA-Lite бенчмарк. bin: agentd, cua-bench
+                      READ/WRITE/DESTRUCTIVE/NETWORK; undo-журнал; анти-фишинг
+                      (rules v1 + тренированная модель AgentPhishing v1); полный
+                      аудит-журнал; Evolving Skills (SKILL_SHARE); CUA-Lite
+                      бенчмарк; браузер-CDP (chromium, рукописный WS-клиент).
+                      bin: agentd, cua-bench, phishing-train, browser-cua
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -127,6 +129,10 @@ printf '%s\n' \
 # корпусе); agentd подхватывает файл agent-phishing.model из джейла автоматически —
 # модель = «второе мнение» (поднять до Suspicious), блокируют по-прежнему правила:
 cargo run -p dinet-agent --bin phishing-train -- /tmp/opencode/agent-jail/agent-phishing.model
+# браузер-CDP: агент управляет headless chromium (клик/ввод/чтение DOM по
+# DevTools-протоколу, рукописный WS-клиент); browser-cua поднимает chromium сам и
+# решает задачи на локальных data:-страницах (офлайн):
+cargo run -p dinet-agent --bin browser-cua
 # CUA-Lite бенчмарк: открытые задачи агенту поверх ToolWorld (v0-политика — точка
 # прикрепления LLM; сам набор задач и чекеров — то, что измеряется):
 cargo run -p dinet-agent --bin cua-bench
@@ -148,9 +154,10 @@ cargo run -p dinet-agent --bin cua-bench
 - **M2-инфосфера закрыта** — клиенты учат рой со своих диалогов (clientswarm),
   многоузловые эры через мост, LoRA-диссеминация через рой; webchat: браузерный
   чат с сетевыми эрами (`--net`) и настоящей llama.cpp (`--features llama`).
-- **M2-Агент в пути** — MCP-сервер (12 инструментов), capability-токены, undo-журнал,
+- **M2-Агент в пути** — MCP-сервер (17 инструментов), capability-токены, undo-журнал,
   анти-фишинг (rules v1 + тренированная модель AgentPhishing v1: логрегресс ловит
   перефразировки — «второе мнение», поднимает до Suspicious), полный аудит,
-  Evolving Skills (SKILL_SHARE v1), CUA-Lite харнесс — рабочие и живо-проверяемые;
-  далее браузер-CDP/UIA-серверы, DoD-бенчмарк с LLM-политикой.
+  Evolving Skills (SKILL_SHARE v1), CUA-Lite харнесс, браузер-CDP (клик/ввод/чтение
+  DOM в headless chromium) — рабочие и живо-проверяемые; далее UIA-серверы
+  (Windows/macOS), DoD-бенчмарк с LLM-политикой.
 - Все крейсы зелёные (тесты), warnings 0, AGPL-3.0 ядро. Подробности — `docs/ROADMAP.md`.

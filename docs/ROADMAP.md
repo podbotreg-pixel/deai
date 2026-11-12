@@ -648,6 +648,24 @@ REVEAL-эры с robust-агрегацией и чек-пойнтом); симу
       v0, succ≥50%, корпус ≥20 задач с уникальными id; прогоны
       бенчмарка изолированы по run_id (параллельные тесты не делят
       tmp-каталоги).
+- [x] Браузер-CDP (`browser.rs`, bin browser-cua): computer-use поверх
+      chromium DevTools-протокола — WebSocket-клиент, SHA-1/base64
+      рукопожатие и маскирование кадров написаны вручную (без внешних
+      зависимостей; RFC 6455 §1.3 вектор рукопожатия в тестах).
+      Инструментов 17: browser_connect (CDP HTTP-порт запущенного
+      chromium), browser_navigate (ожидание document.readyState),
+      browser_read (innerText), browser_click (центр элемента по
+      CSS-селектору → Input.dispatchMouseEvent), browser_type (клик-
+      фокус + Input.insertText). Политика: вкладка одна; URL только
+      http/https/data — file:// умеет читать локальные диски (обход
+      джейла) и бракуется ДО всякой сети; URL прогоняется через
+      анти-фишинг (webhook.site бракуется до соединения); все
+      браузер-инструменты требуют NETWORK и пишутся в аудит как все.
+      Живая проверка bin browser-cua: поднимает headless chromium сам
+      (порт из stderr «DevTools listening») и решает 10/10 на локальных
+      data:-страницах — подключение, чтение, клик-счётчик, ввод+echo
+      и два корректных отказа (webhook.site, file://); полностью
+      офлайн, без аккаунтов.
 
 **DoD:** ≥20 открытых CUA-задач (CUA-Lite-базовые), succ≥50%; фишинг-тест не выводит секреты;
 все действия в журнале.

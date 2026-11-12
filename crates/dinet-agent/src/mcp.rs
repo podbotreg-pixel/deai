@@ -186,6 +186,28 @@ fn tools_list() -> Json {
                     ],
                     vec![Json::Str("command".into())],
                 ),
+                "browser_connect" => (
+                    vec![("cdp".into(), Json::Obj(vec![
+                        ("type".into(), Json::Str("string".into())),
+                        ("description".into(), Json::Str("HTTP-адрес DevTools: '127.0.0.1:9222'".into())),
+                    ]))],
+                    vec![Json::Str("cdp".into())],
+                ),
+                "browser_navigate" => (
+                    vec![("url".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))]))],
+                    vec![Json::Str("url".into())],
+                ),
+                "browser_click" => (
+                    vec![("selector".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))]))],
+                    vec![Json::Str("selector".into())],
+                ),
+                "browser_type" => (
+                    vec![
+                        ("selector".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))])),
+                        ("text".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))])),
+                    ],
+                    vec![Json::Str("selector".into()), Json::Str("text".into())],
+                ),
                 _ => (Vec::new(), Vec::new()),
             };
             Json::Obj(vec![
@@ -197,7 +219,7 @@ fn tools_list() -> Json {
                     ("required".into(), Json::Arr(req)),
                 ])),
                 ("annotations".into(), Json::Obj(vec![
-                    ("readOnlyHint".into(), Json::Bool(matches!(*name, "fs_read" | "fs_list"))),
+                    ("readOnlyHint".into(), Json::Bool(matches!(*name, "fs_read" | "fs_list" | "browser_read" | "audit_tail" | "skill_list"))),
                     ("destructiveHint".into(), Json::Bool(*name == "fs_delete")),
                 ])),
             ])
@@ -333,14 +355,14 @@ mod tests {
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#]);
         assert!(resp.is_empty(), "уведомления молчат");
 
-        // tools/list: двенадцать инструментов
+        // tools/list: семнадцать инструментов
         // (5 FS/CLI + undo + audit_tail + 5 навыковых)
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
         let tools = resp[0].get("result").unwrap().get("tools").and_then(|j| match j {
             Json::Arr(v) => Some(v.len()),
             _ => None,
         });
-        assert_eq!(tools, Some(12));
+        assert_eq!(tools, Some(17));
 
         // fs_write → fs_read
         let resp = feed(

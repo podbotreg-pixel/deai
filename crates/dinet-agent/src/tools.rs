@@ -82,6 +82,31 @@ pub const TOOLS: &[(&str, Need, &str)] = &[
         Need { level: CapLevel::Network },
         "Запустить разрешённую команду из allowlist. Аргументы: command, args[].",
     ),
+    (
+        "browser_connect",
+        Need { level: CapLevel::Network },
+        "Подключиться к браузеру по CDP (chromium --headless --remote-debugging-port=N). Аргументы: cdp ('127.0.0.1:9222').",
+    ),
+    (
+        "browser_navigate",
+        Need { level: CapLevel::Network },
+        "Открыть URL в текущей вкладке (схемы http/https/data; file:// = обход джейла; анти-фишинг сканирует URL). Аргументы: url.",
+    ),
+    (
+        "browser_read",
+        Need { level: CapLevel::Network },
+        "Текст страницы (innerText).",
+    ),
+    (
+        "browser_click",
+        Need { level: CapLevel::Network },
+        "Клик по CSS-селектору (центр элемента). Аргументы: selector.",
+    ),
+    (
+        "browser_type",
+        Need { level: CapLevel::Network },
+        "Ввести текст в поле (клик + Input.insertText). Аргументы: selector, text.",
+    ),
 ];
 
 pub fn need(tool: &str) -> Option<Need> {
@@ -115,6 +140,8 @@ pub struct ToolWorld {
     pub signer: Ed25519Signer,
     /// Тренированная модель анти-фишинга («второе мнение»), если обучена.
     pub model: Option<Model>,
+    /// Браузер по CDP (chromium DevTools), если подключён.
+    pub browser: Option<crate::browser::Browser>,
     /// Лимит вывода cli (байт) — журнал/чат не рвём.
     pub cli_out_limit: usize,
 }
@@ -150,7 +177,7 @@ impl ToolWorld {
         } else {
             None
         };
-        Ok(ToolWorld { jail, allow, journal, audit, skills, signer, model, cli_out_limit: 64 * 1024 })
+        Ok(ToolWorld { jail, allow, journal, audit, skills, signer, model, browser: None, cli_out_limit: 64 * 1024 })
     }
 
     /// ---------- fs_read ----------
@@ -306,6 +333,58 @@ impl ToolWorld {
         }
     }
 
+    /// ---------- Браузер (CDP) ----------
+    /// Подключиться к запущенному chromium (DevTools HTTP-порт).
+    fn browser_connect(&mut self, cdp: &str) -> ToolOut {
+        match crate::browser::Browser::connect(cdp) {
+            Ok(b) => {
+                self.browser = Some(b);
+                ToolOut::ok(format!("подключён: {cdp}"))
+            }
+            Err(e) => ToolOut::err(format!("браузер: {e}")),
+        }
+    }
+
+    fn browser_navigate(&mut self, url: &str) -> ToolOut {
+        let Some(b) = self.browser.as_mut() else {
+            return ToolOut::err("нет подключения к браузеру (browser_connect)".into());
+        };
+        match b.navigate(url) {
+            Ok(()) => ToolOut::ok(format!("открыто: {url}")),
+            Err(e) => ToolOut::err(format!("браузер: {e}")),
+        }
+    }
+
+    fn browser_read(&mut self) -> ToolOut {
+        let Some(b) = self.browser.as_mut() else {
+            return ToolOut::err("нет подключения к браузеру (browser_connect)".into());
+        };
+        match b.page_text() {
+            Ok(t) => ToolOut::ok(clip(&t, self.cli_out_limit)),
+            Err(e) => ToolOut::err(format!("браузер: {e}")),
+        }
+    }
+
+    fn browser_click(&mut self, selector: &str) -> ToolOut {
+        let Some(b) = self.browser.as_mut() else {
+            return ToolOut::err("нет подключения к браузеру (browser_connect)".into());
+        };
+        match b.click(selector) {
+            Ok(()) => ToolOut::ok(format!("клик: {selector}")),
+            Err(e) => ToolOut::err(format!("браузер: {e}")),
+        }
+    }
+
+    fn browser_type(&mut self, selector: &str, text: &str) -> ToolOut {
+        let Some(b) = self.browser.as_mut() else {
+            return ToolOut::err("нет подключения к браузеру (browser_connect)".into());
+        };
+        match b.type_text(selector, text) {
+            Ok(()) => ToolOut::ok(format!("введено в {selector}: {text}")),
+            Err(e) => ToolOut::err(format!("браузер: {e}")),
+        }
+    }
+
     /// Хэндлер всех инструментов: фишинг-фильтр входа → гейт уровня →
     /// действие → аудит. Секрет-пути бракуются ДО открытия даже READ'у.
     pub fn call(&mut self, granted: CapLevel, name: &str, args: &crate::json::Json) -> ToolOut {
@@ -358,6 +437,27 @@ impl ToolWorld {
             }
             if !susp.is_empty() {
                 flagged = format!(" ⚠ [SUSPICIOUS: {}]", susp.join("; "));
+            }
+        }
+        if name == "browser_navigate" {
+            let u = arg_str(args, "url").unwrap_or_default();
+            // схемы: file:// умеет читать локальные диски — обход джейла;
+            // бракуется ДО всякой сети, даже READ-агенту
+            if let Err(why) = crate::browser::url_allowed(&u) {
+                let out = ToolOut::err(format!("АНТИ-ФИШИНГ: {why}"));
+                let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+                return out;
+            }
+            match phishing::scan(&u) {
+                Verdict::Blocked(why) => {
+                    let out = ToolOut::err(format!("АНТИ-ФИШИНГ: {}", why.join("; ")));
+                    let _ = self.audit.log(name, granted.as_str(), false, &out.text, ts);
+                    return out;
+                }
+                Verdict::Suspicious(why) => {
+                    flagged = format!(" ⚠ [SUSPICIOUS: {}]", why.join("; "));
+                }
+                Verdict::Clean => {}
             }
         }
 
@@ -431,6 +531,25 @@ impl ToolWorld {
                     })
                     .unwrap_or_default();
                 self.cli_run(&cmd, &args_v)
+            }
+            "browser_connect" => match arg_str(args, "cdp") {
+                Some(c) => self.browser_connect(&c),
+                None => ToolOut::err("нужен cdp".into()),
+            },
+            "browser_navigate" => match arg_str(args, "url") {
+                Some(u) => self.browser_navigate(&u),
+                None => ToolOut::err("нужен url".into()),
+            },
+            "browser_read" => self.browser_read(),
+            "browser_click" => match arg_str(args, "selector") {
+                Some(s) => self.browser_click(&s),
+                None => ToolOut::err("нужен selector".into()),
+            },
+            "browser_type" => {
+                let (Some(s), Some(t)) = (arg_str(args, "selector"), arg_str(args, "text")) else {
+                    return ToolOut::err("нужны selector и text".into());
+                };
+                self.browser_type(&s, &t)
             }
             _ => ToolOut::err(format!("неизвестный инструмент {name:?}")),
         };
@@ -843,6 +962,31 @@ mod tests {
         assert!(ToolWorld::open(&dir, vec![]).is_err(), "поломанная модель должна ронять open");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn browser_tools_gate_and_refuse() {
+        let mut w = tmp_world("browser");
+        // нет подключения: инструменты честно отказывают
+        let out = w.call(CapLevel::Network, "browser_read", &args_of("{}"));
+        assert!(out.is_error && out.text.contains("нет подключения"), "{}", out.text);
+        // file:// — обход джейла, бракуется ДО всякой сети
+        let out = w.call(
+            CapLevel::Network,
+            "browser_navigate",
+            &args_of(r#"{"url":"file:///etc/passwd"}"#),
+        );
+        assert!(out.is_error && out.text.contains("обход джейла"), "{}", out.text);
+        // webhook.site — эксфильтрация бракуется анти-фишингом
+        let out = w.call(
+            CapLevel::Network,
+            "browser_navigate",
+            &args_of(r#"{"url":"http://webhook.site/x"}"#),
+        );
+        assert!(out.is_error && out.text.contains("АНТИ-ФИШИНГ"), "{}", out.text);
+        // гейт уровня: Read-агенту браузер недоступен
+        let out = w.call(CapLevel::Read, "browser_read", &args_of("{}"));
+        assert!(out.is_error && out.text.contains("требует NETWORK"), "{}", out.text);
     }
 
     #[test]

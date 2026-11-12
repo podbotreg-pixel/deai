@@ -21,3 +21,7 @@ path = "src/bin/cua-bench.rs"
 [[bin]]
 name = "phishing-train"
 path = "src/bin/phishing-train.rs"
+
+[[bin]]
+name = "browser-cua"
+path = "src/bin/browser-cua.rs"
