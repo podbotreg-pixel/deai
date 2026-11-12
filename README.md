@@ -104,6 +104,28 @@ cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
                              # REPL-чат: история, RAG-контекст, пары speak→learn
+# M2-АГЕНТ: MCP-сервер поверх FS-песочницы (agentd — NDJSON/stdio, спека 2025-06-18):
+cargo run -p dinet-agent --bin agentd -- /tmp/opencode/agent-jail --caps DESTRUCTIVE --allow echo
+                             # процесс = готовый MCP-сервер для любого клиента; stdout = протокол,
+                             # логи в stderr; 12 инструментов: fs_read/fs_list/fs_write/fs_delete/
+                             # undo/cli_run/audit_tail + skill_save/skill_run/skill_share/
+                             # skill_import/skill_list; права = max(--caps, подписанный --token)
+# живая сессия (хэндшейк → запись → удаление → undo вернул файл):
+printf '%s\n' \
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+ '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+ '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fs_write","arguments":{"path":"док/привет.txt","content":"M2 агент жив"}}}' \
+ '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fs_delete","arguments":{"path":"док/привет.txt"}}}' \
+ '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"undo","arguments":{}}}' \
+ | cargo run -p dinet-agent --bin agentd -- /tmp/opencode/agent-jail --caps DESTRUCTIVE
+                             # секрет-пути (.env, id_rsa…) и эксфильтрация (webhook.site, | curl)
+                             # бракуются АНТИ-ФИШИНГом ДО исполнения даже READ-агенту;
+                             # ВСЕ вызовы (включая отказы и чтения) — в agent-audit.roi;
+                             # навыки подписаны ключом агента (agent-key.seed, 0600) и
+                             # переносятся конвертом SKILL_SHARE v1 (подделка отбрасывается)
+# CUA-Lite бенчмарк: открытые задачи агенту поверх ToolWorld (v0-политика — точка
+# прикрепления LLM; сам набор задач и чекеров — то, что измеряется):
+cargo run -p dinet-agent --bin cua-bench
 ```
 
 ## Ключевые документы
@@ -115,4 +137,15 @@ cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
 
 ## Статус
 
-`M0` в пути (см. ROADMAP). Прототип протокола и крейты-фундамент — рабочие.
+- **M0 закрыт** — память (KV-лог + RAG), чат-сессия, speak→learn (DPO-lite), локальный fit.
+- **M1 закрыт** — рой: DiLoCo-эры, secure-agg, robust-агрегация, fork-choice; РЕАЛЬНАЯ
+  сеть libp2p (p2pswarm сходится бит-в-бит с симуляцией); реестр чек-пойнтов
+  с нотарными печатями и кусочной репликацией.
+- **M2-инфосфера закрыта** — клиенты учат рой со своих диалогов (clientswarm),
+  многоузловые эры через мост, LoRA-диссеминация через рой; webchat: браузерный
+  чат с сетевыми эрами (`--net`) и настоящей llama.cpp (`--features llama`).
+- **M2-Агент в пути** — MCP-сервер (12 инструментов), capability-токены, undo-журнал,
+  анти-фишинг (rules v1), полный аудит, Evolving Skills (SKILL_SHARE v1),
+  CUA-Lite харнесс — рабочие и живо-проверяемые; далее браузер-CDP/UIA-серверы,
+  анти-фишинг шаг 2 (тренированная модель), DoD-бенчмарк с LLM-политикой.
+- Все крейсы зелёные (тесты), warnings 0, AGPL-3.0 ядро. Подробности — `docs/ROADMAP.md`.
