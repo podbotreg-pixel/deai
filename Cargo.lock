@@ -659,6 +659,7 @@ name = "dinet-agent"
 version = "0.1.0"
 dependencies = [
  "dinet-crypto",
+ "dinet-llama",
  "dinet-memory",
 ]
 

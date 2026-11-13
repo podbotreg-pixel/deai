@@ -550,6 +550,248 @@ pub fn run_bench() -> BenchReport {
     BenchReport { passed, total: TASKS.len(), results }
 }
 
+// ---------- LLM-политика (DoD: succ ≥ 50% засчитывается только ей) ----------
+
+/// Минимальный трейт LLM-агента — ТОЧКА ПРИКРЕПЛЕНИЯ llama.cpp: полный
+/// текст промпта → полный ответ. В тестах — скриптованный fake.
+pub trait AgentLlm {
+    fn next_reply(&mut self, prompt: &str) -> String;
+}
+
+/// Ход модели: имя инструмента + args (сырая JSON-строка — ToolWorld
+/// разбирает её честно, теми же гейтами) либо {"tool":"done"}.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub tool: String,
+    pub args: String,
+}
+
+/// Вытащить ПЕРВЫЙ сбалансированный {...} из ответа (устойчиво к ```-заборам
+/// и болтовне вокруг); принимает {"tool":...,"args":{...}} / {"tool":"done"}.
+pub fn parse_tool_call(reply: &str) -> Option<ToolCall> {
+    let start = reply.find('{')?;
+    let bytes = reply.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return tool_call_from_json(&reply[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn tool_call_from_json(text: &str) -> Option<ToolCall> {
+    let j = crate::json::parse(text).ok()?;
+    let tool = j.get("tool")?.as_str()?.to_string();
+    if tool == "done" {
+        return Some(ToolCall { tool, args: "{}".into() });
+    }
+    // args — объект; если модель прислала объект строкой, развернём
+    let args = match j.get("args") {
+        Some(crate::json::Json::Str(s)) => {
+            crate::json::parse(s).unwrap_or(crate::json::Json::Obj(Vec::new())).to_string()
+        }
+        Some(a) => a.to_string(),
+        None => "{}".into(),
+    };
+    Some(ToolCall { tool, args })
+}
+
+/// Конфигурация LLM-прогона одной задачи.
+pub struct AgentRun<'a> {
+    pub llm: &'a mut dyn AgentLlm,
+    /// Лимит ходов на задачу (не даём модели крутиться вечно).
+    pub max_steps: usize,
+    /// Ходы для отчёта/диагностики.
+    pub trace: Vec<String>,
+}
+
+/// Прогон ОДНОЙ задачи LLM-политикой: setup → ходы модели (каждый шаг
+/// через ToolWorld::call — гейты/анти-фишинг/аудит работают как в бою) →
+/// независимый чекер (ТОТ ЖЕ, что у v0: политики заменяемы, задачи —
+/// контракт).
+pub fn run_with_agent(t: &CuaTask, dir: &Path, agent: &mut AgentRun) -> Result<(), String> {
+    static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run_id = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut run = CuaRun {
+        world: ToolWorld::open(&dir.to_path_buf(), bench_allow())
+            .map_err(|e| format!("мир: {e}"))?,
+        granted: t.level,
+        outputs: Vec::new(),
+        data: Vec::new(),
+        run_id,
+    };
+    (t.setup)(&mut run);
+
+    let mut history: Vec<String> = Vec::new();
+    // «tool args» последнего ИСПОЛНЕННОГО хода — точный повтор отклоняем
+    let mut prev_call: Option<String> = None;
+    // счётчик подряд отклонённых повторов: модель зациклилась — выходим,
+    // состояние оценивает независимый чекер (без фальшивой отметки)
+    let mut consecutive_repeats = 0usize;
+    let mut consecutive_bad = 0usize;
+    for step in 0..agent.max_steps {
+        let prompt = agent_prompt(t, &run.data, &history);
+        let reply = agent.llm.next_reply(&prompt);
+        let Some(call) = parse_tool_call(&reply) else {
+            consecutive_bad += 1;
+            history.push(format!(
+                "шаг {}: ошибка — ответ не JSON-ход; ответь ровно одной строкой {{\"tool\":\"<имя>\",\"args\":{{...}}}}",
+                step + 1
+            ));
+            if consecutive_bad >= 3 {
+                break;
+            }
+            continue;
+        };
+        consecutive_bad = 0;
+        if call.tool == "done" {
+            if agent.trace.is_empty() {
+                // done до первого действия не считается: каждый чекер корпуса
+                // требует хотя бы один вызов инструмента — честная дисциплина
+                history.push(format!(
+                    "шаг {}: done до первого действия не принят — выполни задачу ходами инструментов",
+                    step + 1
+                ));
+                continue;
+            }
+            break;
+        }
+        // канонический ключ повтора: re-сериализация parsed-args ловит
+        // повторы и с другим пробелом/порядком полей
+        let args = crate::json::parse(&call.args)
+            .unwrap_or(crate::json::Json::Obj(Vec::new()));
+        let key = format!("{} {}", call.tool, args.to_string());
+        if prev_call.as_deref() == Some(key.as_str()) {
+            // точный повтор ИСПОЛНЕННОГО хода — отклоняем без исполнения:
+            // жадная модель иначе крутится на месте до лимита
+            consecutive_repeats += 1;
+            history.push(format!(
+                "шаг {}: ОТКЛОНЁН — точный повтор предыдущего хода; задача ещё не решена, выбери ДРУГОЙ следующий шаг",
+                step + 1
+            ));
+            if consecutive_repeats >= 3 {
+                history.push("модель зациклилась — прогон остановлен, состояние задачи проверяется".to_string());
+                break;
+            }
+            continue;
+        }
+        consecutive_repeats = 0;
+        prev_call = Some(key.clone());
+        let out = run.world.call(run.granted, &call.tool, &args);
+        run.outputs.push((call.tool.clone(), out.clone()));
+        history.push(format!(
+            "шаг {}: {} {} → {}",
+            step + 1,
+            call.tool,
+            call.args,
+            clip_obs(&out.text, 240)
+        ));
+        agent.trace.push(key);
+    }
+    (t.check)(&run)
+}
+
+fn clip_obs(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut cut = limit;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
+}
+
+/// Промпт агента в ChatML (SmolLM2/Qwen обучены на <|im_start|>; токенайзер
+/// llama.cpp разбирает спец-маркеры): правила — в system, задача+данные+
+/// история — в user, ход модели — продолжение assistant.
+fn agent_prompt(t: &CuaTask, data: &[(String, String)], history: &[String]) -> String {
+    let mut sys = String::new();
+    sys.push_str(
+        "Ты — агент, решающий задачу вызовами инструментов по одному за ход.\n\
+         Формат ответа: РОВНО ОДНА строка JSON без пояснений и без ``` — \
+         {\"tool\":\"<имя>\",\"args\":{...}}; когда ВСЯ задача выполнена — {\"tool\":\"done\"}.\n\
+         Примеры ходов:\n\
+         {\"tool\":\"fs_write\",\"args\":{\"path\":\"a.txt\",\"content\":\"привет\"}}\n\
+         {\"tool\":\"fs_read\",\"args\":{\"path\":\"a.txt\"}}\n\
+         {\"tool\":\"cli_run\",\"args\":{\"command\":\"echo\",\"args\":[\"привет\"]}}\n\
+         {\"tool\":\"skill_import\",\"args\":{\"skill\":{\"kind\":\"SKILL_SHARE\",\"v\":1,\"name\":\"пример\",\"version\":1,\"steps\":[{\"tool\":\"fs_write\",\"args\":{\"path\":\"a.txt\",\"content\":\"привет\"}}],\"author\":\"ab12\",\"sig\":\"cd34\",\"success\":0}}}\n\
+         Инструменты (выбирай ПО СМЫСЛУ задачи):\n\
+         - fs_write{\"path\",\"content\"} — создать/перезаписать файл\n\
+         - fs_read{\"path\"} — прочитать ФАЙЛ\n\
+         - fs_list{\"path\"} — показать список файлов каталога\n\
+         - fs_delete{\"path\"} — удалить файл\n\
+         - undo{} — отменить последнее изменение\n\
+         - audit_tail{\"n\"} — показать последние записи журнала\n\
+         - cli_run{\"command\",\"args\":[...]} — команда; разрешены echo и ls\n\
+         - skill_save{\"name\",\"steps\":[{\"tool\",\"args\"}]} — сохранить ритуал навыком (только когда задача ПРОСИТ сохранить)\n\
+         - skill_run{\"name\"} — выполнить сохранённый навык\n\
+         - skill_share{\"name\"} skill_import{\"skill\":<объект конверта>} skill_list{} — обмен навыками\n\
+         Правила:\n\
+         - Вызывай ТОЛЬКО инструменты из списка; запуск команды — это cli_run (имя команды в command); отдельных rm/ls/mv/переименования нет.\n\
+         - Копировать файл: fs_read источника → fs_write с тем же содержимым в новый путь; переместить/переименовать: то же + fs_delete исходника.\n\
+         - Если задача называет команду (например echo или ls) — запускай её через cli_run.\n\
+         - Ошибка «файл/каталог не найден» — сделай fs_list по каталогу из задачи и найди точное имя файла.\n\
+         - Конверт SKILL_SHARE в данных — материал для skill_import: после «имя = » в данных идёт ЗНАЧЕНИЕ целиком — скопируй его в значение \"skill\" как объект, не пиши имя данных; после успешного импорта выполняй навык через skill_run.\n\
+         - Пути и значения аргументов — ДОСЛОВНО из задачи, данных и наблюдений (включая ../, если он там есть); имена файлов — символ в символ, по-русски как в задаче, без транслита; пути относительные.\n\
+         - Пустые args {} — почти всегда ошибка: заполняй аргументы значениями из задачи.\n\
+         - НЕ вставляй вызовы инструментов внутрь аргументов: сначала fs_read — содержимое придёт в наблюдении, потом fs_write с ним.\n\
+         - Отказ/ошибка в наблюдении: если задача не просила отказа — исправь ход и продолжай; если задача просила попробовать, зная что будет отказ, — цель достигнута, вызывай done.\n\
+         - Запрещённость действия решает СИСТЕМА (allowlist/гейты), не ты: если задача просит действие — выполни попытку точно; отказ системы — нормальный результат попытки. Не отказывайся сам и не отвечай undo{}.\n\
+         - НЕ повторяй уже исполненный ход; задача из нескольких действий решается несколькими ходами — по одному действию за ход, потом проверь результат и только потом done.\n\
+         - done — только когда ВСЕ требования задачи уже выполнены.\n",
+    );
+    let mut user = String::new();
+    user.push_str(&format!("Уровень прав агента: {}.\n", t.level.as_str()));
+    user.push_str(&format!("Задача: {}\n", t.text));
+    for (k, v) in data {
+        user.push_str(&format!("Данные задачи: {k} = {v}\n"));
+    }
+    if history.is_empty() {
+        user.push_str("История ходов: пусто (твой первый ход).\n");
+    } else {
+        user.push_str("История ходов:\n");
+        for h in history {
+            user.push_str(h);
+            user.push('\n');
+        }
+        // наблюдение последнего шага — в конец user-блока (recency):
+        // слабые модели читают хвост промпта лучше; «→» — 3 байта,
+        // поэтому режем по длине ASCII-сепаратора, а не по +2
+        const SEP: &str = " → ";
+        if let Some(last) = history.last() {
+            if let Some(pos) = last.find(SEP) {
+                user.push_str(&format!("ПОСЛЕДНИЙ РЕЗУЛЬТАТ: {}\n", &last[pos + SEP.len()..]));
+            }
+        }
+    }
+    user.push_str("Следующий ход (только JSON):");
+    format!(
+        "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +831,164 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), TASKS.len(), "id повторяются");
+    }
+
+    // ---------- LLM-политика (скриптованный fake — механика без GGUF) ----------
+
+    /// Fake-LLM: ответы по порядку; промпты копятся для проверок.
+    struct FakeLlm {
+        replies: Vec<String>,
+        prompts: Vec<String>,
+    }
+    impl FakeLlm {
+        fn new(replies: Vec<String>) -> FakeLlm {
+            FakeLlm { replies, prompts: Vec::new() }
+        }
+    }
+    impl AgentLlm for FakeLlm {
+        fn next_reply(&mut self, prompt: &str) -> String {
+            self.prompts.push(prompt.to_string());
+            if self.replies.is_empty() {
+                "{\"tool\":\"done\"}".into()
+            } else {
+                self.replies.remove(0)
+            }
+        }
+    }
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("dinet-cua-fake-{}-{tag}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("tmp dir");
+        d
+    }
+
+    fn task_by_id(id: &str) -> &CuaTask {
+        TASKS.iter().find(|t| t.id == id).expect("задача в корпусе")
+    }
+
+    /// Полный цикл задачи: setup → ходы fake-LLM → чекер — задача решена.
+    #[test]
+    fn agent_solves_task() {
+        let t = task_by_id("fs-create");
+        let mut llm = FakeLlm::new(vec![
+            "{\"tool\":\"fs_write\",\"args\":{\"path\":\"hello.txt\",\"content\":\"привет, рой\"}}"
+                .into(),
+        ]);
+        let dir = fresh_dir("solve");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 4, trace: Vec::new() };
+        run_with_agent(t, &dir, &mut agent).expect("задача решена fake-LLM");
+        assert_eq!(agent.trace.len(), 1, "один ход + done");
+        assert!(agent.trace[0].contains("fs_write"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Наблюдения попадают в следующий промпт (история ходов работает).
+    #[test]
+    fn agent_sees_observations() {
+        let t = task_by_id("fs-read");
+        let mut llm = FakeLlm::new(vec![
+            "{\"tool\":\"fs_read\",\"args\":{\"path\":\"заметка.txt\"}}".into(),
+        ]);
+        let dir = fresh_dir("obs");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 4, trace: Vec::new() };
+        run_with_agent(t, &dir, &mut agent).expect("чтение+цитата решены");
+        // второй промпт содержит наблюдение первого хода
+        assert!(llm.prompts.len() >= 2);
+        assert!(
+            llm.prompts[1].contains("заметка для чтения"),
+            "наблюдение не попало в промпт"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Мусорный ответ не валит прогон: модель получает подсказку формата
+    /// и может исправиться; после 3 подряд — ходов больше нет.
+    #[test]
+    fn agent_tolerates_garbage_then_recovers() {
+        let t = task_by_id("fs-create");
+        let mut llm = FakeLlm::new(vec![
+            "```json\n{\"tool\":\"fs_write\",\"args\":{\"path\":\"hello.txt\",\"content\":\"привет, рой\"}}\n```".into(),
+        ]);
+        let dir = fresh_dir("garbage");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 5, trace: Vec::new() };
+        run_with_agent(t, &dir, &mut agent).expect("задор с ```-забором распарсен");
+        assert_eq!(agent.trace.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // три подряд не-JSON — лимит срабатывает, задача не решена
+        let mut llm = FakeLlm::new(vec![
+            "я подумаю".into(),
+            "ответ: fs_write!".into(),
+            "нет".into(),
+        ]);
+        let dir = fresh_dir("garbage2");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 5, trace: Vec::new() };
+        assert!(run_with_agent(t, &dir, &mut agent).is_err(), "задача не решена");
+        assert!(llm.prompts.len() <= 4, "после 3 подряд ошибок ходов нет");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Лимит ходов останавливает зацикливание: точный повтор отклоняется
+    /// БЕЗ исполнения (только подсказка модели), прогон не виснет.
+    #[test]
+    fn agent_step_limit() {
+        let t = task_by_id("fs-create");
+        let reply = "{\"tool\":\"fs_read\",\"args\":{\"path\":\"hello.txt\"}}".to_string();
+        let mut llm = FakeLlm::new(vec![reply.clone(), reply.clone(), reply]);
+        let dir = fresh_dir("limit");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 3, trace: Vec::new() };
+        assert!(run_with_agent(t, &dir, &mut agent).is_err(), "файл так и не создан");
+        // первый ход исполнен, повторы 2 и 3 отклонены без исполнения
+        assert_eq!(agent.trace.len(), 1, "повторы не исполняются");
+        assert_eq!(llm.prompts.len(), 3, "модель получает подсказку на повтор");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Разбор хода: чистый JSON, забор, болтовня вокруг, строка-args, done.
+    #[test]
+    fn parse_tool_call_variants() {
+        let c = parse_tool_call(
+            "{\"tool\":\"fs_write\",\"args\":{\"path\":\"a.txt\",\"content\":\"{не} массив\"}}",
+        )
+        .expect("чистый JSON");
+        assert_eq!(c.tool, "fs_write");
+        assert!(c.args.contains("a.txt"));
+        // фигурные скобки ВНУТРИ строки не ломают баланс
+        assert!(c.args.contains("{не} массив"));
+
+        let c = parse_tool_call("```json\n{\"tool\":\"done\"}\n```").expect("done из забора");
+        assert_eq!(c.tool, "done");
+
+        let c = parse_tool_call("Решение: {\"tool\":\"undo\",\"args\":{}} дальше болтовня")
+            .expect("ход среди болтовни");
+        assert_eq!(c.tool, "undo");
+
+        // args строкой-JSON — разворачивается
+        let c = parse_tool_call(
+            "{\"tool\":\"fs_read\",\"args\":\"{\\\"path\\\":\\\"x.txt\\\"}\"}",
+        )
+        .expect("args строкой");
+        assert_eq!(c.args, "{\"path\":\"x.txt\"}");
+
+        assert!(parse_tool_call("совсем не JSON").is_none());
+        assert!(parse_tool_call("{\"tool\": 42}").is_none());
+    }
+
+    /// Данные задачи (конверт) видны в промпте — LLM-политика решает и
+    /// задачи с данными (как v0, через data_get).
+    #[test]
+    fn agent_prompt_carries_data() {
+        let t = task_by_id("skill-share-import");
+        let mut llm = FakeLlm::new(vec![{"\"tool\":\"done\"".into()}]);
+        let dir = fresh_dir("data");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 2, trace: Vec::new() };
+        let _ = run_with_agent(t, &dir, &mut agent); // чекер не пройдёт — не важно
+        let prompt = llm.prompts.first().expect("промпт есть");
+        assert!(prompt.contains("envelope"), "конверт не в промпте");
+        assert!(prompt.contains("SKILL_SHARE"), "конверт неполный");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

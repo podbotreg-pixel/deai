@@ -9,6 +9,10 @@ description = "Агент DI-NET (M2): MCP-сервер (stdio NDJSON) пове�
 [dependencies]
 dinet-crypto = { path = "../dinet-crypto" }
 dinet-memory = { path = "../dinet-memory" }
+dinet-llama = { path = "../dinet-llama", optional = true }
+
+[features]
+llama = ["dep:dinet-llama"]
 
 [[bin]]
 name = "agentd"
@@ -25,3 +29,8 @@ path = "src/bin/phishing-train.rs"
 [[bin]]
 name = "browser-cua"
 path = "src/bin/browser-cua.rs"
+
+[[bin]]
+name = "cua-llm"
+path = "src/bin/cua-llm.rs"
+required-features = ["llama"]

@@ -52,8 +52,9 @@ crates/
                       READ/WRITE/DESTRUCTIVE/NETWORK; undo-журнал; анти-фишинг
                       (rules v1 + тренированная модель AgentPhishing v1); полный
                       аудит-журнал; Evolving Skills (SKILL_SHARE); CUA-Lite
-                      бенчмарк; браузер-CDP (chromium, рукописный WS-клиент).
-                      bin: agentd, cua-bench, phishing-train, browser-cua
+                      бенчмарк; браузер-CDP (chromium, рукописный WS-клиент);
+                      LLM-политика CUA (DoD succ≥50% закрыт).
+                      bin: agentd, cua-bench, phishing-train, browser-cua, cua-llm
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -136,6 +137,9 @@ cargo run -p dinet-agent --bin browser-cua
 # CUA-Lite бенчмарк: открытые задачи агенту поверх ToolWorld (v0-политика — точка
 # прикрепления LLM; сам набор задач и чекеров — то, что измеряется):
 cargo run -p dinet-agent --bin cua-bench
+# CUA-Lite под РЕАЛЬНОЙ LLM (DoD: succ≥50% закрыт — Qwen2.5-3B-Instruct 14/22 = 64%;
+# каждый ход модели через те же гейты, чекеры те же, что у v0-политики):
+cargo run -p dinet-agent --features llama --bin cua-llm -- ~/models/qwen2.5-3b-instruct-q4_k_m.gguf 10
 ```
 
 ## Ключевые документы
@@ -158,6 +162,8 @@ cargo run -p dinet-agent --bin cua-bench
   анти-фишинг (rules v1 + тренированная модель AgentPhishing v1: логрегресс ловит
   перефразировки — «второе мнение», поднимает до Suspicious), полный аудит,
   Evolving Skills (SKILL_SHARE v1), CUA-Lite харнесс, браузер-CDP (клик/ввод/чтение
-  DOM в headless chromium) — рабочие и живо-проверяемые; далее UIA-серверы
-  (Windows/macOS), DoD-бенчмарк с LLM-политикой.
+  DOM в headless chromium) — рабочие и живо-проверяемые. DoD CUA ЗАКРЫТ LLM-политикой:
+  Qwen2.5-3B-Instruct (Q4_K_M, локально, анонимная загрузка) решает 14/22 (64%)
+  открытых задач — каждый ход через те же гейты, чекеры те же; фишинг-тест секреты
+  не выводит, все действия в аудите; далее UIA-серверы (Windows/macOS).
 - Все крейсы зелёные (тесты), warnings 0, AGPL-3.0 ядро. Подробности — `docs/ROADMAP.md`.

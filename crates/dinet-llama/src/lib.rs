@@ -36,7 +36,7 @@
 //! `Вопрос: ...\nПамять:\n- факт\n- факт\nОтвет:` — детерминированный
 //! формат, чтобы кормить в обычный ход чата без chat-template сюрпризов.
 
-use dinet_chat::ChatModel;
+pub use dinet_chat::ChatModel;
 pub use llama_cpp_2::model::LlamaLoraAdapter;
 pub use llama_cpp_2::model::LlamaModel;
 pub use llama_cpp_2::llama_backend::LlamaBackend;
@@ -62,11 +62,14 @@ pub struct LlamaOptions {
     /// применяется к каждому контексту (scale 1.0), по mtime горячо
     /// перезагружается (trainer дописывает его фоново).
     pub lora: Option<PathBuf>,
+    /// Рабочих потоков инференса. Дефолт 2 (ноутбучный сценарий);
+    /// для больших моделей (7B+) ставь 8+.
+    pub threads: usize,
 }
 
 impl Default for LlamaOptions {
     fn default() -> Self {
-        LlamaOptions { ctx_len: 512, max_tokens: 32, temp: 0.8, lora: None }
+        LlamaOptions { ctx_len: 512, max_tokens: 32, temp: 0.8, lora: None, threads: 2 }
     }
 }
 
@@ -134,6 +137,12 @@ impl LlamaChatModel {
         String::from_utf8(pieces).map_err(|e| format!("utf8: {e}"))
     }
 
+    /// Сырое дополнение промпта БЕЗ обёртки «Вопрос:/Ответ:» — точка
+    /// прикрепления агентов, которые сами формируют шаблон (ChatML).
+    pub fn complete(&mut self, prompt: &str) -> Result<String, String> {
+        self.generate(prompt)
+    }
+
     /// Стриминговое ядро: кусок байт (кусок BPE-токена) отдаётся сразу
     /// по мере сэмплинга; возвращает ВСЕ байты (полный ответ) либо
     /// (ошибка, что уже успело уйти — кусок мог уйти до падения).
@@ -156,10 +165,13 @@ impl LlamaChatModel {
             prompt_tokens
         };
         let ne_ctx = NonZeroU32::new(self.opts.ctx_len).expect("ctx_len > 0");
+        // n_batch должен вмещать ВЕСЬ промпт-батч (GGML_ASSERT в decode):
+        // для коротких промптов — дефолт 256, для длинных — авто-расширение
+        let n_batch = (prompt_tokens.len() as u32 + 8).max(256);
         let params = LlamaContextParams::default()
             .with_n_ctx(Some(ne_ctx))
-            .with_n_batch(256)
-            .with_n_threads(2);
+            .with_n_batch(n_batch)
+            .with_n_threads(self.opts.threads as i32);
         // Контекст создаётся на ход (привязка жизни к borrow-back не пашет
         // в struct; повторная инициализация на ход честнее и проста).
         // train-cpp: горячий LoRA-адаптер ДО создания контекста
@@ -210,7 +222,10 @@ impl LlamaChatModel {
 
         let mut sampler = LlamaSampler::chain_simple(vec![
             LlamaSampler::temp(self.opts.temp),
-            LlamaSampler::dist(123_456),
+            // seed меняется от вызова к вызову: ретрай после ошибки должен
+            // СЭМПЛИРОВАТЬ, а не упорно повторять тот же ход (при temp=0
+            // сид не влияет — распределение одно-горячее)
+            LlamaSampler::dist(seed()),
         ]);
         let mut out: Vec<u8> = Vec::new();
         for step in 0..self.opts.max_tokens {
@@ -285,6 +300,15 @@ pub struct Probe {
     pub n_vocab: usize,
     pub hidden: Vec<f32>,
     pub base_logits: Vec<f32>,
+}
+
+/// Сид сэмплинга на этот вызов: наносекунды времени (u32; дистрибутивный
+/// сэмплер должен двигаться; при temp=0 сид не влияет).
+fn seed() -> u32 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.subsec_nanos(),
+        Err(_) => 1,
+    }
 }
 
 /// Один проход llama.cpp по последовательности со флагом logits на ВСЕХ
