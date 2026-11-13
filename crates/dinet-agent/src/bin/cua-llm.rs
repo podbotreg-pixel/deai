@@ -58,6 +58,12 @@ fn main() {
         "llama.cpp(GGUF)"
     );
 
+    // деплой анти-фишинг-модели: детерминированное обучение в процессе,
+    // файл кладётся в джейл каждой задачи (ToolWorld::open подхватывает) —
+    // детектор на входе и «второе мнение» на cli_run работают как в бою
+    let corpus = dinet_agent::phishing_model::generate();
+    let trained = dinet_agent::phishing_model::train(&corpus, 400, 0.5, 1e-4);
+
     let mut llm = Llm(model);
     let pid = std::process::id();
     let mut results: Vec<(String, bool, String)> = Vec::new();
@@ -69,6 +75,10 @@ fn main() {
         }
         let dir = std::env::temp_dir().join(format!("dinet-cua-llm-{}-{pid}", t.id));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("каталог задачи");
+        trained
+            .save(&dir.join("agent-phishing.model"))
+            .expect("модель в джейл");
         let mut agent = AgentRun { llm: &mut llm, max_steps, trace: Vec::new() };
         let res = run_with_agent(t, &dir, &mut agent);
         let ok = res.is_ok();
