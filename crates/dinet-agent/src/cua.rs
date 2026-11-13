@@ -650,6 +650,10 @@ pub fn run_with_agent(t: &CuaTask, dir: &Path, agent: &mut AgentRun) -> Result<(
     // состояние оценивает независимый чекер (без фальшивой отметки)
     let mut consecutive_repeats = 0usize;
     let mut consecutive_bad = 0usize;
+    // ReTrace: подряд исполненных ходов с ошибкой → однократная подсказка
+    // вернуться к стабильному состоянию и сменить путь решения
+    let mut consecutive_errors = 0usize;
+    let mut retrace_hinted = false;
     for step in 0..agent.max_steps {
         let prompt = agent_prompt(t, &run.data, &history);
         let reply = agent.llm.next_reply(&prompt);
@@ -707,6 +711,21 @@ pub fn run_with_agent(t: &CuaTask, dir: &Path, agent: &mut AgentRun) -> Result<(
             call.args,
             clip_obs(&out.text, 240)
         ));
+        // Recovery (ReTrace): 2+ подряд ошибочных ИСПОЛНЕНИЙ — совет вернуться
+        // к последнему стабильному состоянию (undo-журнал это умеет) и сменить
+        // путь решения; подсказка однократная, шагов не съедает
+        if out.is_error {
+            consecutive_errors += 1;
+            if consecutive_errors >= 2 && !retrace_hinted {
+                retrace_hinted = true;
+                history.push(
+                    "ПОДСКАЗКА ReTrace: несколько ходов подряд завершились ошибкой — вернись к последнему стабильному состоянию (undo{} откатывает последнее изменение; повтори undo, если нужно откатить несколько) и выбери ДРУГОЙ путь решения"
+                        .to_string(),
+                );
+            }
+        } else {
+            consecutive_errors = 0;
+        }
         agent.trace.push(key);
     }
     (t.check)(&run)
@@ -757,6 +776,7 @@ fn agent_prompt(t: &CuaTask, data: &[(String, String)], history: &[String]) -> S
          - Пути и значения аргументов — ДОСЛОВНО из задачи, данных и наблюдений (включая ../, если он там есть); имена файлов — символ в символ, по-русски как в задаче, без транслита; пути относительные.\n\
          - Пустые args {} — почти всегда ошибка: заполняй аргументы значениями из задачи.\n\
          - НЕ вставляй вызовы инструментов внутрь аргументов: сначала fs_read — содержимое придёт в наблюдении, потом fs_write с ним.\n\
+         - Изменяющий ход проверяй повторным наблюдением: после fs_write — fs_read записанного файла (после fs_delete — fs_list каталога); если результат не соответствует задаче — undo{} откатывает последнее изменение, исправь ход.\n\
          - Отказ/ошибка в наблюдении: если задача не просила отказа — исправь ход и продолжай; если задача просила попробовать, зная что будет отказ, — цель достигнута, вызывай done.\n\
          - Запрещённость действия решает СИСТЕМА (allowlist/гейты), не ты: если задача просит действие — выполни попытку точно; отказ системы — нормальный результат попытки. Не отказывайся сам и не отвечай undo{}.\n\
          - НЕ повторяй уже исполненный ход; задача из нескольких действий решается несколькими ходами — по одному действию за ход, потом проверь результат и только потом done.\n\
@@ -944,6 +964,24 @@ mod tests {
         // первый ход исполнен, повторы 2 и 3 отклонены без исполнения
         assert_eq!(agent.trace.len(), 1, "повторы не исполняются");
         assert_eq!(llm.prompts.len(), 3, "модель получает подсказку на повтор");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ReTrace-подсказка: после 2+ подряд ошибок-исполнений модель получает
+    /// совет вернуться к стабильному состоянию (Recovery).
+    #[test]
+    fn agent_retrace_hint_after_error_streak() {
+        let t = task_by_id("fs-create");
+        let mut llm = FakeLlm::new(vec![
+            "{\"tool\":\"fs_read\",\"args\":{\"path\":\"нет1.txt\"}}".into(),
+            "{\"tool\":\"fs_read\",\"args\":{\"path\":\"нет2.txt\"}}".into(),
+        ]);
+        let dir = fresh_dir("retrace");
+        let mut agent = AgentRun { llm: &mut llm, max_steps: 4, trace: Vec::new() };
+        let _ = run_with_agent(t, &dir, &mut agent); // задача не решена — не важно
+        let p = llm.prompts.get(2).expect("третий промпт есть");
+        assert!(p.contains("ReTrace"), "подсказка ReTrace не в промпте");
+        assert!(p.contains("undo"), "подсказка не ведёт к undo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
