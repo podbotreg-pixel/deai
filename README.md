@@ -79,7 +79,7 @@ cargo run -p dinet-client --bin clientswarm -- /tmp/opencode/clients --pid 1 --p
 # ГРАФИЧЕСКАЯ ОБОЛОЧКА: чат в браузере + вклад клиента в рой с живого ввода:
 cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
                              # открой http://localhost:8080 (std-only, страница вшита в бинарник;
-                             # Tauri 2 позже завернёт ЭТУ ЖЕ страницу в окно без переписывания)
+                             # настольное окно этой функциональности — Qt, правило GUI в PROMPT.md)
                              # кнопка «Учить» = пара учителя → каждые 4 пары локальная эра роя
                              # → REVEAL-эра принимает чек-пойнт → ЧАТ ОТВЕЧАЕТ ОБУЧЕННЫМ РЕПЛИКОЙ
                              # (реплика переживает рестарт: ./dinet-web-mem.roi)
@@ -102,7 +102,7 @@ cargo run -p dinet-p2p --bin p2pswarm -- 4 2
 cargo run -p dinet-llama --bin llamachat -- /tmp/opencode/gemma270m.gguf "Привет! 2+2=?"
                              # gemma-3-270m Q8 (реальный llama.cpp, — модель качается с HuggingFace);
                              # LlamaChatModel реализует ТОТ ЖЕ трейт ChatModel, что и
-                             # микроязыковая сеть роя (webchat/Tauri подложит её флагом)
+                             # микроязыковая сеть роя (webchat/Qt-клиент подложит её флагом)
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem

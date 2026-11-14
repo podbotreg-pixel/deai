@@ -126,7 +126,9 @@
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp
-- [ ] Чат-UI (Tauri) поверх `ChatSession`, экспорт, миграция (механика сессии уже готова)
+- [ ] Чат-UI (Qt) поверх `ChatSession`, экспорт, миграция (механика сессии уже готова)
+      — ПРАВИЛО: GUI для Linux и Windows строится на Qt (комплекты сборки
+      в /home/appelsin/Qt); веб-страница webchat остаётся lightweight-слоем
 - [x] **Speak→learn (механика):** буфер пар → LoRA + hinge-предпочтение (saturating DPO-lite),
       DP-клиппинг, local_fit → secure_agg — на toy-модели, интерфейс LocalTrainer устойчив
       к замене на llama.cpp
@@ -172,7 +174,8 @@
 - [x] Графическая оболочка v0 (`webchat`): чат в браузере на localhost
       (std-only HTTP, страница вшита в бинарник), RAG-память (/ask//forget),
       пара учителя через UI `обучающая пара` → локальная эра роя от каждых
-      N пар; та же страница потом станет окном Tauri 2 без переписывания
+      N пар; настольное окно для той же функциональности — Qt (правило
+      GUI выше)
 - [x] GUI-стиль из СИСТЕМНОГО пакета (libjs-bootstrap, «всё локально»):
       роут `GET /bs/<файл>` отдаёт whitelisted файлы из
       /usr/share/javascript/bootstrap (css/bootstrap(.min).css + шрифты

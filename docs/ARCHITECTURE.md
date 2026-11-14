@@ -29,7 +29,7 @@
 │                                                                  │
 │  ┌───────────┐   ┌──────────────┐   ┌──────────────────────────┐ │
 │  │ UI-оболочка│→ │  Agent Core   │→ │  Инференс (llama.cpp/MLX)│ │
-│  │ Tauri /    │   │ PAPAV-цикл,   │   │  GGUF база (заморожена)  │ │
+│  │ Qt /       │   │ PAPAV-цикл,   │   │  GGUF база (заморожена)  │ │
 │  │ Compose    │   │ MCP-серверы,  │   │  + личный LoRA-адаптер   │ │
 │  │            │   │ память (RAG)  │   │  + сетевой LoRA-адаптер  │ │
 │  └───────────┘   └──────────────┘   └────────────┬─────────────┘ │
@@ -207,7 +207,8 @@ charging only».
   `dinet-net` (transport/DHT/gossip), `dinet-fl` (DP-SGD, secure agg, сжатие),
   `dinet-proto` (wire-сообщения), `dinet-crypto` (ed25519/DID/HASH).
 - **Инференс:** llama.cpp binding (GGUF), MLX на macOS. [{ОТКРЫТО}: NPU-путь]
-- **UI:** Tauri 2 (desktop), Compose (Android). Кубо: общая REST/IPC-обвязка узла.
+- **UI:** Qt (desktop — Linux/Windows; комплекты сборки в /home/appelsin/Qt),
+  Compose (Android). Кубо: общая REST/IPC-обвязка узла.
 - **Крипто:** ed25519-dalek, X25519 + Noise, SHA-256 content addressing, Merkle.
 - **Хранилище:** SQLite (+sqlite-vec для RAG), локальные логи append-only.
 - **Лицензии:** ядро AGPL-3.0 (анти-приватизация), SDK/протокол Apache-2.0.
