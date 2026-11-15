@@ -664,6 +664,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinet-android"
+version = "0.1.0"
+dependencies = [
+ "dinet-chat",
+ "dinet-client",
+ "dinet-fl",
+ "dinet-memory",
+ "dinet-node",
+]
+
+[[package]]
 name = "dinet-chat"
 version = "0.1.0"
 dependencies = [

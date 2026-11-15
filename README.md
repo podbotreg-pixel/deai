@@ -56,6 +56,13 @@ crates/
                       AT-SPI: Linux GUI (рукописный D-Bus, dbus.rs + atspi.rs);
                       LLM-политика CUA (DoD succ≥50% закрыт).
                       bin: agentd, cua-bench, phishing-train, browser-cua, cua-llm, gui-spi
+  dinet-android/      M3-ТЕЛЕФОН (std-only): то же ядро (ChatSession + рой) в
+                      cdylib `libdinet_phone.so`; JNI-мост рукописный — таблица
+                      JNIEnv по спец-индексам, страж ABI (GetVersion 1.6 +
+                      self-roundtrip «ок»), экспорты open/turn/teach/stats;
+                      локальные эры роя каждые 4 валидные пары, чек-пойнт
+                      REVEAL → реплика чата. Compose-UI в `android/` (Gradle),
+                      .so собирает crates/dinet-android/build-android.sh
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -106,6 +113,14 @@ cargo run -p dinet-llama --bin llamachat -- /tmp/opencode/gemma270m.gguf "При
                              # микроязыковая сеть роя (webchat/Qt-клиент подложит её флагом)
 cargo run -p dinet-memory --bin memdemo -- ./dinet-mem
                              # REPL памяти: /remember | /ask | /forget | /stats
+# M3-ТЕЛЕФОН: то же ядро на Android (Compose UI, без аккаунтов — сборка целиком локальная):
+crates/dinet-android/build-android.sh
+                             # libdinet_phone.so (arm64-v8a + x86_64) → android/app/src/main/jniLibs;
+                             # требуется rustup target add aarch64-linux-android x86_64-linux-android
+                             # и NDK в ~/Android/Sdk/ndk (линкеры clang с суффиксом API, minSdk 24)
+cd android && ./gradlew assembleDebug
+                             # app-debug.apk; UI: чат + кнопка «Учить» + строка stats —
+                             # та же логика, что у webchat (эра каждые 4 пары, REVEAL → реплика)
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
                              # REPL-чат: история, RAG-контекст, пары speak→learn
 # M2-АГЕНТ: MCP-сервер поверх FS-песочницы (agentd — NDJSON/stdio, спека 2025-06-18):

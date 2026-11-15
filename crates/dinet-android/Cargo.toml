@@ -1,0 +1,21 @@
+[package]
+name = "dinet-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Телефонное ядро DI-NET (M3): тот же Rust-стек чата и роя, рукописный JNI-мост без крейта jni"
+
+[lib]
+# cdylib → libdinet_phone.so (loadLibrary("dinet_phone"); имя НЕ "dinet_core" —
+# совпало бы с lib таргетом крейта dinet-core, filename collision);
+# rlib — для host-тестов.
+name = "dinet_phone"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dinet-chat = { path = "../dinet-chat" }
+dinet-client = { path = "../dinet-client" }
+dinet-fl = { path = "../dinet-fl" }
+dinet-memory = { path = "../dinet-memory" }
+dinet-node = { path = "../dinet-node" }

@@ -213,6 +213,13 @@ charging only».
 - **Инференс:** llama.cpp binding (GGUF), MLX на macOS. [{ОТКРЫТО}: NPU-путь]
 - **UI:** Qt (desktop — Linux/Windows; комплекты сборки в /home/appelsin/Qt),
   Compose (Android). Кубо: общая REST/IPC-обвязка узла.
+- **Мобильная ветка (M3):** `dinet-android` — то же ядро (chat/node/fl/memory)
+  в cdylib `libdinet_phone.so`; JNI-ABI рукописный (таблица JNIEnv по
+  спец-индексам + страж GetVersion 1.6/self-roundtrip, без крейта jni),
+  Compose-UI в `android/` (Gradle 8.10.2 + AGP 8.7.3 + Kotlin 2.0.21,
+  minSdk 24 / target 35); сборка .so — build-android.sh (линкеры clang NDK,
+  без cargo-ndk). Хранилище телефона — тот же append-only KV
+  (dinet-memory), не SQLite.
 - **Крипто:** ed25519-dalek, X25519 + Noise, SHA-256 content addressing, Merkle.
 - **Хранилище:** SQLite (+sqlite-vec для RAG), локальные логи append-only.
 - **Лицензии:** ядро AGPL-3.0 (анти-приватизация), SDK/протокол Apache-2.0.

@@ -819,6 +819,28 @@ REVEAL-эры с robust-агрегацией и чек-пойнтом); симу
 ## M3 — Мобильные (8 недель)
 
 - [ ] Android (Compose UI, JDK ↔ Rust core ↔ llama.cpp NDK)
+  - [x] шаг 1: скелет Android — Compose UI поверх того же Rust-ядра.
+    Крейт `dinet-android` (cdylib → `libdinet_phone.so`): `PhoneCore`
+    собирает то же ядро, что у webchat — `ChatSession` (KV `<dir>`,
+    автопары диалогов + учительские), рой-KV `<dir>.рой`
+    («рой:adapter|cps|eras», переживают рестарт), локальная эра роя
+    каждые 4 валидные пары (тот же `run_era_partition`, чек-пойнт
+    REVEAL каждые 4-ю эру → сразу реплика чата). JNI-мост рукописный
+    (без крейта jni): таблица JNIEnv по спец-индексам
+    (GetVersion=4, FindClass=6, ThrowNew=14, NewStringUTF=167,
+    GetStringUTFChars=169, ReleaseStringUTFChars=170,
+    ExceptionCheck=228), страж ABI в open() — GetVersion==0x00010006
+    и self-roundtrip «ок», несходство = паника, Java видит
+    false + RuntimeException. Экспорты
+    Java_dev_dinet_app_Core_{open,turn,teach,stats}; строки — MUTF-8
+    ≈ UTF-8 для BMP (кириллица байт-в-байт, non-BMP lossy).
+    Сборка .so — `crates/dinet-android/build-android.sh` (без
+    cargo-ndk: CARGO_TARGET_*_LINKER на clang NDK, minSdk 24 →
+    суффикс API) → jniLibs/{arm64-v8a,x86_64}; Gradle-проект
+    `android/` (Gradle 8.10.2 + AGP 8.7.3 + Kotlin 2.0.21 + compose
+    2.0.21, compileSdk 35, minSdk 24, репозитории google()/mavenCentral —
+    без аккаунтов). Host-тесты: ход/учёба, эра на 16 парах, чек-пойнт
+    4-й эры, персистентность пар и адаптера, stats — 5/5.
 - [ ] WorkManager-расписание (charging + un-metered Wi-Fi only)
 - [ ] EFFEKT-прокси: телефон обучает 0.5B-прокси, вклад — через DSL/дистилляцию
 

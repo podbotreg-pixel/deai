@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 Cargo.lock.bak
+/android/build/
+/android/.gradle/
+/android/local.properties
+/android/app/build/
+/android/.idea/
