@@ -208,6 +208,40 @@ fn tools_list() -> Json {
                     ],
                     vec![Json::Str("selector".into()), Json::Str("text".into())],
                 ),
+                "gui_connect" => (vec![], vec![]),
+                "gui_nodes" => (
+                    vec![
+                        ("app".into(), Json::Obj(vec![
+                            ("type".into(), Json::Str("string".into())),
+                            ("description".into(), Json::Str("пусто = список приложений; иначе дерево приложения (substring)".into())),
+                        ])),
+                        ("depth".into(), Json::Obj(vec![
+                            ("type".into(), Json::Str("integer".into())),
+                            ("description".into(), Json::Str("глубина обхода (1-8, по умолчанию 4)".into())),
+                        ])),
+                    ],
+                    vec![],
+                ),
+                "gui_text" | "gui_focus" => (
+                    vec![("id".into(), Json::Obj(vec![
+                        ("type".into(), Json::Str("integer".into())),
+                        ("description".into(), Json::Str("id узла из последнего gui_nodes".into())),
+                    ]))],
+                    vec![Json::Str("id".into())],
+                ),
+                "gui_click" => (
+                    vec![
+                        ("id".into(), Json::Obj(vec![
+                            ("type".into(), Json::Str("integer".into())),
+                            ("description".into(), Json::Str("id узла из последнего gui_nodes".into())),
+                        ])),
+                        ("action".into(), Json::Obj(vec![
+                            ("type".into(), Json::Str("integer".into())),
+                            ("description".into(), Json::Str("индекс действия (по умолчанию 0)".into())),
+                        ])),
+                    ],
+                    vec![Json::Str("id".into())],
+                ),
                 _ => (Vec::new(), Vec::new()),
             };
             Json::Obj(vec![
@@ -219,7 +253,7 @@ fn tools_list() -> Json {
                     ("required".into(), Json::Arr(req)),
                 ])),
                 ("annotations".into(), Json::Obj(vec![
-                    ("readOnlyHint".into(), Json::Bool(matches!(*name, "fs_read" | "fs_list" | "browser_read" | "audit_tail" | "skill_list"))),
+                    ("readOnlyHint".into(), Json::Bool(matches!(*name, "fs_read" | "fs_list" | "browser_read" | "gui_connect" | "gui_nodes" | "gui_text" | "audit_tail" | "skill_list"))),
                     ("destructiveHint".into(), Json::Bool(*name == "fs_delete")),
                 ])),
             ])
@@ -355,14 +389,14 @@ mod tests {
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#]);
         assert!(resp.is_empty(), "уведомления молчат");
 
-        // tools/list: семнадцать инструментов
-        // (5 FS/CLI + undo + audit_tail + 5 навыковых)
+        // tools/list: двадцать два инструмента
+        // (5 FS/CLI + undo + audit_tail + 5 навыковых + 6 браузерных + 5 GUI)
         let resp = feed(&mut srv, &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
         let tools = resp[0].get("result").unwrap().get("tools").and_then(|j| match j {
             Json::Arr(v) => Some(v.len()),
             _ => None,
         });
-        assert_eq!(tools, Some(17));
+        assert_eq!(tools, Some(22));
 
         // fs_write → fs_read
         let resp = feed(

@@ -143,6 +143,10 @@ Aptain: неотсутствующие/офлайн узлы не блокиру
 
 - **Perceive:** скрин + AX-дерево (Win UIA / macOS AX / Linux AT-SPI / Android
   AccessibilityService), DOM-снимок браузера (CDP, локальный профиль), CLI-launch.
+  Linux-ветка AT-SPI реализована (dbus.rs + atspi.rs: рукописный D-Bus — SASL
+  EXTERNAL по UnixSocket, маршалинг вручную; инструменты gui_connect/gui_nodes/
+  gui_text READ, gui_click/gui_focus WRITE; gui-spi demo 6/6 на живой шине);
+  Windows UIA / macOS AX — на этой машине не проверяемы (честно).
 - **Plan:** план ≤10 шагов, каждый — в журнале с undo-свойствами.
 - **Act:** через **MCP-серверы**; каждое действие требует capability-token с TTL.
   Уровни: READ / WRITE(confirm-by-default) / DESTRUCTIVE / NETWORK(confirm+лог).

@@ -4,9 +4,11 @@
 //! tools (инструменты), mcp (JSON-RPC 2.0 stdio NDJSON).
 
 pub mod audit;
+pub mod atspi;
 pub mod browser;
 pub mod caps;
 pub mod cua;
+pub mod dbus;
 pub mod jail;
 pub mod journal;
 pub mod json;

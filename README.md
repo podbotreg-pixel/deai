@@ -53,8 +53,9 @@ crates/
                       (rules v1 + тренированная модель AgentPhishing v1); полный
                       аудит-журнал; Evolving Skills (SKILL_SHARE); CUA-Lite
                       бенчмарк; браузер-CDP (chromium, рукописный WS-клиент);
+                      AT-SPI: Linux GUI (рукописный D-Bus, dbus.rs + atspi.rs);
                       LLM-политика CUA (DoD succ≥50% закрыт).
-                      bin: agentd, cua-bench, phishing-train, browser-cua, cua-llm
+                      bin: agentd, cua-bench, phishing-train, browser-cua, cua-llm, gui-spi
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -134,6 +135,12 @@ cargo run -p dinet-agent --bin phishing-train -- /tmp/opencode/agent-jail/agent-
 # DevTools-протоколу, рукописный WS-клиент); browser-cua поднимает chromium сам и
 # решает задачи на локальных data:-страницах (офлайн):
 cargo run -p dinet-agent --bin browser-cua
+# AT-SPI (Linux GUI): чтение дерева доступности поверх рукописного D-Bus
+# (SASL EXTERNAL по UnixSocket, без зависимостей); gui-spi осматривает живую
+# шину (apps | tree | text | click | focus) и в demo поднимает СВОЁ gtk-окно,
+# кликает по своей кнопке через WRITE-гейт и проверяет эффект (счётчик 0→1):
+target/debug/gui-spi apps
+target/debug/gui-spi demo
 # CUA-Lite бенчмарк: открытые задачи агенту поверх ToolWorld (v0-политика — точка
 # прикрепления LLM; сам набор задач и чекеров — то, что измеряется):
 cargo run -p dinet-agent --bin cua-bench
@@ -158,13 +165,15 @@ cargo run -p dinet-agent --features llama --bin cua-llm -- ~/models/qwen2.5-3b-i
 - **M2-инфосфера закрыта** — клиенты учат рой со своих диалогов (clientswarm),
   многоузловые эры через мост, LoRA-диссеминация через рой; webchat: браузерный
   чат с сетевыми эрами (`--net`) и настоящей llama.cpp (`--features llama`).
-- **M2-Агент в пути** — MCP-сервер (17 инструментов), capability-токены, undo-журнал,
+- **M2-Агент в пути** — MCP-сервер (22 инструмента), capability-токены, undo-журнал,
   анти-фишинг (rules v1 + тренированная модель AgentPhishing v1: логрегресс ловит
   перефразировки — «второе мнение», поднимает до Suspicious; детектор на входе —
   данные/конверты в промпте агента помечаются ⚠ [АНТИ-ФИШИНГ ВХОД], блокируют
   по-прежнему гейты действий), полный аудит, PAPAV-цикл (Verify повторным
   наблюдением + Recovery/ReTrace-подсказка), Evolving Skills (SKILL_SHARE v1),
-  CUA-Lite харнесс, браузер-CDP (клик/ввод/чтение DOM в headless chromium) —
+  CUA-Lite харнесс, браузер-CDP (клик/ввод/чтение DOM в headless chromium),
+  AT-SPI: Linux GUI (дерево доступности поверх рукописного D-Bus; gui-spi demo
+  6/6 — клик по своему окну с проверкой эффекта) —
   рабочие и живо-проверяемые. DoD CUA ЗАКРЫТ LLM-политикой: Qwen2.5-3B-Instruct
   (Q4_K_M, локально, анонимная загрузка) решает 11–14/22 (50–64%) открытых задач
   (полоса трёх прогонов) — каждый ход через те же гейты, чекеры те же; фишинг-тест

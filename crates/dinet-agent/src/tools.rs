@@ -107,6 +107,31 @@ pub const TOOLS: &[(&str, Need, &str)] = &[
         Need { level: CapLevel::Network },
         "Ввести текст в поле (клик + Input.insertText). Аргументы: selector, text.",
     ),
+    (
+        "gui_connect",
+        Need { level: CapLevel::Read },
+        "Подключиться к Linux GUI (AT-SPI, шина доступности D-Bus). Чтение — READ; клик/фокус — WRITE. Без аргументов.",
+    ),
+    (
+        "gui_nodes",
+        Need { level: CapLevel::Read },
+        "Список приложений (без аргументов) или дерево одного приложения (аргументы: app, depth). Заполняет кэш узлов: id из последнего gui_nodes.",
+    ),
+    (
+        "gui_text",
+        Need { level: CapLevel::Read },
+        "Текст текстового узла (terminal, поле ввода…). Аргументы: id.",
+    ),
+    (
+        "gui_click",
+        Need { level: CapLevel::Write },
+        "Действие узла по индексу (кнопки, пункты меню). Аргументы: id, action (по умолчанию 0).",
+    ),
+    (
+        "gui_focus",
+        Need { level: CapLevel::Write },
+        "Фокус на узле (окно, поле ввода). Аргументы: id.",
+    ),
 ];
 
 pub fn need(tool: &str) -> Option<Need> {
@@ -142,6 +167,10 @@ pub struct ToolWorld {
     pub model: Option<Model>,
     /// Браузер по CDP (chromium DevTools), если подключён.
     pub browser: Option<crate::browser::Browser>,
+    /// Linux GUI по AT-SPI (шина доступности), если подключён.
+    pub gui: Option<crate::atspi::Atspi>,
+    /// Кэш узлов последнего gui_nodes (id = индекс).
+    pub gui_nodes: Vec<crate::atspi::Node>,
     /// Лимит вывода cli (байт) — журнал/чат не рвём.
     pub cli_out_limit: usize,
 }
@@ -177,7 +206,7 @@ impl ToolWorld {
         } else {
             None
         };
-        Ok(ToolWorld { jail, allow, journal, audit, skills, signer, model, browser: None, cli_out_limit: 64 * 1024 })
+        Ok(ToolWorld { jail, allow, journal, audit, skills, signer, model, browser: None, gui: None, gui_nodes: Vec::new(), cli_out_limit: 64 * 1024 })
     }
 
     /// ---------- fs_read ----------
@@ -385,6 +414,131 @@ impl ToolWorld {
         }
     }
 
+    /// ---------- GUI (AT-SPI, Linux) ----------
+    /// Подключиться к шине доступности (адрес — org.a11y.Bus либо сокет
+    /// по стандартному месту). Мир работает и без GUI: ошибка честная.
+    fn gui_connect(&mut self) -> ToolOut {
+        let addr = match crate::atspi::Atspi::resolve() {
+            Ok(a) => a,
+            Err(e) => return ToolOut::err(format!("gui: {e}")),
+        };
+        match crate::atspi::Atspi::connect(&addr) {
+            Ok(a) => {
+                self.gui = Some(a);
+                self.gui_nodes.clear();
+                ToolOut::ok(format!("подключён: {addr}"))
+            }
+            Err(e) => ToolOut::err(format!("gui: {e}")),
+        }
+    }
+
+    /// Список приложений (app пуст) или дерево одного приложения:
+    /// заполняет кэш gui_nodes, id = индекс строки.
+    fn gui_list(&mut self, app: &str, depth: usize) -> ToolOut {
+        let Some(g) = self.gui.as_mut() else {
+            return ToolOut::err("нет подключения к GUI (gui_connect)".into());
+        };
+        if app.is_empty() {
+            match g.apps() {
+                Ok(apps) => {
+                    let mut s = String::new();
+                    for (i, n) in apps.iter().enumerate() {
+                        s.push_str(&format!(
+                            "{i} role={} name={} {} {}\n",
+                            n.role, n.name, n.r.bus, n.r.path
+                        ));
+                    }
+                    self.gui_nodes = apps;
+                    ToolOut::ok(s.trim_end().into())
+                }
+                Err(e) => ToolOut::err(format!("gui: {e}")),
+            }
+        } else {
+            // приложение ищем в кэше последнего listing'а (substring, без регистра)
+            let target = self
+                .gui_nodes
+                .iter()
+                .find(|n| n.role == "application" && n.name.to_lowercase().contains(&app.to_lowercase()))
+                .cloned();
+            let Some(app_node) = target else {
+                return ToolOut::err(format!(
+                    "gui: приложение {app:?} не найдено (сначала gui_nodes без аргументов)"
+                ));
+            };
+            let depth = depth.clamp(1, 8);
+            match g.tree(&app_node.r, depth) {
+                Ok(nodes) => {
+                    let mut s = String::new();
+                    for (i, n) in nodes.iter().enumerate() {
+                        s.push_str(&format!(
+                            "{i} role={} name={} {} {}\n",
+                            n.role, n.name, n.r.bus, n.r.path
+                        ));
+                    }
+                    self.gui_nodes = nodes;
+                    ToolOut::ok(s.trim_end().into())
+                }
+                Err(e) => ToolOut::err(format!("gui: {e}")),
+            }
+        }
+    }
+
+    /// Текст узла по id из кэша.
+    fn gui_text(&mut self, id: usize) -> ToolOut {
+        let Some(g) = self.gui.as_mut() else {
+            return ToolOut::err("нет подключения к GUI (gui_connect)".into());
+        };
+        let Some(n) = self.gui_nodes.get(id) else {
+            return ToolOut::err(format!("gui: нет узла {id} (id из последнего gui_nodes)"));
+        };
+        match g.text(&n.r) {
+            Ok(t) => {
+                if t.is_empty() {
+                    ToolOut::ok("(пусто)".into())
+                } else {
+                    ToolOut::ok(clip(&t, self.cli_out_limit))
+                }
+            }
+            Err(e) => ToolOut::err(format!("gui: {e}")),
+        }
+    }
+
+    /// Действие узла по индексу (кнопки/пункты) — WRITE в чужом окне.
+    fn gui_click(&mut self, id: usize, action: usize) -> ToolOut {
+        let Some(g) = self.gui.as_mut() else {
+            return ToolOut::err("нет подключения к GUI (gui_connect)".into());
+        };
+        let Some(n) = self.gui_nodes.get(id) else {
+            return ToolOut::err(format!("gui: нет узла {id} (id из последнего gui_nodes)"));
+        };
+        match g.do_action(&n.r, action) {
+            Ok(true) => ToolOut::ok(format!(
+                "действие {action} отправлено: {} «{}»",
+                n.role, n.name
+            )),
+            Ok(false) => ToolOut::err(format!(
+                "gui: действие {action} не выполнено ({} «{}»)",
+                n.role, n.name
+            )),
+            Err(e) => ToolOut::err(format!("gui: {e}")),
+        }
+    }
+
+    /// Фокус на узле — WRITE.
+    fn gui_focus(&mut self, id: usize) -> ToolOut {
+        let Some(g) = self.gui.as_mut() else {
+            return ToolOut::err("нет подключения к GUI (gui_connect)".into());
+        };
+        let Some(n) = self.gui_nodes.get(id) else {
+            return ToolOut::err(format!("gui: нет узла {id} (id из последнего gui_nodes)"));
+        };
+        match g.grab_focus(&n.r) {
+            Ok(true) => ToolOut::ok(format!("фокус: {} «{}»", n.role, n.name)),
+            Ok(false) => ToolOut::err(format!("gui: фокус не взят ({} «{}»)", n.role, n.name)),
+            Err(e) => ToolOut::err(format!("gui: {e}")),
+        }
+    }
+
     /// Хэндлер всех инструментов: фишинг-фильтр входа → гейт уровня →
     /// действие → аудит. Секрет-пути бракуются ДО открытия даже READ'у.
     pub fn call(&mut self, granted: CapLevel, name: &str, args: &crate::json::Json) -> ToolOut {
@@ -550,6 +704,26 @@ impl ToolWorld {
                     return ToolOut::err("нужны selector и text".into());
                 };
                 self.browser_type(&s, &t)
+            }
+            "gui_connect" => self.gui_connect(),
+            "gui_nodes" => {
+                let app = arg_str(args, "app").unwrap_or_default();
+                let depth = arg_int(args, "depth").unwrap_or(4);
+                self.gui_list(&app, depth)
+            }
+            "gui_text" => match arg_int(args, "id") {
+                Some(id) => self.gui_text(id),
+                None => ToolOut::err("нужен id (из gui_nodes)".into()),
+            },
+            "gui_click" => {
+                let Some(id) = arg_int(args, "id") else {
+                    return ToolOut::err("нужен id (из gui_nodes)".into());
+                };
+                self.gui_click(id, arg_int(args, "action").unwrap_or(0))
+            }
+            "gui_focus" => match arg_int(args, "id") {
+                Some(id) => self.gui_focus(id),
+                None => ToolOut::err("нужен id (из gui_nodes)".into()),
             }
             _ => ToolOut::err(format!("неизвестный инструмент {name:?}")),
         };
@@ -1024,8 +1198,43 @@ mod tests {
         assert!(out.text.contains("#"), "{}", out.text);
     }
 
-    // ---------- Evolving Skills ----------
+    // ---------- GUI (AT-SPI) ----------
 
+    #[test]
+    fn gui_needs_levels() {
+        // чтение дерева/текста — READ; действие в чужом окне и фокус — WRITE
+        assert_eq!(need("gui_connect").map(|n| n.level), Some(CapLevel::Read));
+        assert_eq!(need("gui_nodes").map(|n| n.level), Some(CapLevel::Read));
+        assert_eq!(need("gui_text").map(|n| n.level), Some(CapLevel::Read));
+        assert_eq!(need("gui_click").map(|n| n.level), Some(CapLevel::Write));
+        assert_eq!(need("gui_focus").map(|n| n.level), Some(CapLevel::Write));
+    }
+
+    #[test]
+    fn gui_tools_honest_without_connection() {
+        let mut w = tmp_world("gui-off");
+        // мир работает и без GUI: ошибки честные, не паника
+        let out = w.call(CapLevel::Read, "gui_nodes", &args_of("{}"));
+        assert!(out.is_error, "{}", out.text);
+        assert!(out.text.contains("нет подключения"), "{}", out.text);
+        let out = w.call(CapLevel::Read, "gui_text", &args_of(r#"{"id":0}"#));
+        assert!(out.is_error && out.text.contains("нет подключения"), "{}", out.text);
+        let out = w.call(CapLevel::Write, "gui_click", &args_of(r#"{"id":0}"#));
+        assert!(out.is_error && out.text.contains("нет подключения"), "{}", out.text);
+        let out = w.call(CapLevel::Write, "gui_focus", &args_of(r#"{"id":0}"#));
+        assert!(out.is_error && out.text.contains("нет подключения"), "{}", out.text);
+    }
+
+    #[test]
+    fn gui_click_requires_id() {
+        let mut w = tmp_world("gui-noid");
+        let out = w.call(CapLevel::Write, "gui_click", &args_of("{}"));
+        assert!(out.is_error && out.text.contains("нужен id"), "{}", out.text);
+        let out = w.call(CapLevel::Read, "gui_text", &args_of("{}"));
+        assert!(out.is_error && out.text.contains("нужен id"), "{}", out.text);
+    }
+
+    // ---------- Evolving Skills ----------
     #[test]
     fn skill_save_run_restores_file() {
         let mut w = tmp_world("skillrun");
