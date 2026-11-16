@@ -39,6 +39,10 @@ use crate::PhoneCore;
 
 /// Ядро телефона — одно на процесс; открывается `open(dir)`.
 static CORE: Mutex<Option<PhoneCore>> = Mutex::new(None);
+/// Каталог KV последнего успешного `open` — фон (WorkManager) поднимает
+/// ядро через `tick()` без UI: если ядро не открыто, оно открывается
+/// отсюда само.
+static CORE_DIR: Mutex<Option<String>> = Mutex::new(None);
 
 /// `JNIEnv*`: указатель на указатель на таблицу функций.
 type Env = *mut *mut c_void;
@@ -145,6 +149,28 @@ fn core<T>(f: impl FnOnce(&mut PhoneCore) -> Result<T, String>, err: &str) -> Re
     }
 }
 
+/// Фон без UI: поднять ядро по запомненному каталогу, если оно не открыто.
+fn ensure_open() -> Result<(), String> {
+    let empty = CORE
+        .lock()
+        .map_err(|_| "блокировка ядра отравлена".to_string())?
+        .is_none();
+    if !empty {
+        return Ok(());
+    }
+    let dir = CORE_DIR
+        .lock()
+        .map_err(|_| "блокировка каталога отравлена".to_string())?
+        .clone()
+        .ok_or_else(|| "tick: каталог ядра неизвестен (сначала open)".to_string())?;
+    let c = PhoneCore::open(std::path::Path::new(&dir))
+        .map_err(|e| format!("tick: KV не открылся: {e}"))?;
+    *CORE
+        .lock()
+        .map_err(|_| "блокировка ядра отравлена".to_string())? = Some(c);
+    Ok(())
+}
+
 /// Обвязка экспорта: паника Rust-ядра ловится → Java получает
 /// `false`/пустую строку + RuntimeException с причиной.
 fn safe<T>(env: Env, tag: &str, fallback: T, f: impl FnOnce() -> Result<T, String>) -> T {
@@ -178,6 +204,9 @@ pub extern "C" fn Java_dev_dinet_app_Core_open(
                 *CORE
                     .lock()
                     .map_err(|_| "блокировка ядра отравлена".to_string())? = Some(c);
+                if let Ok(mut d) = CORE_DIR.lock() {
+                    *d = Some(dir);
+                }
                 Ok(true)
             }
             Err(e) => Err(format!("KV не открылся: {e}")),
@@ -220,6 +249,18 @@ pub extern "C" fn Java_dev_dinet_app_Core_teach(
 pub extern "C" fn Java_dev_dinet_app_Core_stats(env: Env, _class: *mut c_void) -> *mut c_void {
     let stats = safe(env, "stats", String::new(), || core(|c| Ok(c.stats()), "stats"));
     unsafe { write_string(env, &stats) }
+}
+
+/// Фоновый вклад (WorkManager, шаг 2): эра роя по новому материалу.
+/// Ядро поднимает себя сам (фоновый процесс без UI); строка-итог для логов.
+#[no_mangle]
+pub extern "C" fn Java_dev_dinet_app_Core_tick(env: Env, _class: *mut c_void) -> *mut c_void {
+    let note = safe(env, "tick", String::new(), || {
+        ensure_open()?;
+        core(|c| Ok(c.bg_tick()), "tick")
+            .map(|o| o.unwrap_or_else(|| "нет нового материала".into()))
+    });
+    unsafe { write_string(env, &note) }
 }
 
 #[cfg(test)]

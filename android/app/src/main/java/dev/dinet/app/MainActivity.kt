@@ -65,8 +65,17 @@ class MainActivity : ComponentActivity() {
             }
         )
         refreshStats()
+        // M3 шаг 2: периодический фоновый вклад (WorkManager, 6 ч; гейты
+        // батарея≥70% / Wi-Fi unmetered / термал<44°C — внутри воркера)
+        if (opened) TickWorker.schedulePeriodic(this)
         handleUri(intent?.data)
         setContent { DinetApp(this) }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // вернулись в форграунд после фона — счётчики могли уехать
+        refreshStats()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -75,7 +84,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleUri(uri: Uri?) {
-        if (uri == null || !opened) return
+        if (uri == null) return
+        if (uri.pathSegments.firstOrNull() == "bg") {
+            // «вклад сейчас»: воркер с теми же гейтами (жёсткая проверка
+            // сети-гейтов планировщика всё равно случится перед запуском)
+            if (opened) {
+                TickWorker.scheduleOnce(this)
+                push(Msg("система", "фоновый вклад запрошен; лог — logcat (dinet-bg)"))
+            }
+            return
+        }
+        if (!opened) return
         when (uri.pathSegments.firstOrNull()) {
             "turn" -> doTurn(uri.getQueryParameter("text").orEmpty())
             "teach" -> doTeach(

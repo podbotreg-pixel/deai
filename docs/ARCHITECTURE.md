@@ -197,8 +197,11 @@ Checkpoint = {
 | Idle (swarm) | 0 активного | 60–120 МБ | DHT ≤5 кБ/мин; gossip по событиям | ~0 |
 
 Триггеры старта обучения: **(зарядка ИЛИ батарея>70%) И (утилизация CPU<20% 15 мин) И (не
-«рабочие часы», если задал) И термально OK**. Мобильные: WorkManager + «Wi-Fi + un-metered +
-charging only».
+«рабочие часы», если задал) И термально OK**. Мобильные (M3, реализовано): `TickWorker`
+(WorkManager, периодика 6 ч KEEP, constraint UNMETERED + battery-not-low) с гейтами
+внутри воркера — батарея ≥70% (sticky-интент ACTION_BATTERY_CHANGED), термал <44°C,
+Wi-Fi unmetered; эра (`PhoneCore::bg_tick`) только по новому материалу, ядро
+поднимается фоном само; «вклад сейчас» — deep-link `dinet://cmd/bg`.
 
 `crates/dinet-core/src/scheduler.rs` — единственный Autority по расписанию; UI
 обязана ю-ать всегда показ: что делает узел, сколько съел, кнопки пауза/стоп/ограничить.

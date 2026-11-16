@@ -39,6 +39,10 @@ const PHONE_ID: u16 = 7;
 const WORLD_SEED: u64 = 7;
 /// Порог локальной эры: каждые N валидных учительских пар.
 const EVERY: u32 = 4;
+/// KV-ключ: сколько валидных пар было на момент ПОСЛЕДНЕЙ эры (фоновый
+/// воркер гонит эру только по новому материалу — семантика bg_trainer
+/// webchat: «при новом материале прокручивается та же era_tick»).
+const P_LAST_PAIRS: &str = "рой:last_pairs";
 
 pub struct PhoneCore {
     pub session: ChatSession,
@@ -49,6 +53,8 @@ pub struct PhoneCore {
     pub cps: u32,
     /// порог эры по парам
     pub every: u32,
+    /// валидных пар на момент последней эры (переживает рестарт)
+    pub last_pairs: u32,
     /// Реплика чата: последний чек-пойнт роя; до первой эры адаптер
     /// нулевой/начальный — микроязык отвечает argmax'ом базы, обычная
     /// речь — шаблонным режимом RAG (как в webchat).
@@ -77,6 +83,7 @@ impl PhoneCore {
         };
         let eras = kver("рой:eras");
         let cps = kver("рой:cps");
+        let last_pairs = kver(P_LAST_PAIRS);
         let mut node = Node::new(PHONE_ID, WORLD_SEED, false);
         if let Some(ab) = kv.get("рой:adapter") {
             let vals: Vec<f32> = ab
@@ -97,6 +104,7 @@ impl PhoneCore {
             eras,
             cps,
             every: EVERY,
+            last_pairs,
             model,
             kv,
         })
@@ -170,6 +178,11 @@ impl PhoneCore {
         let r = &reports[0];
         self.node = mine.remove(0);
         self.eras += 1;
+        // материал этой эры учтён: фоновый воркер не повторит её зря;
+        // счётчик эр — в KV КАЖДУЮ эру (иначе рестарт сбивает ритм reveal)
+        self.last_pairs = valid.len() as u32;
+        let _ = self.kv.put(P_LAST_PAIRS, &self.last_pairs.to_le_bytes());
+        let _ = self.kv.put("рой:eras", &self.eras.to_le_bytes());
         let mut note = format!(
             "эра {}: вклад {} пар, acc {:.3}→{:.3}",
             r.era, valid.len(), r.accuracy_before, r.accuracy_after
@@ -183,6 +196,18 @@ impl PhoneCore {
             ));
         }
         Some(note)
+    }
+
+    /// ФОНОВЫЙ вклад (WorkManager, шаг 2): эра по НОВОМУ материалу —
+    /// сколько накопилось валидных пар сверх последней эры, такая эра и
+    /// идёт (семантика bg_trainer webchat: «при новом материале»).
+    /// None — нового материала нет; воркер тогда просто выходит.
+    pub fn bg_tick(&mut self) -> Option<String> {
+        let pairs = self.valid_pairs().len() as u32;
+        if pairs <= self.last_pairs {
+            return None;
+        }
+        self.era_tick()
     }
 
     /// Чек-пойнт → KV (адаптер + счётчики, переживают рестарт) и сразу в
@@ -344,5 +369,40 @@ mod tests {
         assert!(core.stats().contains("модель: toy-v0"));
         core.teach("ай ви ди би", "ви").unwrap();
         assert!(core.stats().contains("пары: 1"), "{}", core.stats());
+    }
+
+    #[test]
+    fn bg_tick_only_on_new_material() {
+        let dir = tmp("bg");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        // 4 пары → inline-эра (last_pairs = 4); фон без нового материала — тишина
+        for i in 0..4 {
+            let (p, a) = mic_pair(i);
+            core.teach(&p, &a).unwrap();
+        }
+        assert_eq!(core.eras, 1);
+        assert_eq!(core.last_pairs, 4);
+        assert!(core.bg_tick().is_none());
+        // ещё 2 пары (не кратные порогу — inline не стрелял): фон доводит до эры
+        for i in 4..6 {
+            let (p, a) = mic_pair(i);
+            core.teach(&p, &a).unwrap();
+        }
+        assert_eq!(core.eras, 1);
+        let note = core.bg_tick().unwrap();
+        assert!(note.contains("эра"), "note: {note}");
+        assert_eq!(core.eras, 2);
+        assert_eq!(core.last_pairs, 6);
+        // снова без нового материала
+        assert!(core.bg_tick().is_none());
+        // last_pairs переживает рестарт: 7-я пара → фон гонит эру на ней
+        drop(core);
+        let mut core = PhoneCore::open(&dir).unwrap();
+        assert_eq!(core.last_pairs, 6);
+        assert_eq!(core.eras, 2, "счётчик эр переживает рестарт даже без REVEAL");
+        let (p, a) = mic_pair(6);
+        core.teach(&p, &a).unwrap();
+        assert!(core.bg_tick().unwrap().contains("эра"));
+        assert_eq!(core.eras, 3);
     }
 }

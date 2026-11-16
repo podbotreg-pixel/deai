@@ -59,10 +59,12 @@ crates/
   dinet-android/      M3-ТЕЛЕФОН (std-only): то же ядро (ChatSession + рой) в
                       cdylib `libdinet_phone.so`; JNI-мост рукописный — таблица
                       JNIEnv по спец-индексам, страж ABI (GetVersion 1.6 +
-                      self-roundtrip «ок»), экспорты open/turn/teach/stats;
+                      self-roundtrip «ок»), экспорты open/turn/teach/tick/stats;
                       локальные эры роя каждые 4 валидные пары, чек-пойнт
-                      REVEAL → реплика чата. Compose-UI в `android/` (Gradle),
-                      .so собирает crates/dinet-android/build-android.sh
+                      REVEAL → реплика чата; bg_tick — фоновая эра по новому
+                      материалу (WorkManager-воркер TickWorker: батарея ≥70%,
+                      Wi-Fi unmetered, термал <44°C). Compose-UI в `android/`
+                      (Gradle), .so собирает crates/dinet-android/build-android.sh
 prototype/            исполняемый Питон-прототип: кодирование сообщений + демо Secure Agg
 PROMPT.md             исходный мега-промт проектирования
 ```
@@ -121,6 +123,8 @@ crates/dinet-android/build-android.sh
 cd android && ./gradlew assembleDebug
                              # app-debug.apk; UI: чат + кнопка «Учить» + строка stats —
                              # та же логика, что у webchat (эра каждые 4 пары, REVEAL → реплика)
+                             # + WorkManager-вклад: periodic 6 ч (Wi-Fi unmetered, батарея ≥70%,
+                             # термал <44°C — TickWorker) и «вклад сейчас» deep-link dinet://cmd/bg
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
                              # REPL-чат: история, RAG-контекст, пары speak→learn
 # M2-АГЕНТ: MCP-сервер поверх FS-песочницы (agentd — NDJSON/stdio, спека 2025-06-18):
