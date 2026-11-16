@@ -30,6 +30,14 @@ for pair in "aarch64-linux-android:arm64-v8a" "x86_64-linux-android:x86_64"; do
   dir="${pair##*:}"
   up="$(echo "$tgt" | tr 'a-z-' 'A-Z_')"
   export "CARGO_TARGET_${up}_LINKER=$TC/${tgt}${API}-clang"
+  # ring (libp2p-noise) собирает C через cc-rs: для android-таргетов cc-rs
+  # ищет "{triple}-clang" (БЕЗ API-суффикса) на PATH, затем CC_<target>.
+  # NDK 27 держит только API-суффиксные обёртки — делаем шимы-симлинки и
+  # ставим bin NDK первым в PATH.
+  [ -e "$TC/$tgt-clang" ] || ln -s "${tgt}${API}-clang" "$TC/$tgt-clang"
+  export "CC_${up}=$TC/${tgt}${API}-clang"
+  export "AR_${up}=$TC/llvm-ar"
+  export PATH="$TC:$PATH"
   cargo build --release -p dinet-android --target "$tgt"
   mkdir -p "$OUT/$dir"
   cp -f "$ROOT/target/$tgt/release/libdinet_phone.so" "$OUT/$dir/libdinet_phone.so"

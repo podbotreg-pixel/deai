@@ -65,9 +65,13 @@ class MainActivity : ComponentActivity() {
             }
         )
         refreshStats()
-        // M3 шаг 2: периодический фоновый вклад (WorkManager, 6 ч; гейты
-        // батарея≥70% / Wi-Fi unmetered / термал<44°C — внутри воркера)
-        if (opened) TickWorker.schedulePeriodic(this)
+        // M3 шаги 2+3: периодический вклад (WorkManager, 6 ч; гейты
+        // батарея≥70% / Wi-Fi unmetered / термал<44°C — внутри воркеров):
+        // локальный по новому материалу + сетевой (dial роя, если адреса есть)
+        if (opened) {
+            TickWorker.schedulePeriodic(this)
+            NetWorker.schedulePeriodic(this)
+        }
         handleUri(intent?.data)
         setContent { DinetApp(this) }
     }
@@ -85,14 +89,41 @@ class MainActivity : ComponentActivity() {
 
     private fun handleUri(uri: Uri?) {
         if (uri == null) return
-        if (uri.pathSegments.firstOrNull() == "bg") {
-            // «вклад сейчас»: воркер с теми же гейтами (жёсткая проверка
-            // сети-гейтов планировщика всё равно случится перед запуском)
-            if (opened) {
-                TickWorker.scheduleOnce(this)
-                push(Msg("система", "фоновый вклад запрошен; лог — logcat (dinet-bg)"))
+        when (uri.pathSegments.firstOrNull()) {
+            "bg" -> {
+                // «вклад сейчас»: воркер с теми же гейтами (жёсткая проверка
+                // сети-гейтов планировщика всё равно случится перед запуском)
+                if (opened) {
+                    TickWorker.scheduleOnce(this)
+                    push(Msg("система", "фоновый вклад запрошен; лог — logcat (dinet-bg)"))
+                }
+                return
             }
-            return
+            "net" -> {
+                // «сетевой вклад сейчас»: dial роя, серия эр до чек-пойнта
+                if (opened) {
+                    NetWorker.scheduleOnce(this)
+                    push(Msg("система", "сетевой вклад запрошен; лог — logcat (dinet-net)"))
+                }
+                return
+            }
+            "peer" -> {
+                // адрес роя: ip:порт (смотрителя) — в рой-KV «рой:peers»
+                val addr = uri.getQueryParameter("addr").orEmpty()
+                if (addr.isEmpty()) {
+                    push(Msg("система", "нет addr= — формат dinet://cmd/peer?addr=ip:порт"))
+                    return
+                }
+                val ok = if (opened) Core.peer(addr) else false
+                push(
+                    Msg(
+                        "система",
+                        if (ok) "адрес роя записан: $addr; сетевой вклад — dinet://cmd/net"
+                        else "адрес НЕ записан: $addr (нужен формат ip:порт)",
+                    ),
+                )
+                return
+            }
         }
         if (!opened) return
         when (uri.pathSegments.firstOrNull()) {

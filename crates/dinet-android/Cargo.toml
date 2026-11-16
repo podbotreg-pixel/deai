@@ -19,3 +19,5 @@ dinet-client = { path = "../dinet-client" }
 dinet-fl = { path = "../dinet-fl" }
 dinet-memory = { path = "../dinet-memory" }
 dinet-node = { path = "../dinet-node" }
+dinet-p2p = { path = "../dinet-p2p" }
+dinet-registry = { path = "../dinet-registry" }

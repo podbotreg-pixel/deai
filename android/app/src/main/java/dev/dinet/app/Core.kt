@@ -26,4 +26,11 @@ object Core {
     /** Фоновый вклад (WorkManager): эра роя по новому материалу; ядро
      *  поднимает себя сам (воркер стартует без UI). */
     external fun tick(): String
+
+    /** Запомнить адрес роя (deep-link dinet://cmd/peer?addr=ip:порт). */
+    external fun peer(addr: String): Boolean
+
+    /** Сетевой вклад (WorkManager): dial роя, серия эр на реальном TCP
+     *  до чек-пойнта REVEAL; ядро поднимает себя сам. */
+    external fun net(): String
 }

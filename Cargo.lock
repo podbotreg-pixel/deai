@@ -672,6 +672,8 @@ dependencies = [
  "dinet-fl",
  "dinet-memory",
  "dinet-node",
+ "dinet-p2p",
+ "dinet-registry",
 ]
 
 [[package]]

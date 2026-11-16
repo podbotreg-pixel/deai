@@ -813,6 +813,244 @@ pub mod swarm_net {
         panic!("приглашение эры не приехало за 200 тиков (после {done:?})");
     }
 
+    /// Волна состава с бюджетом: announce → listen до тишины (5 тиков без
+    /// новых пиров). `min_iters` защищает новичка: mesh graft-ится ~1.6с,
+    /// и раньше этого объявления составов ещё не доходят — затихать можно
+    /// только после прогретой паузы. Одна и та же механика у смотрителя
+    /// роя и внешних клиентов (телефон).
+    pub fn wave_until_quiet(
+        mine: &mut [Node],
+        book: &mut PeerBook,
+        bridge: &mut dyn Transport,
+        min_iters: u32,
+        max_iters: u32,
+    ) {
+        let mut quiet = 0u32;
+        for i in 0..max_iters {
+            roster_announce(&mut mine[0], bridge);
+            settled(70);
+            let fresh = roster_listen(&mut mine[0], book, bridge);
+            if fresh == 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            if quiet >= 5 && i >= min_iters {
+                break;
+            }
+        }
+    }
+
+    /// Ждать приглашение эры с БЮДЖЕТОМ (без паники — живые клиенты:
+    /// телефон, смотритель). `announce` — продолжать вещать Hello, пока
+    /// ждём: новичок должен оставаться видимым составу, иначе следующий
+    /// минёр начнёт эру без него (разъезд состава ломает маски).
+    /// Эра, которая УЖЕ шла к нашему подключению (в накопителе есть бары
+    /// той же пары (эра, минёр) с фазой > 0), пропускается: новичок
+    /// опоздал к её фазе A — его доля не соберётся.
+    pub fn wait_invite_budget(
+        mine: &mut [Node],
+        roster: &[NodeId],
+        bridge: &mut dyn Transport,
+        done: Option<u32>,
+        ticks: u32,
+        announce: bool,
+    ) -> Option<(u32, NodeId)> {
+        use dinet_node::swarm::bar_absorb;
+        use dinet_node::transport::CH_BARRIER;
+        for i in 0..ticks {
+            if announce && i % 2 == 0 {
+                roster_announce(&mut mine[0], bridge);
+            }
+            let wire = bridge.collect(CH_BARRIER, mine[0].id);
+            bar_absorb(&mut mine[0], roster, wire);
+            let invite = mine[0]
+                .bars
+                .iter()
+                .filter(|((n, m, p), v)| {
+                    *p == 0 && *m != mine[0].id && done.map_or(true, |d| *n > d) && !v.is_empty()
+                })
+                .map(|((n, m, _), _)| (*n, *m))
+                .min();
+            if let Some((n, m)) = invite {
+                let started = mine[0]
+                    .bars
+                    .keys()
+                    .any(|&(n2, m2, p)| n2 == n && m2 == m && p > 0);
+                if started {
+                    let d = done.map_or(n, |d| d.max(n));
+                    return wait_invite_budget(mine, roster, bridge, Some(d), ticks - i - 1, announce);
+                }
+                return Some((n, m));
+            }
+            settled(60);
+        }
+        None
+    }
+
+    /// Итог сессии внешнего клиента (телефон): заметки эр + состав.
+    pub struct JoinSession {
+        /// человекочитаемая строка на каждую эру (GUI/лог)
+        pub notes: Vec<String>,
+        /// последняя эра, в которой клиент участвовал (None — не успел)
+        pub last_era: Option<u32>,
+        /// состав на момент волны
+        pub roster: Vec<NodeId>,
+        /// чек-пойнтов REVEAL применено к адаптеру узла за сессию
+        pub reveals: u32,
+    }
+
+    /// Сессия внешнего клиента роя (M3-телефон, тот же ход в тесте
+    /// динамического входа): волна состава → серия сетевых эр на СВОЁМ
+    /// батче — до чек-пойнта REVEAL либо лимита эр. Адаптер узла на входе —
+    /// накопленный клиентский (эры продолжают с него), на выходе — после
+    /// последней REVEAL-эры (реплику клиента чата пересобирает вызывающий).
+    /// Мост/книга/реестр живут у вызывающего (мост переиспользуется между
+    /// эрами и сессиями; реестр — append-only файл клиента).
+    pub fn client_join_session(
+        mine: &mut [Node],
+        book: &mut PeerBook,
+        bridge: &mut dyn Transport,
+        reg: &mut dinet_registry::RegistryLog,
+        cfg: &SimConfig,
+        seed: u64,
+        batch: Vec<Sample>,
+        max_eras: u32,
+        wave_min: u32,
+        wave_ticks: u32,
+        wait_ticks: u32,
+    ) -> Result<JoinSession, String> {
+        use dinet_node::swarm::run_net_era;
+        let mut out =
+            JoinSession { notes: Vec::new(), last_era: None, roster: Vec::new(), reveals: 0 };
+        // --- волна: каждая сессия перечитывает состав (вошли новички,
+        //     ушли старые — рой живёт своей жизнью между нашими сессиями)
+        wave_until_quiet(mine, book, bridge, wave_min, wave_ticks);
+        let roster = roster_now(mine[0].id, book);
+        if roster.len() < 3 {
+            return Err(format!(
+                "мало пиров: состав {roster:?} — ниже кворума не держится"
+            ));
+        }
+        out.roster = roster.clone();
+        mine[0].book = std::mem::take(book);
+        mine[0].batch_override = Some(batch);
+
+        let mut done: Option<u32> = None;
+        for _ in 0..max_eras {
+            let (era_n, miner) =
+                wait_invite_budget(mine, &roster, bridge, done, wait_ticks, true)
+                    .ok_or_else(|| "приглашение эры не дождались (рой молчит)".to_string())?;
+            let rep = run_net_era(mine, &roster, bridge, era_n, miner, cfg, seed, reg);
+            done = Some(done.map_or(era_n, |d| d.max(era_n)));
+            out.last_era = Some(era_n);
+            let mut note = format!(
+                "эра {}: состав {:?}, вклад {}, acc {:.3}→{:.3}, роль {:?}",
+                era_n,
+                roster,
+                rep.contributors,
+                rep.accuracy_before,
+                rep.accuracy_after,
+                rep.role
+            );
+            let reveal = rep.was_reveal && rep.checkpoint_id.is_some();
+            if reveal {
+                out.reveals += 1;
+                note.push_str("; чек-пойнт роя в адаптере узла");
+            }
+            out.notes.push(note);
+            if reveal {
+                break; // чек-пойнт уже в адаптере — на сессию хватит
+            }
+        }
+        Ok(out)
+    }
+
+    /// Итог работы смотрителя (для теста): по порядку — (эра, состав).
+    pub struct KeeperOut {
+        pub joined: Vec<(u32, Vec<NodeId>)>,
+    }
+
+    /// Ход СМОТРИТЕЛЯ роя (долгоживущий узел, M3): вечный цикл «волна →
+    /// эра». Состав перечитывается волной ПЕРЕД каждой эрой — внешние
+    /// клиенты (телефон) входят в любой момент, ушедшие выпадают.
+    /// Минёр — id 0: счётчик эр у него (persist в era_path, если задан —
+    /// переживает рестарт смотрителя); прочие ждут приглашения.
+    /// `max_eras` > 0 ограничивает сессию (тест); 0 — бесконечно (бинарник).
+    pub fn keeper_worker(
+        id: u16,
+        mut bridge: GossipBridge,
+        reg_path: &std::path::Path,
+        cfg: SimConfig,
+        seed: u64,
+        era0: u32,
+        era_path: Option<std::path::PathBuf>,
+        max_eras: u32,
+        log: bool,
+    ) -> Result<KeeperOut, String> {
+        use dinet_node::swarm::run_net_era;
+        use dinet_registry::RegistryLog;
+
+        let mut mine = vec![Node::new(id, 7, false)];
+        // порог реестра от МИНИМАЛЬНОГО состава: переживает рост роя —
+        // старые записи с меньшим кворумом не бракуются при перечитывании
+        let mut reg = RegistryLog::open(reg_path, dinet_node::registry_phase::notary_min(3))
+            .map_err(|e| format!("реестр смотрителя {id}: {e}"))?;
+        let mut era_next = era0; // счётчик минёра
+        let mut done: Option<u32> = None; // «ждать эры новее этой» (прочие)
+        let mut out = KeeperOut { joined: Vec::new() };
+        let mut n_done = 0u32;
+        loop {
+            if max_eras > 0 && n_done >= max_eras {
+                break;
+            }
+            // волна между эрами: состав мог измениться
+            let mut book = PeerBook::empty();
+            wave_until_quiet(&mut mine, &mut book, &mut bridge, 10, 60);
+            let roster = roster_now(id, &book);
+            if roster.len() < 3 {
+                settled(700);
+                continue;
+            }
+            mine[0].book = std::mem::take(&mut book);
+            let (era_n, miner) = if id == 0 {
+                let e = era_next;
+                era_next += 1;
+                (e, 0)
+            } else {
+                match wait_invite_budget(&mut mine, &roster, &mut bridge, done, 350, false) {
+                    Some(x) => x,
+                    None => continue, // минёр молчит: снова волна
+                }
+            };
+            let rep =
+                run_net_era(&mut mine, &roster, &mut bridge, era_n, miner, &cfg, seed, &mut reg);
+            done = Some(done.map_or(era_n, |d| d.max(era_n)));
+            n_done += 1;
+            out.joined.push((era_n, roster.clone()));
+            if id == 0 {
+                if let Some(p) = &era_path {
+                    let _ = std::fs::write(p, era_next.to_le_bytes());
+                }
+            }
+            if log {
+                let kind = if rep.was_reveal { "REVEAL" } else { "masked" };
+                println!(
+                    "узел {id}: эра {era_n} {kind} состав {:?} contrib {} acc {:.3}→{:.3} роль {:?} аудит +{} -{}",
+                    roster,
+                    rep.contributors,
+                    rep.accuracy_before,
+                    rep.accuracy_after,
+                    rep.role,
+                    rep.audits_pass,
+                    rep.audits_fail
+                );
+            }
+            settled(1200); // окно между эрами — сюда входит новичок
+        }
+        Ok(out)
+    }
+
     
     /// Один клиент-узел на сетевых барах: состав волной, дальше фазовый ход
     /// `run_net_era`. `empty` — узел БЕЗ материала (пустой журнал): он входит
@@ -1060,6 +1298,25 @@ fn topic_name(ch: u8, to: Option<u16>) -> String {
     }
 }
 
+/// Адрес для dial: `ip:порт` (короткая форма для телефона) либо полный
+/// multiaddr (`/ip4/…/tcp/…`). Всё, кроме первого `:`-разделения, уходит
+/// в парсер multiaddr как есть.
+pub fn parse_dial(s: &str) -> Result<Multiaddr, String> {
+    let t = s.trim();
+    if t.starts_with('/') {
+        return t.parse().map_err(|e| format!("адрес {t}: {e}"));
+    }
+    let (ip, port) = t
+        .rsplit_once(':')
+        .ok_or_else(|| format!("адрес {t}: нет порта (формат ip:порт)"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("адрес {t}: порт не число"))?;
+    format!("/ip4/{ip}/tcp/{port}")
+        .parse()
+        .map_err(|e| format!("адрес {t}: {e}"))
+}
+
 /// Обратное: канал из имени темы (мусорные темы → None).
 fn topic_channel(name: &gossipsub::TopicHash) -> Option<u8> {
     let parts: Vec<&str> = name.as_str().split('/').collect();
@@ -1095,6 +1352,12 @@ impl GossipBridge {
     /// Поднять сетевой поток узла; BLOCKS до готовности адреса (≤5 с).
     /// Подписки: `all` и `t{me}` по всем трём каналам эры.
     pub fn spawn(me: u16, seed: [u8; 32]) -> Result<GossipBridge, String> {
+        Self::spawn_on(me, seed, "/ip4/127.0.0.1/tcp/0")
+    }
+
+    /// То же с ЯВНЫМ адресом слушателя (смотритель роя держит постоянный
+    /// порт, чтобы внешние клиенты — телефон — могли dial'ить по адресу).
+    pub fn spawn_on(me: u16, seed: [u8; 32], listen: &str) -> Result<GossipBridge, String> {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<BridgeCmd>();
         let queues: Vec<Arc<StdMutex<Vec<InFrame>>>> =
             (0..CH_N).map(|_| Arc::new(StdMutex::new(Vec::new()))).collect();
@@ -1102,9 +1365,10 @@ impl GossipBridge {
 
         let q = queues.clone();
         let r = ready.clone();
+        let listen = listen.to_string();
         std::thread::Builder::new()
             .name(format!("dineth-{me}"))
-            .spawn(move || gossip_node_thread(seed, cmd_rx, q, r))
+            .spawn(move || gossip_node_thread(seed, &listen, cmd_rx, q, r))
             .map_err(|e| format!("thread: {e}"))?;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1122,6 +1386,14 @@ impl GossipBridge {
     /// Соединиться с адресом чужого моста.
     pub fn dial(&self, addr: Multiaddr) {
         let _ = self.cmd_tx.send(BridgeCmd::Dial(addr));
+    }
+
+    /// Dial по строке (`ip:порт` или полный multiaddr) — живым клиентам
+    /// (телефон) не надо тянуть типы libp2p.
+    pub fn dial_str(&self, addr: &str) -> Result<(), String> {
+        let ma: Multiaddr = parse_dial(addr)?;
+        self.dial(ma);
+        Ok(())
     }
 
     /// Дождаться опорожнения команд (для вмешательства драйвера — опция).
@@ -1174,6 +1446,7 @@ impl Drop for GossipBridge {
 /// Тело сетевого потока моста (own tokio-рантайм на своей ните).
 fn gossip_node_thread(
     seed: [u8; 32],
+    listen: &str,
     cmd_rx: std_mpsc::Receiver<BridgeCmd>,
     queues: Vec<Arc<StdMutex<Vec<InFrame>>>>,
     ready: Arc<StdMutex<Option<(PeerId, Multiaddr)>>>,
@@ -1195,13 +1468,15 @@ fn gossip_node_thread(
                 return;
             }
         };
-        if swarm
-            .listen_on("/ip4/127.0.0.1/tcp/0"
-                .parse()
-                .expect("multiaddr литерал"))
-            .is_err()
-        {
-            eprintln!("[bridge] listen не поднялся");
+        let ma: Multiaddr = match listen.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[bridge] слушатель {listen}: {e}");
+                return;
+            }
+        };
+        if swarm.listen_on(ma).is_err() {
+            eprintln!("[bridge] listen не поднялся ({listen})");
             return;
         }
         // Подписки: все три канала, all + адресный (свой).
@@ -1317,6 +1592,7 @@ pub fn signed_frame_bytes(
 mod tests {
     use super::*;
     use dinet_fl::toy_llm::toy_world::honesty_batch;
+    use dinet_node::swarm::{Node, NodeId, PeerBook, SimConfig};
 
     /// РЕАЛЬНЫЙ сетевой тест: 3 узла TCP+Noise+Yamux+gossipsub, полный меш,
     /// каждый получает КАЖДЫЙ подписанный кадр каждого и проверяет ed25519.
@@ -1430,6 +1706,146 @@ mod tests {
             run.mean_acc_start,
             run.mean_acc_end
         );
+    }
+
+    /// M3 — динамический вход клиента (телефон) в ЖИВОЙ смотритель-рой:
+    /// 3 смотрителя гонят эры; новичок (id 7) входит между эрами (волна →
+    /// приглашение начавшейся НЕ считается) и участвует наравне: состав у
+    /// всех один, реестр клиента получает REVEAL-запись.
+    #[test]
+    fn keeper_dynamic_join() {
+        let dir = std::env::temp_dir().join(format!("dinet-keeper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // мосты: смотрители 0,1,2 + новичок 7 (все слушают loopback:0).
+        // СИДЫ МОСТОВ — 0x40+id, НЕ [id;32]: в одном процессе тестов
+        // параллельно живут мосты других сьютов с сидами [id;32] —
+        // совпадение PeerId + mdns на loopback связывают ЧУЖИЕ рои и
+        // теряют кадры (поймано этим же тестом: приглашения эр
+        // пропадали у соседних сьютов).
+        let mut bridges = Vec::new();
+        for id in [0u16, 1, 2, 7] {
+            let seed = [0x40u8.wrapping_add(id as u8); 32];
+            bridges.push(GossipBridge::spawn(id, seed).expect("мост"));
+        }
+        // смотрители связаны между собой; новичок подключается ко всем
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let a = bridges[j].addr.clone().unwrap();
+                    bridges[i].dial(a);
+                }
+            }
+        }
+        let addrs: Vec<_> = bridges[..3].iter().map(|b| b.addr.clone().unwrap()).collect();
+        for a in addrs {
+            bridges[3].dial(a);
+        }
+        std::thread::sleep(Duration::from_millis(1600)); // graft mesh
+
+        let cfg = SimConfig::default();
+        let (tx, rx) =
+            std::sync::mpsc::channel::<(u16, Result<Vec<(u32, Vec<NodeId>)>, String>)>();
+        // смотрители: по 5 эр (клиент входит в одну из средних)
+        for id in 0..3u16 {
+            let b = bridges.remove(0);
+            let reg = dir.join(format!("r{id}.dlog"));
+            let txc = tx.clone();
+            let cfg2 = cfg.clone();
+            std::thread::spawn(move || {
+                let out = swarm_net::keeper_worker(id, b, &reg, cfg2, 2026, 0, None, 5, false);
+                let _ = txc.send((id, out.map(|o| o.joined)));
+            });
+        }
+        // новичок: та же сессия, что у телефона (client_join_session,
+        // лимит 4 эры — до чек-пойнта REVEAL)
+        let jb = bridges.remove(0);
+        let jreg = dir.join("r7.dlog");
+        let txc = tx.clone();
+        std::thread::spawn(move || {
+            let res = joiner_run(7u16, jb, &jreg, &cfg);
+            let _ = txc.send((7, res));
+        });
+
+        // сбор: 3 смотрителя + новичок, каждому ≤90с
+        let mut keepers: Vec<(u16, Vec<(u32, Vec<NodeId>)>)> = Vec::new();
+        let mut joiner: Option<Vec<(u32, Vec<NodeId>)>> = None;
+        for _ in 0..4 {
+            let (id, got) = rx
+                .recv_timeout(Duration::from_secs(90))
+                .expect("участник отчитался");
+            if id == 7 {
+                joiner = got.ok();
+            } else {
+                keepers.push((id, got.expect("смотритель отчитался")));
+            }
+        }
+        // новичок участвовал; состав everywhere [0,1,2,7]
+        let joined = joiner.expect("новичок обязан войти в рой");
+        assert!(!joined.is_empty(), "новичок не участвовал ни в одной эре");
+        for (era, roster) in &joined {
+            assert_eq!(roster, &vec![0, 1, 2, 7], "состав эры {era} у новичка");
+        }
+        // у смотрителей состав из тех же двух значений: [0,1,2] или
+        // [0,1,2,7] — рой ЖИВЁТ: новичок входит между эрами и выходит
+        // после своего чек-пойнта, смотрители перечитывают состав волной
+        // и продолжают эры (включая эры ПОСЛЕ выхода новичка — без
+        // зависаний: run_net_era завершается на любом составе)
+        for (id, eras) in &keepers {
+            for (era, roster) in eras {
+                assert!(
+                    roster == &vec![0, 1, 2] || roster == &vec![0, 1, 2, 7],
+                    "смотритель {id}: эра {era} состав {roster:?}"
+                );
+            }
+        }
+        // реестр новичка получил REVEAL-запись (эра 3 — каждая 4-я)
+        let recs = dinet_registry::RegistryLog::open(
+            &dir.join("r7.dlog"),
+            dinet_node::registry_phase::notary_min(3),
+        )
+        .expect("реестр новичка читается");
+        assert!(
+            !recs.entries().is_empty(),
+            "REVEAL-запись не доехала до реестра новичка"
+        );
+    }
+
+    /// Ход новичка роя (то же, что у телефона `net_tick`): волна → серия
+    /// эр через `client_join_session` до чек-пойнта REVEAL/лимита. Свой
+    /// батч и свой реестр-файл.
+    fn joiner_run(
+        id: u16,
+        mut bridge: GossipBridge,
+        reg_path: &std::path::Path,
+        cfg: &SimConfig,
+    ) -> Result<Vec<(u32, Vec<NodeId>)>, String> {
+        use dinet_node::registry_phase::notary_min;
+        use dinet_registry::RegistryLog;
+
+        let mut mine = vec![Node::new(id, 7, false)];
+        let mut reg = RegistryLog::open(reg_path, notary_min(3))
+            .map_err(|e| format!("реестр: {e}"))?;
+        let mut book = PeerBook::empty();
+        let batch = honesty_batch(40, 9_000 + id as u64);
+        let session = swarm_net::client_join_session(
+            &mut mine,
+            &mut book,
+            &mut bridge,
+            &mut reg,
+            cfg,
+            2026,
+            batch,
+            4,   // до 4 эр — как телефон net_tick(4)
+            50,  // волна: минимум 3.5с (graft mesh)...
+            90,  // ...до 6.3с
+            350, // ожидание приглашения ≤21с
+        )?;
+        Ok(session
+            .last_era
+            .map(|e| vec![(e, session.roster)])
+            .unwrap_or_default())
     }
 }
 

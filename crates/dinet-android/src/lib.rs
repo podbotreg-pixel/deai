@@ -20,9 +20,10 @@
 //! - `рой:cps`, `рой:eras` — счётчики `u32` little-endian.
 
 mod jni;
+mod net;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dinet_chat::{ChatSession, ToyChatModel};
@@ -43,6 +44,9 @@ const EVERY: u32 = 4;
 /// воркер гонит эру только по новому материалу — семантика bg_trainer
 /// webchat: «при новом материале прокручивается та же era_tick»).
 const P_LAST_PAIRS: &str = "рой:last_pairs";
+/// KV-ключ: адреса роя через запятую (`ip:порт` — их dial'ит сетевой
+/// вклад; пишет deep-link dinet://cmd/peer?addr=…).
+const P_PEERS: &str = "рой:peers";
 
 pub struct PhoneCore {
     pub session: ChatSession,
@@ -55,6 +59,8 @@ pub struct PhoneCore {
     pub every: u32,
     /// валидных пар на момент последней эры (переживает рестарт)
     pub last_pairs: u32,
+    /// путь KV-файла сессии (от него — сиблинги: рой-KV, реестр сети)
+    pub base: PathBuf,
     /// Реплика чата: последний чек-пойнт роя; до первой эры адаптер
     /// нулевой/начальный — микроязык отвечает argmax'ом базы, обычная
     /// речь — шаблонным режимом RAG (как в webchat).
@@ -105,6 +111,7 @@ impl PhoneCore {
             cps,
             every: EVERY,
             last_pairs,
+            base: base.to_path_buf(),
             model,
             kv,
         })
@@ -210,6 +217,31 @@ impl PhoneCore {
         self.era_tick()
     }
 
+    /// Адреса роя из рой-KV (»рой:peers», через запятую).
+    pub fn peers(&self) -> Vec<String> {
+        self.kv
+            .get(P_PEERS)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Запомнить адрес роя (`ip:порт`; дубликат не пишется). Формат
+    /// проверяет `parse_dial` — та же валидация, что у dial'а.
+    pub fn add_peer(&mut self, addr: &str) -> Result<(), String> {
+        dinet_p2p::parse_dial(addr)?;
+        let mut list = self.peers();
+        if !list.iter().any(|a| a == addr.trim()) {
+            list.push(addr.trim().to_string());
+            let _ = self.kv.put(P_PEERS, list.join(",").as_bytes());
+        }
+        Ok(())
+    }
+
     /// Чек-пойнт → KV (адаптер + счётчики, переживают рестарт) и сразу в
     /// жизнь чата: реплика пересобирается из нового адаптера.
     fn apply_checkpoint(&mut self) {
@@ -265,6 +297,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("dinet-android-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&d);
         let _ = std::fs::remove_file(d.with_extension("рой"));
+        let _ = std::fs::remove_file(d.with_extension("net-reg"));
         d
     }
 
@@ -404,5 +437,37 @@ mod tests {
         core.teach(&p, &a).unwrap();
         assert!(core.bg_tick().unwrap().contains("эра"));
         assert_eq!(core.eras, 3);
+    }
+
+    #[test]
+    fn peers_kv_and_validation() {
+        let dir = tmp("peers");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        assert!(core.net_tick(1).is_err(), "без адресов роя — честная ошибка");
+        assert!(core.add_peer("127.0.0.1:notaport").is_err());
+        assert!(core.add_peer("example.com:80").is_err(), "хостнеймы не парсим");
+        core.add_peer("10.0.2.2:9300").unwrap();
+        core.add_peer("10.0.2.2:9300").unwrap(); // дубликат — не пишется
+        core.add_peer("/ip6/::1/tcp/9301").unwrap(); // полный multiaddr тоже ок
+        assert_eq!(core.peers(), vec!["10.0.2.2:9300", "/ip6/::1/tcp/9301"]);
+        // адреса переживают рестарт (рой-KV)
+        drop(core);
+        let core = PhoneCore::open(&dir).unwrap();
+        assert_eq!(core.peers().len(), 2);
+    }
+
+    /// Сетевой вклад против недостижимого роя: мост поднимается, dial
+    /// промахивается, волна вымирает → честная ошибка «мало пиров»
+    /// (воркер просто выходит, без паник и висяков).
+    #[test]
+    fn net_tick_unreachable_degrades_cleanly() {
+        let dir = tmp("net-unreach");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        core.add_peer("127.0.0.1:1").unwrap(); // закрытый порт
+        let err = core.net_tick(1).unwrap_err();
+        assert!(err.contains("мало пиров"), "err: {err}");
+        // счётчики не тронуты
+        assert_eq!(core.eras, 0);
+        assert_eq!(core.cps, 0);
     }
 }

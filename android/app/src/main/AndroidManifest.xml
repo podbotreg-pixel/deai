@@ -4,6 +4,8 @@
     <!-- WorkManager: возобновление периодики после ребута и wakelock на время воркера -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- M3 шаг 3: сетевой вклад — dial роя (libp2p TCP) -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="DI-NET"

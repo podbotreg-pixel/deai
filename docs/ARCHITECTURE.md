@@ -222,7 +222,13 @@ Wi-Fi unmetered; эра (`PhoneCore::bg_tick`) только по новому м
   Compose-UI в `android/` (Gradle 8.10.2 + AGP 8.7.3 + Kotlin 2.0.21,
   minSdk 24 / target 35); сборка .so — build-android.sh (линкеры clang NDK,
   без cargo-ndk). Хранилище телефона — тот же append-only KV
-  (dinet-memory), не SQLite.
+  (dinet-memory), не SQLite. Сетевой вклад — телефон как ВНЕШНИЙ клиент
+  роя: dial адресов смотрителя (`swarmkeeper`, вечные узлы с постоянными
+  портами), Hello-волна согласует состав перед каждой эрой, телефон
+  участвует в эрах на реальном TCP+gossipsub и уходит после REVEAL
+  (реестр вклада — append-only `<base>.net-reg`); гейты вклада общие
+  (батарея ≥70%, термал <44°C, Wi-Fi unmetered), manifest требует
+  только INTERNET.
 - **Крипто:** ed25519-dalek, X25519 + Noise, SHA-256 content addressing, Merkle.
 - **Хранилище:** SQLite (+sqlite-vec для RAG), локальные логи append-only.
 - **Лицензии:** ядро AGPL-3.0 (анти-приватизация), SDK/протокол Apache-2.0.

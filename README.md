@@ -124,7 +124,14 @@ cd android && ./gradlew assembleDebug
                              # app-debug.apk; UI: чат + кнопка «Учить» + строка stats —
                              # та же логика, что у webchat (эра каждые 4 пары, REVEAL → реплика)
                              # + WorkManager-вклад: periodic 6 ч (Wi-Fi unmetered, батарея ≥70%,
-                             # термал <44°C — TickWorker) и «вклад сейчас» deep-link dinet://cmd/bg
+                             # термал <44°C — TickWorker локальный, NetWorker сетевой) и
+                             # «вклад сейчас» deep-links dinet://cmd/bg, dinet://cmd/net
+cargo run -p dinet-p2p --bin swarmkeeper -- 3 9300 /tmp/opencode/skeeper
+                             # СМОТРИТЕЛЬ роя (вечные узлы, состав перечитывается перед
+                             # каждой эрой); телефон входит в любой момент:
+                             # dinet://cmd/peer?addr=<IP>:9300 (и 9301/9302) → dinet://cmd/net —
+                             # серия эр роя на реальном TCP до REVEAL-чек-пойнта, чек-пойнт
+                             # применяется к реплике чата (см. keeper_dynamic_join в dinet-p2p)
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
                              # REPL-чат: история, RAG-контекст, пары speak→learn
 # M2-АГЕНТ: MCP-сервер поверх FS-песочницы (agentd — NDJSON/stdio, спека 2025-06-18):

@@ -263,6 +263,40 @@ pub extern "C" fn Java_dev_dinet_app_Core_tick(env: Env, _class: *mut c_void) ->
     unsafe { write_string(env, &note) }
 }
 
+/// Запомнить адрес роя (deep-link `dinet://cmd/peer?addr=ip:порт`).
+/// 0 — адрес не парсится (GUI покажет; ядро живо).
+#[no_mangle]
+pub extern "C" fn Java_dev_dinet_app_Core_peer(
+    env: Env,
+    _class: *mut c_void,
+    jaddr: *mut c_void,
+) -> u8 {
+    safe(env, "peer", false, || {
+        let addr = unsafe { read_string(env, jaddr) };
+        core(|c| c.add_peer(&addr).map(|_| true), "peer")
+    }) as u8
+}
+
+/// Сетевой вклад (WorkManager, шаг 3): dial роя («рой:peers»), волна
+/// состава, серия эр роя на реальном TCP до чек-пойнта REVEAL (≤4 эры).
+/// Ядро поднимает себя сам; строка-итог для логов.
+#[no_mangle]
+pub extern "C" fn Java_dev_dinet_app_Core_net(env: Env, _class: *mut c_void) -> *mut c_void {
+    let note = safe(env, "net", String::new(), || {
+        ensure_open()?;
+        core(
+            |c| {
+                Ok(match c.net_tick(4) {
+                    Ok(n) => n,
+                    Err(e) => format!("не вышло: {e}"),
+                })
+            },
+            "net",
+        )
+    });
+    unsafe { write_string(env, &note) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
