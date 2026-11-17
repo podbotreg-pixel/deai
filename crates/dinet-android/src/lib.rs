@@ -53,6 +53,13 @@ const P_PEERS: &str = "рой:peers";
 /// эрами, переживает рестарты; в чек-пойнт роя НЕ входит (вклад —
 /// carrier-логиты, DSL).
 const P_PROXY: &str = "рой:proxy";
+/// KV-ключ: последний состав роя (u16 little-endian подряд, отсортирован)
+/// — пишет probe/сетевой вклад после волны; читает `swarm_stats`
+/// (экран «Рой»).
+const P_LAST_ROSTER: &str = "рой:last_roster";
+/// KV-ключ: время последнего контакта с роем (unix-сек, u64 LE) —
+/// «видели N мин назад» на экране «Рой».
+const P_LAST_SEEN: &str = "рой:last_seen";
 
 /// f32-массив → little-endian байты (формат KV `рой:adapter`/`рой:proxy`).
 fn kv_f32(v: &[f32]) -> Vec<u8> {
@@ -308,6 +315,66 @@ impl PhoneCore {
             self.cps,
         )
     }
+
+    /// Статистика роя (экран «Рой»): количественные характеристики —
+    /// адреса роя, последний состав («рой:last_roster», пишет
+    /// net_probe/сетевой вклад после волны), «видели N мин назад»
+    /// («рой:last_seen»), вклад (эры/чек-пойнты, последняя эра сети
+    /// из «рой:net_done») и глубина личной прокси (≈ эры × шаги KD).
+    /// NB: записи клиентского реестра `<base>.net-reg` в v1 всегда
+    /// пусты (телефон входит в цепочку с середины — parent не сходится,
+    /// печати бракуются), поэтому метрикой служит «рой:net_done».
+    pub fn swarm_stats(&self) -> String {
+        let addrs = self.peers();
+        let roster: Vec<u16> = self
+            .kv
+            .get(P_LAST_ROSTER)
+            .map(|b| {
+                b.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let seen = self
+            .kv
+            .get(P_LAST_SEEN)
+            .map(|b| {
+                let mut a = [0u8; 8];
+                let n = b.len().min(8);
+                a[..n].copy_from_slice(&b[..n]);
+                now_ts().saturating_sub(u64::from_le_bytes(a)) / 60
+            })
+            .unwrap_or(0);
+        let net_done = self
+            .kv
+            .get("рой:net_done")
+            .map(|b| {
+                let mut a = [0u8; 4];
+                let n = b.len().min(4);
+                a[..n].copy_from_slice(&b[..n]);
+                u32::from_le_bytes(a)
+            })
+            .map(|era| format!("последняя эра сети: {era}"))
+            .unwrap_or_else(|| "последняя эра сети: нет (только локальные)".to_string());
+        let addr_line = if addrs.is_empty() {
+            "адресов 0 (добавить: dinet://cmd/peer?addr=ip:порт)".to_string()
+        } else {
+            format!("адресов {} ({})", addrs.len(), addrs.join(", "))
+        };
+        let roster_line = if roster.is_empty() {
+            "ещё не видели («Обновить состав» — probe роя)".to_string()
+        } else {
+            format!("{roster:?} — {} узл., видели {seen} мин назад", roster.len())
+        };
+        let steps = SimConfig::default().train_steps;
+        format!(
+            "рой: {addr_line}\nсостав: {roster_line}\n\
+             вклад: эр {}, чек-пойнтов {}; {net_done}; прокси ≈ {} шагов KD",
+            self.eras,
+            self.cps,
+            self.eras as u64 * steps as u64,
+        )
+    }
 }
 
 fn now_ts() -> u64 {
@@ -321,10 +388,16 @@ fn now_ts() -> u64 {
 mod tests {
     use super::*;
     use dinet_fl::toy_llm::LEX;
+    use std::sync::Mutex;
+
+    /// Взаимоисключение СЕТЕВЫХ тестов: мост телефона — фиксированный
+    /// PeerId `[7;32]`, два параллельных экземпляра ломают друг друга
+    /// (mdns на loopback при этом переливает Hello между тестами).
+    pub(crate) static NET_LOCK: Mutex<()> = Mutex::new(());
 
     /// Путь KV-ФАЙЛА сессии (как webchat `./wa`); рой-KV — сиблинг
     /// `<base>.рой`. Чистим и файл, и рой-сиблинга от прошлых запусков.
-    fn tmp(name: &str) -> std::path::PathBuf {
+    pub(crate) fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("dinet-android-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&d);
         let _ = std::fs::remove_file(d.with_extension("рой"));
@@ -463,6 +536,38 @@ mod tests {
         assert!(core.stats().contains("пары: 1"), "{}", core.stats());
     }
 
+    /// Экран «Рой»: swarm_stats перечисляет адреса, последний состав,
+    /// «видели N мин назад» и вклад; состав переживает рестарт (KV).
+    #[test]
+    fn swarm_stats_line_readable() {
+        let dir = tmp("swarm-stats");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        let s = core.swarm_stats();
+        assert!(s.contains("адресов 0"), "{s}");
+        assert!(s.contains("ещё не видели"), "{s}");
+        assert!(s.contains("прокси ≈ 0 шагов KD"), "{s}");
+        assert!(s.contains("последняя эра сети: нет"), "{s}");
+        // адрес роя + след probe: состав и время — как их пишет net_probe
+        core.add_peer("10.0.2.2:9300").unwrap();
+        let mut rb = Vec::new();
+        for id in [3u16, 7, 11] {
+            rb.extend_from_slice(&id.to_le_bytes());
+        }
+        core.kv.put(P_LAST_ROSTER, &rb).unwrap();
+        core.kv.put(P_LAST_SEEN, &(now_ts() - 120).to_le_bytes()).unwrap();
+        // след сетевого вклада: последняя эра сети (пишет net_tick)
+        core.kv.put("рой:net_done", &559u32.to_le_bytes()).unwrap();
+        let s = core.swarm_stats();
+        assert!(s.contains("адресов 1 (10.0.2.2:9300)"), "{s}");
+        assert!(s.contains("[3, 7, 11] — 3 узл."), "{s}");
+        assert!(s.contains("видели 2 мин назад"), "{s}");
+        assert!(s.contains("последняя эра сети: 559"), "{s}");
+        // состав/seen переживают рестарт (рой-KV)
+        drop(core);
+        let core = PhoneCore::open(&dir).unwrap();
+        assert!(core.swarm_stats().contains("[3, 7, 11]"), "рестарт");
+    }
+
     #[test]
     fn bg_tick_only_on_new_material() {
         let dir = tmp("bg");
@@ -518,8 +623,14 @@ mod tests {
     /// Сетевой вклад против недостижимого роя: мост поднимается, dial
     /// промахивается, волна вымирает → честная ошибка «мало пиров»
     /// (воркер просто выходит, без паник и висяков).
+    /// Взаимоисключение с другими СЕТЕВЫМИ тестами (NET_LOCK): мост
+    /// телефона — фиксированный PeerId `[id;32]`, два параллельных
+    /// ломают друг друга, а mdns на loopback переливает Hello между
+    /// тестами (потому же НЕ гонять крейт параллельно с живым
+    /// swarmkeeper/эмулятором — mdns найдёт настоящий рой).
     #[test]
     fn net_tick_unreachable_degrades_cleanly() {
+        let _net = crate::tests::NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp("net-unreach");
         let mut core = PhoneCore::open(&dir).unwrap();
         core.add_peer("127.0.0.1:1").unwrap(); // закрытый порт

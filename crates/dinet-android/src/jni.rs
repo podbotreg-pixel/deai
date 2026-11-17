@@ -26,7 +26,10 @@
 //!
 //! ## Экспорты (`Java_dev_dinet_app_Core_*`)
 //! `open(dir): Bool` · `turn(prompt): String` ·
-//! `teach(prompt, answer): String` · `stats(): String`.
+//! `teach(prompt, answer): String` · `stats(): String` ·
+//! `tick(): String` · `peer(addr): Bool` · `net(): String` ·
+//! `probe(): String` (волна состава без эр) · `swarmStats(): String`
+//! (экран «Рой»).
 //! Паника внутри любого экспорта ловится: Java получает `false`/пустую
 //! строку + `RuntimeException` с причиной.
 
@@ -295,6 +298,31 @@ pub extern "C" fn Java_dev_dinet_app_Core_net(env: Env, _class: *mut c_void) -> 
         )
     });
     unsafe { write_string(env, &note) }
+}
+
+/// Лёгкий probe роя (экран «Рой», «Обновить состав»): dial адресов,
+/// волна состава до тишины — без эр. Состав персистит (swarmStats).
+#[no_mangle]
+pub extern "C" fn Java_dev_dinet_app_Core_probe(env: Env, _class: *mut c_void) -> *mut c_void {
+    let note = safe(env, "probe", String::new(), || {
+        ensure_open()?;
+        core(|c| c.net_probe(), "probe")
+    });
+    unsafe { write_string(env, &note) }
+}
+
+/// Статистика роя из рой-KV (экран «Рой»): адреса, последний состав,
+/// «видели N мин назад», вклад (эры/чек-пойнты/прокси/записи сети).
+#[no_mangle]
+pub extern "C" fn Java_dev_dinet_app_Core_swarmStats(
+    env: Env,
+    _class: *mut c_void,
+) -> *mut c_void {
+    let s = safe(env, "swarmStats", String::new(), || {
+        ensure_open()?;
+        core(|c| Ok(c.swarm_stats()), "swarmStats")
+    });
+    unsafe { write_string(env, &s) }
 }
 
 #[cfg(test)]

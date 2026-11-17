@@ -10,12 +10,13 @@
 //! файл `<base>.net-reg` (переживает рестарты).
 
 use dinet_client::pairs_to_batch;
+use dinet_node::join::roster_now;
 use dinet_node::registry_phase::notary_min;
 use dinet_node::swarm::{Node, PeerBook, SimConfig};
-use dinet_p2p::swarm_net::client_join_session;
+use dinet_p2p::swarm_net::{client_join_session, wave_until_quiet};
 use dinet_registry::RegistryLog;
 
-use crate::PhoneCore;
+use crate::{P_LAST_ROSTER, P_LAST_SEEN, PhoneCore};
 
 /// Волновой бюджет: минимум итераций (≈3.5с — mesh graft) и максимум
 /// (≈6.3с); тик волны ≈70мс. Меньше минимума затихать нельзя: раньше
@@ -102,5 +103,137 @@ impl PhoneCore {
             let _ = self.kv.put("рой:net_done", &era.to_le_bytes());
         }
         Ok(note)
+    }
+
+    /// Лёгкий PROBE роя (экран «Рой», кнопка «Обновить состав»): поднять
+    /// мост, dial адресов роя, волна состава до тишины — БЕЗ эр (это не
+    /// вклад, а «кто сейчас в сети»). Состав и время контакта персистим
+    /// («рой:last_roster»/«рой:last_seen») — `swarm_stats` показывает их
+    /// и после выхода из сети. Состав от 1 узла (только я) — не ошибка:
+    /// честный ответ «рой не отвечает».
+    pub fn net_probe(&mut self) -> Result<String, String> {
+        let addrs = self.peers();
+        if addrs.is_empty() {
+            return Err("нет адресов роя — добавить: dinet://cmd/peer?addr=ip:порт".into());
+        }
+        let mut bridge = dinet_p2p::GossipBridge::spawn_on(
+            self.node.id,
+            [self.node.id as u8; 32],
+            "/ip4/0.0.0.0/tcp/0",
+        )
+        .map_err(|e| format!("мост не поднялся: {e}"))?;
+        for a in &addrs {
+            let _ = bridge.dial_str(a);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(GRAFT_MS));
+        // узел на время probe живёт локально (PeerBook не Clone)
+        let nid = self.node.id;
+        let mut node = std::mem::replace(&mut self.node, Node::new(nid, crate::WORLD_SEED, false));
+        let mut book = PeerBook::empty();
+        wave_until_quiet(
+            std::slice::from_mut(&mut node),
+            &mut book,
+            &mut bridge,
+            WAVE_MIN,
+            WAVE_MAX,
+        );
+        let roster = roster_now(node.id, &book);
+        self.node = node;
+        // персист состава и времени (экран «Рой» читает после выхода)
+        let mut rb = Vec::new();
+        for id in &roster {
+            rb.extend_from_slice(&id.to_le_bytes());
+        }
+        let _ = self.kv.put(P_LAST_ROSTER, &rb);
+        let _ = self.kv.put(P_LAST_SEEN, &crate::now_ts().to_le_bytes());
+        if roster.len() < 2 {
+            return Ok(format!(
+                "рой не отвечает: состав {roster:?} — только я (проверь адреса/сеть)"
+            ));
+        }
+        Ok(format!(
+            "рой на связи: состав {roster:?} ({} узлов)",
+            roster.len()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{NET_LOCK, tmp};
+    use dinet_node::join::roster_announce;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Probe без адресов — честная ошибка (экран «Рой» подскажет, что
+    /// добавить адреса deep-link'ом).
+    #[test]
+    fn probe_err_without_addrs() {
+        let dir = tmp("probe-noaddrs");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        assert!(core.net_probe().is_err());
+    }
+
+    /// Probe поверх РЕАЛЬНОГО TCP: два узла роя (loopback, Hello-волна)
+    /// + телефон — состав [0,1,7] виден, эр НЕТ (probe не вклад), состав
+    /// и «видели» персистят (рестарт → экран «Рой» читает из KV).
+    /// Взаимоисключение с другими сетевыми тестами (NET_LOCK — мост
+    /// телефона фиксированный `[7;32]`, mdns переливает Hello).
+    #[test]
+    fn probe_over_real_network() {
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmp("probe");
+        // мосты узлов роя: сиды 0x50+id — PeerId отличен от телефона
+        // ([id;32]) и от соседних сьютов (mdns/loopback-коллизии
+        // одинаковых PeerId связывали чужие рои и теряли кадры)
+        let mut bridges = Vec::new();
+        for id in [0u16, 1] {
+            let seed = [0x50u8.wrapping_add(id as u8); 32];
+            bridges.push(dinet_p2p::GossipBridge::spawn(id, seed).expect("мост узла роя"));
+        }
+        let addrs: Vec<String> = bridges
+            .iter()
+            .map(|b| b.addr.clone().unwrap().to_string())
+            .collect();
+        // узлы роя вещают Hello в своей волне (как смотритель): СИГНЕР —
+        // seed [id;32] (sim-схема самосертификации id), сам мост — 0x50+id;
+        // stop-флаг — анонсеры затихают сразу после probe (не мешая
+        // следующим сетевым тестам под локом)
+        let stop = Arc::new(AtomicBool::new(false));
+        for id in 0..2u16 {
+            let mut n = Node::new(id, crate::WORLD_SEED, false);
+            let mut b = bridges.remove(0);
+            let st = stop.clone();
+            std::thread::spawn(move || {
+                // потолок ≈8с — заведомо длиннее волны probe (3.5–6.3с)
+                for _ in 0..40 {
+                    if st.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    roster_announce(&mut n, &mut b);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+        }
+        let mut core = PhoneCore::open(&dir).unwrap();
+        for a in &addrs {
+            core.add_peer(a).unwrap();
+        }
+        let note = core.net_probe().unwrap();
+        stop.store(true, Ordering::Relaxed); // волна набрана — тишина
+        assert!(note.contains("состав [0, 1, 7]"), "note: {note}");
+        assert!(note.contains("3 узлов"), "note: {note}");
+        assert_eq!(core.eras, 0, "probe не гонит эр");
+        assert_eq!(core.cps, 0, "probe не трогает чек-пойнты");
+        // персист: рестарт — состав и «видели» живы (экран «Рой»)
+        drop(core);
+        let core = PhoneCore::open(&dir).unwrap();
+        let s = core.swarm_stats();
+        assert!(s.contains("[0, 1, 7]"), "{s}");
+        assert!(s.contains("видели 0 мин назад"), "{s}");
+        // анонсерам — выйти (итерация ≤200мс), мостам — упасть: следующий
+        // сетевой тест под локом начинает в тишине
+        std::thread::sleep(std::time::Duration::from_millis(400));
     }
 }

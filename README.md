@@ -121,8 +121,17 @@ crates/dinet-android/build-android.sh
                              # требуется rustup target add aarch64-linux-android x86_64-linux-android
                              # и NDK в ~/Android/Sdk/ndk (линкеры clang с суффиксом API, minSdk 24)
 cd android && ./gradlew assembleDebug
-                             # app-debug.apk; UI: чат + кнопка «Учить» + строка stats —
-                             # та же логика, что у webchat (эра каждые 4 пары, REVEAL → реплика)
+                             # app-debug.apk; UI: чат (ход микроязыком — реплика
+                             # отвечает словом, автопары = знание) + экран «Рой»
+                             # (переключатель вверху): количественная статистика
+                             # роя — адреса, последний состав, «видели N мин
+                             # назад», эры/чек-пойнты, последняя эра сети, глубина
+                             # прокси, гейты; кнопка «Обновить состав» = probe роя
+                             # (dial + волна состава, БЕЗ эр). ВСЕ JNI-вызовы — на
+                             # фоновом исполнителе: UI-поток не блокируется.
+                             # Кнопки «Учить» нет: пары — ходы чата и
+                             # deep-link dinet://cmd/teach?p=…&a=… (каждые 4
+                             # пары локальная эра роя, REVEAL → реплика)
                              # + WorkManager-вклад: periodic 6 ч (Wi-Fi unmetered, батарея ≥70%,
                              # термал <44°C — TickWorker локальный, NetWorker сетевой) и
                              # «вклад сейчас» deep-links dinet://cmd/bg, dinet://cmd/net
@@ -131,7 +140,8 @@ cargo run -p dinet-p2p --bin swarmkeeper -- 3 9300 /tmp/opencode/skeeper
                              # каждой эрой); телефон входит в любой момент:
                              # dinet://cmd/peer?addr=<IP>:9300 (и 9301/9302) → dinet://cmd/net —
                              # серия эр роя на реальном TCP до REVEAL-чек-пойнта, чек-пойнт
-                             # применяется к реплике чата (см. keeper_dynamic_join в dinet-p2p)
+                             # применяется к реплике чата (см. keeper_dynamic_join в dinet-p2p);
+                             # «кто сейчас в сети» — экран «Рой» → «Обновить состав» (probe)
                              # ВКЛАД ТЕЛЕФОНА — EFFEKT+DSL: телефон учит ЛИЧНУЮ прокси,
                              # в эру отдаёт только её carrier-логиты (512 Б i8, CarrierShare
                              # 0x24), рой пулит МЕДИАНОЙ и дистиллирует в общий адаптер —
