@@ -23,12 +23,12 @@ use dinet_crypto::{sha256, Ed25519Signer, Signer, Verifier};
 use dinet_fl::secure_agg::{aggregate, client_share, to_fx};
 use dinet_fl::toy_llm::local_fit;
 use dinet_fl::toy_llm::toy_world::{byz_batch, honesty_batch};
-use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyBase, ToyModel};
+use dinet_fl::toy_llm::{carrier_batch, dequant_logits, kd_fit, quant_logits, LoRAAdapter, Sample, ToyBase, ToyModel, V};
 use dinet_fl::{krum_select, norm2, Lcg};
 use dinet_proto::{Frame, MsgType, Payload, SENDER_LEN};
 
 use crate::registry_phase::{era_notary_collect, era_notary_seal};
-use crate::transport::{Transport, CH_ANNOUNCE, CH_LAZY, CH_SHARES, CH_VOTES};
+use crate::transport::{Transport, CH_ANNOUNCE, CH_CARRIER, CH_LAZY, CH_SHARES, CH_VOTES};
 use dinet_registry::RegistryLog;
 
 /// Сетевой мост асинхронен: сборы фаз ждут ожидаемый состав кадр-за-кадром
@@ -36,6 +36,16 @@ use dinet_registry::RegistryLog;
 /// транспорты (mesh/спул) возвращают всё в первой попытке — сна в них нет.
 const WIRE_ATTEMPTS: u32 = 24;
 const WIRE_ATTEMPT_MS: u64 = 40;
+
+/// EFFEKT (arXiv:2608.08138) + DSL (arXiv:2610.05378): клиент учит ЛЁГКУЮ
+/// прокси-модель (а не общую), вклад в рой — carrier-логиты прокси на
+/// случайных task-unrelated входах; рой пулит их медианой и дистиллирует
+/// в общий адаптер (kd_fit). Веса прокси не передаются. Базис прокси —
+/// НЕЗАВИСИМЫЙ от роевого world_seed (v1 — toy-архитектура; GGUF-0.5B на
+/// телефоне — v2).
+pub const PROXY_BASE_SEED: u64 = 0x50B;
+/// K carriers DSL на эру: логиты K×V = 512 байт i8 на узел за эру.
+pub const DSL_CARRIERS: usize = 64;
 
 pub type NodeId = u16;
 
@@ -118,6 +128,11 @@ pub struct Node {
     /// и будущим приглашениям (иначе приглашение эры N теряется в хвосте
     /// эры N-1, состав расходится). Чистится по завершении эры (run_net_era).
     pub bars: BTreeMap<(u32, NodeId, u8), Vec<NodeId>>,
+    /// ЛИЧНАЯ лёгкая прокси узла (EFFEKT): адаптер на независимом базисе
+    /// `proxy_base()`, учится СВОИМ батчем эры, накапливается через эры.
+    /// В чек-пойнт НЕ входит (вклад — carrier-логиты, DSL); телефон
+    /// персистит её между сессиями в KV «рой:proxy».
+    pub proxy: LoRAAdapter,
 }
 
 impl Node {
@@ -142,6 +157,9 @@ impl Node {
             x_sk: None,
             book: PeerBook::empty(),
             bars: BTreeMap::new(),
+            // ОБЩИЙ init прокси у всех узлов (детерминизм реплик: одинаковые
+            // сиды → одинаковые прокси-траектории)
+            proxy: LoRAAdapter::lora_init(PROXY_BASE_SEED),
         }
     }
 
@@ -357,19 +375,25 @@ pub fn run_net_era(
     let mids = era_audit(mine, roster, transport, era, cfg, mids);
     net_bar(&mut mine[0], roster, transport, bar_id, 3);
 
+    // --- ФАЗА D+ (DSL/EFFEKT): пул carrier-логитов (публикация была в
+    //     фазе A) → медиана роя → KD в общий адаптер. ДО отчёта: acc-
+    //     отчёт отражает эффект.
+    era_dsl_kd(mine, roster, transport, era, cfg);
+    net_bar(&mut mine[0], roster, transport, bar_id, 4);
+
     // --- ФАЗА E: отчёт (счётчики аудита дописываются в mids)
     let mut mids = mids;
     let mut reps = era_report(mine, roster, transport, era, cfg, &mut mids);
-    net_bar(&mut mine[0], roster, transport, bar_id, 4);
+    net_bar(&mut mine[0], roster, transport, bar_id, 5);
 
     // --- ФАЗА F: печать reveal-эры в реестр клиента (шов между рассылкой
     //     и сбором печатей держит бар: мост асинхронен)
     if (era + 1) % cfg.reveal_every == 0 {
         era_notary_seal(mine, roster, transport, era, cfg, &mids, std::slice::from_mut(reg));
-        net_bar(&mut mine[0], roster, transport, bar_id, 5);
+        net_bar(&mut mine[0], roster, transport, bar_id, 6);
         era_notary_collect(mine, roster, transport, era, cfg, &mids, std::slice::from_mut(reg));
     }
-    net_bar(&mut mine[0], roster, transport, bar_id, 6);
+    net_bar(&mut mine[0], roster, transport, bar_id, 7);
     // Бар-дальнобойщик этой эры отработал: записи эры ≤ текущей ушли,
     // будущие эры живут до их времени (накопитель не растёт).
     mine[0].bars.retain(|(en, _, _), _| *en > era);
@@ -792,6 +816,9 @@ pub fn era_publish(
             transport.send(CH_SHARES, node.id, None, &frame);
         }
     }
+    // --- Фаза A+ (DSL/EFFEKT): прокси-фит + публикация carrier-логитов
+    // (все стороны публикуют ДО любых сборов — скрещивание фаз сохраняется)
+    era_dsl_publish(mine, all_ids, transport, era, cfg);
     truths
 }
 
@@ -1199,7 +1226,147 @@ pub fn era_tally(
     mids: Vec<MidNode>,
 ) -> Vec<EraReport> {
     let mut mids = era_audit(mine, all_ids, transport, era, cfg, mids);
+    // DSL-фаза (EFFEKT+DSL): KD-сбор ПОСЛЕ агрегации дельт (аудит), ДО
+    // отчёта — KD-эффект входит в адаптер эры и отражается в acc-отчёте.
+    // Публикация carriers — в фазе A (era_dsl_publish из era_publish):
+    // все стороны публикуют ДО любых tally — скрещивание фаз партиций
+    // и бит-в-бит совпадение с полным роем сохраняются.
+    era_dsl_kd(mine, all_ids, transport, era, cfg);
     era_report(mine, all_ids, transport, era, cfg, &mut mids)
+}
+
+// ---------------------------------------------------------------------------
+// DSL-фазы эры (EFFEKT arXiv:2608.08138 + DSL arXiv:2610.05378): знание
+// переносится ПОВЕДЕНИЕМ, не весами. ДВЕ фазы с общим кодом у сим- и
+// сетевого пути (реплики бит-в-бит):
+//   A+  era_dsl_publish — каждый учит СВОЮ лёгкую прокси на независимом
+//       базисе своим батчем эры и публикует ТОЛЬКО carrier-логиты
+//       (квант i8 со общим scale, K×V байт);
+//   D+  era_dsl_kd — пул логитов роя поэлементной МЕДИАНОЙ (устойчив к
+//       византийцам и порядку приёма) дистиллируется в ОБЩИЙ адаптер эры
+//       (kd_fit). Прокси-адаптер в чек-пойнт не входит — он персистентен
+//       у узла (телефон: KV «рой:proxy»).
+// ---------------------------------------------------------------------------
+
+/// Базис лёгкого клиентского прокси (независим от роевого world_seed).
+pub fn proxy_base() -> ToyBase {
+    ToyBase::from_seed(PROXY_BASE_SEED)
+}
+
+/// Поэлементная медиана пулов (византиец до половины узлов не двигает
+/// медиану; порядок приёма не влияет — сортировка значений).
+fn median_of(mut v: Vec<f32>) -> f32 {
+    v.sort_by(f32::total_cmp);
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Фаза A+ : прокси-фит (аккумулируется в Node.proxy) + публикация
+/// carrier-логитов на канале CH_CARRIER.
+pub fn era_dsl_publish(
+    mine: &mut [Node],
+    _all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+) {
+    let ehash = era_hash32(era);
+    // carriers: ОБЩИЙ сид от эры (не от состава и не от seed-волны сим-
+    // публикации) — одинаковые входы у всех узлов, разные в разных эрах
+    let carriers =
+        carrier_batch(DSL_CARRIERS, 0xC422_25B9 ^ (era as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let pbase = proxy_base();
+
+    for idx in 0..mine.len() {
+        let batch = mine[idx].local_batch(64);
+        // DP-гигиена прокси та же, что у основного фита: честный — клип,
+        // byz — клип мимо (его отравленные carriers режет медиана пула).
+        let max_norm = if mine[idx].byz { 1_000_000.0 } else { cfg.max_norm };
+        // rng-волна прокси: детерминированная от (эра, id) — реплики совпадают
+        let mut rng = Lcg::new(
+            0xD15A_1C22 ^ ((era as u64) << 24) ^ (mine[idx].id as u64).wrapping_mul(7_919),
+        );
+        let fit = local_fit(
+            &pbase,
+            &mine[idx].proxy,
+            &batch,
+            cfg.train_steps,
+            cfg.lr,
+            2.0, // margin_preference — та же форма, что у основного фита
+            max_norm,
+            cfg.sigma,
+            &mut rng,
+        );
+        let delta = fit.delta;
+        let adapter = std::mem::replace(&mut mine[idx].proxy, LoRAAdapter::zero());
+        mine[idx].proxy = apply_delta(adapter, &delta);
+
+        let proxy_model = ToyModel { base: pbase.clone(), adapter: mine[idx].proxy.clone() };
+        let logits: Vec<Vec<f32>> = carriers.iter().map(|c| proxy_model.logits(c)).collect();
+        let (scale, q) = quant_logits(&logits);
+        let frame = sign_frame(
+            &mine[idx],
+            MsgType::CarrierShare,
+            Payload::CarrierShare { era_id: ehash, scale, q },
+        );
+        transport.send(CH_CARRIER, mine[idx].id, None, &frame);
+    }
+}
+
+/// Фаза D+ : сбор carrier-логитов, поэлементная медиана, KD в общий
+/// адаптер эры (вызывается ПОСЛЕ агрегации дельт, до отчёта).
+pub fn era_dsl_kd(
+    mine: &mut [Node],
+    all_ids: &[NodeId],
+    transport: &mut dyn Transport,
+    era: u32,
+    cfg: &SimConfig,
+) {
+    let ehash = era_hash32(era);
+    let carriers =
+        carrier_batch(DSL_CARRIERS, 0xC422_25B9 ^ (era as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    for idx in 0..mine.len() {
+        let mut entries: Vec<(NodeId, f32, Vec<u8>)> = Vec::new();
+        // мост асинхронен: копим carrier-вклады до полного состава
+        for attempt in 0..WIRE_ATTEMPTS {
+            let wire = transport.collect(CH_CARRIER, mine[idx].id);
+            for (nid, pl) in decode_with_book(&mut mine[idx], all_ids, wire) {
+                if let Payload::CarrierShare { era_id, scale, q } = pl {
+                    if era_id == ehash && !entries.iter().any(|(n, _, _)| *n == nid) {
+                        entries.push((nid, scale, q.clone()));
+                    }
+                }
+            }
+            if entries.len() >= all_ids.len() {
+                break;
+            }
+            if attempt + 1 < WIRE_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
+            }
+        }
+        // teacher: поэлементная медиана логитов участников (порядок неважен)
+        let pools: Vec<Vec<Vec<f32>>> = entries
+            .iter()
+            .map(|(_, scale, q)| dequant_logits(*scale, q, DSL_CARRIERS))
+            .collect();
+        let mut teacher: Vec<Vec<f32>> = Vec::with_capacity(DSL_CARRIERS);
+        for ci in 0..DSL_CARRIERS {
+            let mut t = vec![0.0f32; V];
+            for vi in 0..V {
+                t[vi] = median_of(pools.iter().map(|p| p[ci][vi]).collect());
+            }
+            teacher.push(t);
+        }
+        let base = mine[idx].base.clone();
+        let adapter = std::mem::replace(&mut mine[idx].adapter, LoRAAdapter::zero());
+        mine[idx].adapter = kd_fit(&base, &adapter, &carriers, &teacher, cfg.train_steps, cfg.lr);
+    }
 }
 
 /// Фазы A–E над ПОДМНОЖЕСТВОМ узлов роя (без барьеров внутри — для тестов:

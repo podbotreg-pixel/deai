@@ -330,8 +330,8 @@ pub mod swarm_net {
     use dinet_node::join::{roster_announce, roster_listen, roster_now};
     use dinet_node::registry_phase::{era_notary_collect, era_notary_seal};
     use dinet_node::swarm::{
-        era_audit, era_collect_and_vote, era_publish, era_report, EraReport, Node, NodeId,
-        PeerBook, SimConfig,
+        era_audit, era_collect_and_vote, era_dsl_kd, era_publish, era_report, EraReport, Node,
+        NodeId, PeerBook, SimConfig,
     };
     use dinet_fl::toy_llm::{LoRAAdapter, Sample, ToyBase, ToyModel};
     use dinet_fl::toy_llm::toy_world::honesty_batch;
@@ -369,6 +369,12 @@ pub mod swarm_net {
 
             // ФАЗА D: кворум-применение/анонс, аудит masked (кадры на проводе)
             let mids = era_audit(&mut mine, &all_ids, transport, era, &cfg, mids);
+            settled(70);
+            bar.wait();
+
+            // ФАЗА D+ (DSL/EFFEKT): пул carrier-логитов (публикация была в
+            // фазе A) → медиана роя → KD в общий адаптер — как в era_tally
+            era_dsl_kd(&mut mine, &all_ids, transport, era, &cfg);
             settled(70);
             bar.wait();
 
@@ -575,6 +581,12 @@ pub mod swarm_net {
 
             // ФАЗА D: кворум/анонс (reveal), AggCommit + LazyAudit (masked)
             let mids = era_audit(&mut mine, &roster, transport, era, cfg, mids);
+            settled(70);
+            bar.wait();
+
+            // ФАЗА D+ (DSL/EFFEKT): пул carrier-логитов (публикация была в
+            // фазе A) → медиана роя → KD в общий адаптер — как в era_tally
+            era_dsl_kd(&mut mine, &roster, transport, era, cfg);
             settled(70);
             bar.wait();
 
@@ -1345,7 +1357,7 @@ pub struct GossipBridge {
     pub addr: Option<Multiaddr>,
 }
 
-const CH_N: usize = 11; // SHARES..CH_BARRIER (0..10): мост маршрутизирует все каналы
+const CH_N: usize = 12; // SHARES..CH_CARRIER (0..11): мост маршрутизирует все каналы
 const TOPIC_BASE: &str = "dinet/v0";
 
 impl GossipBridge {
@@ -1660,6 +1672,31 @@ mod tests {
         assert!(
             run.ledgers.iter().all(|l| l.is_empty()),
             "masked-only рой не пишет реестр"
+        );
+    }
+
+    /// M3 шаг 4 — DSL поверх РЕАЛЬНОЙ сети (EFFEKT arXiv:2608.08138 +
+    /// DSL arXiv:2610.05378): клиенты публикуют carrier-логиты своих лёгких
+    /// прокси (0x24 CarrierShare), рой пулит их МЕДИАНОЙ и дистиллирует в
+    /// общий адаптер (kd_fit). Инварианты: реплики сошлись бит-в-бит и
+    /// совпали с симуляцией (внутри драйвера), acc РАСТЁТ (KD поверх FL),
+    /// византиец (25% роя) не роняет медиану — рой продолжает учиться.
+    #[test]
+    fn dsl_distill_over_real_network() {
+        let bm: swarm_net::BatchMaker =
+            Arc::new(|id, era| honesty_batch(40, 5_000 + id as u64 * 97 + era as u64 * 131 + 409));
+        let run = swarm_net::run_network_client_eras(4, 4, 3, true, bm, true)
+            .expect("DSL-рой поверх TCP");
+        assert!(
+            run.mean_acc_end > run.mean_acc_start + 0.1,
+            "KD обязан двигать acc поверх FL: {} → {}",
+            run.mean_acc_start,
+            run.mean_acc_end
+        );
+        assert!(
+            run.mean_acc_end > 0.5,
+            "рой с 25% византийца обязан учиться через медиану пулов: {}",
+            run.mean_acc_end
         );
     }
 

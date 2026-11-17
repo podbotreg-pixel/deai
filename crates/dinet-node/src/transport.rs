@@ -36,6 +36,9 @@ pub const CH_LAZY: u8 = 9;
 /// Сетевой барьер фаз (--net: многопроцессные клиенты сшивают фазы
 /// волнами подписанных баров; общего барьера-нити у них нет).
 pub const CH_BARRIER: u8 = 10;
+/// DSL-канал (EFFEKT+DSL): carrier-логиты лёгких прокси узлов
+/// (фаза D+ между аудитом и отчётом; dinet-p2p маршрутизирует 0..CH_N).
+pub const CH_CARRIER: u8 = 11;
 
 pub trait Transport {
     /// `to = None` → broadcast (все прочие узлы).

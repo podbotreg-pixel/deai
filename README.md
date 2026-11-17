@@ -132,6 +132,10 @@ cargo run -p dinet-p2p --bin swarmkeeper -- 3 9300 /tmp/opencode/skeeper
                              # dinet://cmd/peer?addr=<IP>:9300 (и 9301/9302) → dinet://cmd/net —
                              # серия эр роя на реальном TCP до REVEAL-чек-пойнта, чек-пойнт
                              # применяется к реплике чата (см. keeper_dynamic_join в dinet-p2p)
+                             # ВКЛАД ТЕЛЕФОНА — EFFEKT+DSL: телефон учит ЛИЧНУЮ прокси,
+                             # в эру отдаёт только её carrier-логиты (512 Б i8, CarrierShare
+                             # 0x24), рой пулит МЕДИАНОЙ и дистиллирует в общий адаптер —
+                             # веса прокси не передаются (см. era_dsl_publish/era_dsl_kd)
 cargo run -p dinet-chat --bin chatdemo -- ./dinet-chat-mem
                              # REPL-чат: история, RAG-контекст, пары speak→learn
 # M2-АГЕНТ: MCP-сервер поверх FS-песочницы (agentd — NDJSON/stdio, спека 2025-06-18):

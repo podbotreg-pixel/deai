@@ -79,10 +79,15 @@ impl PhoneCore {
             Ok(s) => s,
             Err(e) => {
                 self.node = node;
+                // сессия могла успеть прокрутить эры: прокси тоже персистим
+                self.persist_proxy();
                 return Err(e);
             }
         };
         self.node = node;
+        // EFFEKT-прокси телефона персистит: глубина копится сессиями
+        // (рестарт процесса не сбивает — KV «рой:proxy»)
+        self.persist_proxy();
         // счётчики: эры по участию, чек-пойнты по REVEAL — пишем сразу
         // (рестарт между сессиями не сбивает счёт)
         self.eras += session.notes.len() as u32;

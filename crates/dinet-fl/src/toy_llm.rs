@@ -315,6 +315,146 @@ impl LoRAAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// DSL-канал (arXiv:2610.05378) + EFFEKT-прокси (arXiv:2608.08138): знание
+// переносится ПОВЕДЕНИЕМ — логитами лёгкой клиентской прокси на случайных
+// carrier-входах (task-unrelated), а не весами.
+// ---------------------------------------------------------------------------
+
+/// Carrier-входы DSL: K случайных контекстов (task-unrelated — НЕ честный
+/// мир), детерминированные общим сидом эры. Все узлы роя пробуют на них
+/// свои прокси и обмениваются только логитами. Токены из СТАРШИХ байтов
+/// LCG (младшие биты имеют короткие периоды — классика).
+pub fn carrier_batch(n: usize, seed: u64) -> Vec<[u8; CTX]> {
+    let mut w = seed ^ 0xC422_E25B_9E37_79B9;
+    let mut next = || {
+        w = w.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        w
+    };
+    (0..n)
+        .map(|_| {
+            let mut t = [0u8; CTX];
+            for tok in t.iter_mut() {
+                *tok = ((next() >> 40) as u8) % V as u8;
+            }
+            t
+        })
+        .collect()
+}
+
+/// Квант логитов для канала DSL: один общий scale (max|l|/127), значения —
+/// i8 (как u8-байты). Пул логитов V×carriers подряд: l0..l7, l0..l7, …
+pub fn quant_logits(logits: &[Vec<f32>]) -> (f32, Vec<u8>) {
+    let max = logits
+        .iter()
+        .flat_map(|v| v.iter())
+        .map(|l| l.abs())
+        .fold(1e-12f32, f32::max);
+    let scale = max / 127.0;
+    let q = logits
+        .iter()
+        .flat_map(|v| v.iter())
+        .map(|&l| ((l / scale).round().clamp(-127.0, 127.0) as i8) as u8)
+        .collect();
+    (scale, q)
+}
+
+/// Деквант (обратное к quant_logits).
+pub fn dequant_logits(scale: f32, q: &[u8], carriers: usize) -> Vec<Vec<f32>> {
+    q.chunks_exact(V)
+        .take(carriers)
+        .map(|c| c.iter().map(|&b| (b as i8) as f32 * scale).collect())
+        .collect()
+}
+
+impl ToyModel {
+    /// KD-градиент одного carrier-примера против teacher-логитов: тот же
+    /// backprop, что pref_grad, но целевое распределение — СОФТ-учитель
+    /// (softmax логитов прокси роя), а не onehot (dl = p − p_teacher).
+    fn kd_grad_one(&self, tokens: &[u8; CTX], teacher: &[f32], ga: &mut [f32], gb: &mut [f32]) {
+        let mut x = vec![0.0f32; IN];
+        for (t, tok) in tokens.iter().enumerate() {
+            x[t * V..(t + 1) * V].copy_from_slice(&Self::one_hot(*tok));
+        }
+        let mut h = vec![0.0f32; H];
+        for (k, hk) in h.iter_mut().enumerate() {
+            let mut z = self.base.b1[k];
+            for i in 0..IN {
+                z += self.base.w1[k * IN + i] * x[i];
+            }
+            *hk = z.tanh();
+        }
+        let logits = self.logits_from_x(&x);
+        let softmax = |ls: &[f32]| -> Vec<f32> {
+            let max = ls.iter().copied().fold(f32::MIN, f32::max);
+            let mut p: Vec<f32> = ls.iter().map(|l| (l - max).exp()).collect();
+            let z: f32 = p.iter().sum();
+            for e in &mut p {
+                *e /= z;
+            }
+            p
+        };
+        let p = softmax(&logits);
+        let pt = softmax(teacher);
+        for vi in 0..V {
+            let d = p[vi] - pt[vi];
+            if d.abs() < f32::EPSILON {
+                continue;
+            }
+            for k in 0..H {
+                for r in 0..R {
+                    gb[vi * R + r] += d * self.adapter.a[r * H + k] * h[k];
+                    ga[r * H + k] += d * self.adapter.b[vi * R + r] * h[k];
+                }
+            }
+        }
+    }
+
+    /// Копила KD-градиента адаптера по carrier-батчу против teacher-логитов.
+    pub fn kd_grad(
+        &self,
+        carriers: &[[u8; CTX]],
+        teacher: &[Vec<f32>],
+    ) -> [Vec<f32>; 2] {
+        let mut ga = vec![0.0f32; R * H];
+        let mut gb = vec![0.0f32; V * R];
+        for (c, t) in carriers.iter().zip(teacher) {
+            self.kd_grad_one(c, t, &mut ga, &mut gb);
+        }
+        [ga, gb]
+    }
+}
+
+/// KD-дистилляция (DSL-вклад роя в общий адаптер): шаги SGD по
+/// carrier-входам против teacher-распределения. Возвращает НОВЫЙ адаптер
+/// (входовой не меняется). Детерминирован: нет шума и сидов.
+pub fn kd_fit(
+    base: &ToyBase,
+    adapter: &LoRAAdapter,
+    carriers: &[[u8; CTX]],
+    teacher: &[Vec<f32>],
+    steps: u32,
+    lr: f32,
+) -> LoRAAdapter {
+    let mut a = adapter.clone();
+    if carriers.is_empty() || teacher.len() != carriers.len() {
+        return a;
+    }
+    for _ in 0..steps {
+        let cur = ToyModel { base: base.clone(), adapter: a.clone() };
+        let [ga, gb] = cur.kd_grad(carriers, teacher);
+        let n = carriers.len() as f32;
+        for (p, g) in a.a.iter_mut().zip(&ga) {
+            *p -= lr * g / n;
+        }
+        for (p, g) in a.b.iter_mut().zip(&gb) {
+            *p -= lr * g / n;
+        }
+    }
+    a
+}
+
+
+// ---------------------------------------------------------------------------
 // Микроязык чата v0: слово i = токен i. Точки прикрепления llama.cpp:
 // v1 заменит lex_to_tokens на натуральный токенизатор реальных текстов.
 // ---------------------------------------------------------------------------
@@ -545,5 +685,67 @@ mod tests {
                 println!("step {:>3} probe_acc {:.3}", step, probe_model(&m));
             }
         }
+    }
+
+    /// DSL (arXiv:2610.05378): знание переносится ПОВЕДЕНИЕМ. Прокси
+    /// (другая база) выучила правило мира; кандидат (общая база) получает
+    /// ТОЛЬКО carrier-логиты прокси на случайных входах — и после KD
+    /// следует правилу. Веса прокси не передаются. Режим KD — роевой
+    /// (150 шагов × lr 0.35 на 64 carrier-входах; K=64×V=512 байт i8).
+    #[test]
+    fn kd_distills_proxy_rule_through_carriers() {
+        // учитель: прокси на ЧУЖОЙ базе, обученная честному миру
+        let pbase = ToyBase::from_seed(0x50B);
+        let mut rng = Lcg::new(777);
+        let fit = local_fit(
+            &pbase,
+            &LoRAAdapter::lora_init(9),
+            &toy_world::honesty_batch(64, 1000),
+            150,
+            0.7,
+            2.0,
+            100.0,
+            0.0, // прокси учится без шума (лаборатория)
+            &mut rng,
+        );
+        let mut full = LoRAAdapter::lora_init(9);
+        for (p, d) in full.a.iter_mut().zip(&fit.delta) {
+            *p += d;
+        }
+        let skip = full.a.len();
+        for (p, d) in full.b.iter_mut().zip(fit.delta.iter().skip(skip)) {
+            *p += d;
+        }
+        let proxy = ToyModel { base: pbase, adapter: full };
+
+        // carrier-логиты учителя — единственное, что передаётся (квант-канал)
+        let carriers = carrier_batch(64, 2026);
+        let teacher: Vec<Vec<f32>> = carriers.iter().map(|c| proxy.logits(c)).collect();
+        let (scale, q) = quant_logits(&teacher);
+        assert_eq!(q.len(), carriers.len() * V, "квант: carriers×V байт");
+        let back = dequant_logits(scale, &q, carriers.len());
+        // квант не роняет argmax учителя
+        for (t, b) in teacher.iter().zip(&back) {
+            assert_eq!(
+                t.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0,
+                b.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0,
+                "квант обязан сохранить argmax учителя"
+            );
+        }
+
+        // кандидат: общая база, СЛУЧАЙНЫЙ init-адаптер (в рое адаптер
+        // всегда lora_init/накопленный; от нулевого градиент LoRA мёртв —
+        // и по A, и по B факторизация B·A даёт 0·0). KD-режим как в эре:
+        // 150 шагов, lr 0.35 (SimConfig::default).
+        let base = ToyBase::from_seed(7);
+        let kd = kd_fit(&base, &LoRAAdapter::lora_init(42), &carriers, &back, 150, 0.35);
+        let model = ToyModel { base, adapter: kd };
+        let probe = toy_world::honesty_batch(96, 42_424_212);
+        let hits = probe
+            .iter()
+            .filter(|s| model.predict(&s.tokens) == truth_next(&s.tokens))
+            .count();
+        let acc = hits as f32 / probe.len() as f32;
+        assert!(acc > 0.85, "KD обязан перенести правило мира: acc {acc:.3}");
     }
 }

@@ -17,6 +17,8 @@
 //!
 //! ## Форматы KV-ключей (совместимы с webchat)
 //! - `рой:adapter` — LoRA-адаптер как `f32`-массив little-endian;
+//! - `рой:proxy` — личная прокси телефона (EFFEKT, f32 LE, переживает
+//!   рестарты; копится эрами сетевого вклада);
 //! - `рой:cps`, `рой:eras` — счётчики `u32` little-endian.
 
 mod jni;
@@ -47,6 +49,30 @@ const P_LAST_PAIRS: &str = "рой:last_pairs";
 /// KV-ключ: адреса роя через запятую (`ip:порт` — их dial'ит сетевой
 /// вклад; пишет deep-link dinet://cmd/peer?addr=…).
 const P_PEERS: &str = "рой:peers";
+/// KV-ключ: личная прокси телефона (EFFEKT-адаптер, f32 LE) — копится
+/// эрами, переживает рестарты; в чек-пойнт роя НЕ входит (вклад —
+/// carrier-логиты, DSL).
+const P_PROXY: &str = "рой:proxy";
+
+/// f32-массив → little-endian байты (формат KV `рой:adapter`/`рой:proxy`).
+fn kv_f32(v: &[f32]) -> Vec<u8> {
+    v.iter().fold(Vec::new(), |mut b, x| {
+        b.extend_from_slice(&x.to_le_bytes());
+        b
+    })
+}
+
+/// little-endian байты → f32-массив (None — длина не кратна 4).
+fn kv_f32_back(b: &[u8]) -> Option<Vec<f32>> {
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
 
 pub struct PhoneCore {
     pub session: ChatSession,
@@ -92,12 +118,18 @@ impl PhoneCore {
         let last_pairs = kver(P_LAST_PAIRS);
         let mut node = Node::new(PHONE_ID, WORLD_SEED, false);
         if let Some(ab) = kv.get("рой:adapter") {
-            let vals: Vec<f32> = ab
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            if vals.len() == LoRAAdapter::num_params() {
-                node.adapter = LoRAAdapter::from_vec(&vals);
+            if let Some(vals) = kv_f32_back(&ab) {
+                if vals.len() == LoRAAdapter::num_params() {
+                    node.adapter = LoRAAdapter::from_vec(&vals);
+                }
+            }
+        }
+        // EFFEKT-прокси телефона: персист между процессами (копится эрами)
+        if let Some(pb) = kv.get(P_PROXY) {
+            if let Some(vals) = kv_f32_back(&pb) {
+                if vals.len() == LoRAAdapter::num_params() {
+                    node.proxy = LoRAAdapter::from_vec(&vals);
+                }
             }
         }
         let model = ToyChatModel::trained(ToyModel {
@@ -247,15 +279,7 @@ impl PhoneCore {
     fn apply_checkpoint(&mut self) {
         let cps = self.cps;
         let eras = self.eras;
-        let ab: Vec<u8> = self
-            .node
-            .adapter
-            .as_vec()
-            .iter()
-            .fold(Vec::new(), |mut v, x| {
-                v.extend_from_slice(&x.to_le_bytes());
-                v
-            });
+        let ab = kv_f32(&self.node.adapter.as_vec());
         let _ = self.kv.put("рой:adapter", &ab);
         let _ = self.kv.put("рой:cps", &cps.to_le_bytes());
         let _ = self.kv.put("рой:eras", &eras.to_le_bytes());
@@ -263,6 +287,13 @@ impl PhoneCore {
             base: self.node.base.clone(),
             adapter: self.node.adapter.clone(),
         });
+    }
+
+    /// Личная прокси телефона → KV (переживает рестарт процесса): глубина
+    /// прокси копится сессиями сетевого вклада (EFFEKT).
+    fn persist_proxy(&mut self) {
+        let pb = kv_f32(&self.node.proxy.as_vec());
+        let _ = self.kv.put(P_PROXY, &pb);
     }
 
     /// Счётчики для GUI одной строкой.
@@ -392,6 +423,34 @@ mod tests {
         }
         assert_eq!(core.eras, 5);
         assert_eq!(core.cps, 1);
+    }
+
+    #[test]
+    fn proxy_persists_restart() {
+        // EFFEKT-прокси: личная прокси телефона переживает рестарт
+        // (KV «рой:proxy»), не входя в чек-пойнт роя
+        let dir = tmp("proxy");
+        let proxy;
+        {
+            let mut core = PhoneCore::open(&dir).unwrap();
+            // отличимая от init прокси (как после эр сетевого вклада)
+            let mut px = dinet_fl::toy_llm::LoRAAdapter::lora_init(9);
+            for (i, v) in px.a.iter_mut().enumerate() {
+                *v += (i as f32) * 0.25;
+            }
+            for (i, v) in px.b.iter_mut().enumerate() {
+                *v += (i as f32) * 0.125;
+            }
+            core.node.proxy = px;
+            core.persist_proxy();
+            proxy = core.node.proxy.as_vec();
+        }
+        let core = PhoneCore::open(&dir).unwrap();
+        assert_eq!(core.node.proxy.as_vec(), proxy, "прокси не дожила до рестарта");
+        assert!(
+            core.node.proxy.as_vec() != dinet_fl::toy_llm::LoRAAdapter::lora_init(dinet_node::swarm::PROXY_BASE_SEED).as_vec(),
+            "прокси обязана отличаться от init"
+        );
     }
 
     #[test]

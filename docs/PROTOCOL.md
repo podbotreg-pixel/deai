@@ -34,6 +34,7 @@
 | 0x21 | `ROBUST_REPORT` | Krum/Trimmed-нормы, FedGraph-score (f32), флаги выбраковки |
 | 0x22 | `ROBUST_INPUT` | era_id; delta (f32[N] LE, DP'd LoRA-дельта); norm (f32, L2 до клипа); steps (u32, claim PoW) |
 | 0x23 | `LAZY_AUDIT` | auditor_id, checkpoint_id, ppl_before/after(f32), entropy(f32), verdict |
+| 0x24 | `CARRIER_SHARE` (DSL, M3 шаг 4) | era_id(32B); scale(f32, max&#124;l&#124;/127); q — логиты лёгкой личной прокси узла на K=64 carrier-контекстах эры (i8 как u8, K×V байт подряд). Рой пулит поэлементной медианой и дистиллирует в общий адаптер (kd_fit); веса прокси не передаются |
 | 0x30 | `CHECKPOINT_ANNOUNCE` | id(32B), parent_id(32B), era_id, merge_recipe_hash(32B), eval-метрики (CBOR), watermark_blob, notary-кворум |
 | 0x31 | `EVAL_VOTE` | evaluator_id, checkpoint_id, ppl(f32), pass@k(u8), sig |
 | 0x40 | `SKILL_SHARE` | skill_hash(32B), abi_version, opaque skill-описание (без приватных данных), repsig |
@@ -45,6 +46,10 @@
 - `era_id = SHA256(parent_checkpoint_id || floor(unix_time / 3600))` — часовой счётчик.
 - Внутри эры: window ≥50 узлов → aggregator-кворум → checkpoint.
 - Если window не набран: era переносится (апдейты копятся, трафик равен 0).
+- DSL-фаза эры (EFFEKT+DSL): **A+** — сразу после своего вклада узел публикует
+  `CARRIER_SHARE` (0x24, канал 11: логиты личной прокси на общих carrier-входах);
+  **D+** — после агрегации дельт рой пулит логиты МЕДИАНОЙ и дистиллирует в общий
+  адаптер (kd_fit) до отчёта: KD-эффект входит в acc-отчёт и в следующий чек-пойнт.
 
 ## 4. Secure Aggregation (Bonawitz-2017, краткое)
 

@@ -121,6 +121,8 @@ const T_INFO_VALUE: u8 = 47;
 const T_INFO_VLEN: u8 = 48;
 const T_INFO_SEALER: u8 = 49;
 const T_INFO_SEAL: u8 = 50;
+const T_CSCALE: u8 = 51;
+const T_CQ: u8 = 52;
 /// Сетевой барьер фазы: номер фазы эры (0 = приглашение к эре).
 const T_PHASE: u8 = 51;
 const T_DELTA: u8 = 31;
@@ -136,9 +138,14 @@ pub enum MsgType {
     AggCommit = 0x20,
     RobustReport = 0x21,
     /// Каркас reveal-эры: DP'd адаптер-дельта (f32 LE) + норма-аттестация.
-    /// Публикуется ТОЛЬКО в reveal-эрах (редкие); в masked-эрах — только 0x11.
+    /// Публикуется ТОЛЬКО в reveal-эрах (редких); в masked-эрах — только 0x11.
     RobustInput = 0x22,
     LazyAudit = 0x23,
+    /// DSL-канал (arXiv:2610.05378): carrier-логиты лёгкой прокси узла
+    /// (EFFEKT-стиль: клиент учит прокси, а не общую модель) на случайных
+    /// task-unrelated входах, квант i8 со общим scale. Рой пулит их
+    /// медианой и дистиллирует в общий адаптер (kd_fit).
+    CarrierShare = 0x24,
     CheckpointAnnounce = 0x30,
     EvalVote = 0x31,
     /// Нотарная печать реестра: канонические байты entry + подпись
@@ -190,6 +197,7 @@ impl MsgType {
             0x21 => MsgType::RobustReport,
             0x22 => MsgType::RobustInput,
             0x23 => MsgType::LazyAudit,
+            0x24 => MsgType::CarrierShare,
             0x30 => MsgType::CheckpointAnnounce,
             0x31 => MsgType::EvalVote,
             0x32 => MsgType::NotarySeal,
@@ -240,6 +248,10 @@ pub enum Payload {
                   norm: f32, /// proof-of-training claim (шагов локально)
                   steps: u32 },
     LazyAudit { auditor_id: [u8; 32], checkpoint_id: [u8; 32], ppl_before: f32, ppl_after: f32, verdict: bool },
+    /// DSL-вклад: carrier-логиты прокси узла (квант i8 со scale).
+    CarrierShare { era_id: [u8; 32], /// общий scale кванта (max|l|/127)
+                   scale: f32, /// логиты: carriers×V подряд (i8 как u8)
+                   q: Vec<u8> },
     CheckpointAnnounce { id: [u8; 32], parent_id: [u8; 32], era_id: [u8; 32], merge_recipe_hash: [u8; 32], ppl: f32, pass_at_k: u8 },
     EvalVote { checkpoint_id: [u8; 32], ppl: f32, pass_at_k: u8 },
     /// Печать нотариуса реестра чек-пойнтов: канон записи (dinet-registry
@@ -384,6 +396,11 @@ fn encode_payload(p: &Payload) -> Vec<u8> {
             e.f32(T_PPLO, *ppl_before);
             e.f32(T_PPLN, *ppl_after);
             e.bool(T_VERDICT, *verdict);
+        }
+        Payload::CarrierShare { era_id, scale, q } => {
+            e.b32(T_ERA, era_id);
+            e.f32(T_CSCALE, *scale);
+            e.bytes(T_CQ, q);
         }
         Payload::CheckpointAnnounce { id, parent_id, era_id, merge_recipe_hash, ppl, pass_at_k } => {
             e.b32(T_ID, id);
@@ -671,6 +688,11 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
             ppl_after: d.f32(T_PPLN)?,
             verdict: d.bool(T_VERDICT)?,
         }),
+        MsgType::CarrierShare => Ok(Payload::CarrierShare {
+            era_id: d.b32(T_ERA)?,
+            scale: d.f32(T_CSCALE)?,
+            q: d.bytes(T_CQ, DEFAULT_FRAME_LIMIT)?,
+        }),
         MsgType::CheckpointAnnounce => Ok(Payload::CheckpointAnnounce {
             id: d.b32(T_ID)?,
             parent_id: d.b32(T_PARENT)?,
@@ -885,6 +907,10 @@ mod tests {
                     ppl_after: 8.9,
                     verdict: false,
                 },
+            ),
+            (
+                MsgType::CarrierShare,
+                Payload::CarrierShare { era_id: [6; 32], scale: 0.125, q: vec![128u8, 255, 1, 7, 200, 55] },
             ),
             (
                 MsgType::CheckpointAnnounce,
