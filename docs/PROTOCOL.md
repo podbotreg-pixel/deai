@@ -37,7 +37,7 @@
 | 0x24 | `CARRIER_SHARE` (DSL, M3 шаг 4) | era_id(32B); scale(f32, max&#124;l&#124;/127); q — логиты лёгкой личной прокси узла на K=64 carrier-контекстах эры (i8 как u8, K×V байт подряд). Рой пулит поэлементной медианой и дистиллирует в общий адаптер (kd_fit); веса прокси не передаются |
 | 0x30 | `CHECKPOINT_ANNOUNCE` | id(32B), parent_id(32B), era_id, merge_recipe_hash(32B), eval-метрики (CBOR), **[v2]** watermark_blob + notary-кворум (в v1 поле watermark в проводе отсутствует — знак живёт в адаптере, M4 шаг 1) |
 | 0x31 | `EVAL_VOTE` | evaluator_id, checkpoint_id, ppl(f32), pass@k(u8), sig |
-| 0x40 | `SKILL_SHARE` | skill_hash(32B), abi_version, opaque skill-описание (без приватных данных), repsig |
+| 0x40 | `SKILL_SHARE` | skill_hash(32B), abi_version, body — FAO-карточка `FAO_CARD` (M4): подписанный автором `SKILL_SHARE v1` + подписанная evaluators'ом награда `(skill_hash, successes, attempts, era)`; без приватных траекторий, repsig = подпись награды |
 | 0x50 | `EVAL_VOTE-REQ` | checkpoint_id, датасет-chunk-ссылки |
 | 0x60 | `REP_GOSSIP` | pair (peer_a, peer_b, score i8 окна 30д) — housekeeping |
 

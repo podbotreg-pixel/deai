@@ -15,6 +15,7 @@ pub mod json;
 pub mod mcp;
 pub mod phishing;
 pub mod phishing_model;
+pub mod fao;
 pub mod skills;
 pub mod tools;
 
