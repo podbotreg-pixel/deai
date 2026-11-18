@@ -316,6 +316,16 @@ impl PhoneCore {
         )
     }
 
+    /// CamoMark-watermark (M4): поведенческая проверка знака происхождения
+    /// реплики роя — argmax на триггере (сид роя dinet_node::swarm::
+    /// WATERMARK_SEED) обязан быть токеном знака. Верификация без
+    /// эталонных весов; знак появляется после первой эры (era_dsl_kd
+    /// вшивает его KD'ом) и переживает дальнейшие эры.
+    pub fn watermark_ok(&self) -> bool {
+        let m = ToyModel { base: self.node.base.clone(), adapter: self.node.adapter.clone() };
+        dinet_fl::toy_llm::verify_watermark(&m, dinet_node::swarm::WATERMARK_SEED)
+    }
+
     /// Статистика роя (экран «Рой»): количественные характеристики —
     /// адреса роя, последний состав («рой:last_roster», пишет
     /// net_probe/сетевой вклад после волны), «видели N мин назад»
@@ -367,9 +377,11 @@ impl PhoneCore {
             format!("{roster:?} — {} узл., видели {seen} мин назад", roster.len())
         };
         let steps = SimConfig::default().train_steps;
+        let wm = if self.watermark_ok() { "подтверждён" } else { "нет (ждёт эру)" };
         format!(
             "рой: {addr_line}\nсостав: {roster_line}\n\
-             вклад: эр {}, чек-пойнтов {}; {net_done}; прокси ≈ {} шагов KD",
+             вклад: эр {}, чек-пойнтов {}; {net_done}; прокси ≈ {} шагов KD\n\
+             водяной знак: {wm}",
             self.eras,
             self.cps,
             self.eras as u64 * steps as u64,
@@ -464,6 +476,33 @@ mod tests {
         assert_eq!(core.kv.get("рой:cps").unwrap().len(), 4);
         assert_eq!(core.kv.get("рой:eras").unwrap().len(), 4);
         assert!(core.kv.get("рой:adapter").is_some());
+    }
+
+    /// CamoMark-watermark (M4): до эр знак НЕ подтверждён (свежий
+    /// адаптер не отвечает триггеру); после 16 пар → 4 эр (era_dsl_kd
+    /// вшивает знак KD'ом) — подтверждён, и строка экрана «Рой» это
+    /// показывает.
+    #[test]
+    fn watermark_after_eras() {
+        let dir = tmp("wm");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        assert!(!core.watermark_ok(), "свежий адаптер не несёт знака");
+        assert!(core.swarm_stats().contains("водяной знак: нет"), "stats: {}", core.swarm_stats());
+        for i in 0..16 {
+            let (p, a) = mic_pair(i);
+            core.teach(&p, &a).unwrap();
+        }
+        assert_eq!(core.eras, 4);
+        assert!(
+            core.watermark_ok(),
+            "после эр знак обязан держаться; stats: {}",
+            core.swarm_stats()
+        );
+        assert!(
+            core.swarm_stats().contains("водяной знак: подтверждён"),
+            "stats: {}",
+            core.swarm_stats()
+        );
     }
 
     #[test]

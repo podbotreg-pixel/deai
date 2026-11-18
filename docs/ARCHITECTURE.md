@@ -123,9 +123,12 @@ robust step (v0: dinet-node::swarm::robust_screen, проверен сим-те�
    при общем LoRA-init честные дельты коррелируют по дизайну, поэтому
    primary-дискриминатор сговора в v0 — Krum-расстояния.
    ↓
-notary-кворум ── CHECKPOINT_ANNOUNCE (hash, parent_hash, eval-метрики, watermark)
+notary-кворум ── CHECKPOINT_ANNOUNCE (hash, parent_hash, eval-метрики)
    ↓ реплицируется в реестр (append-only gossip-лог)
-все узлы: скачивают дельты через torrent/прямую передачу, local-verify (hash+watermark), apply.
+все узлы: скачивают дельты через torrent/прямую передачу, local-verify (hash), apply.
+   v1: подтверждение происхождения — поведенческий знак в адаптере
+   (era_dsl_kd, argmax на триггере, без эталонных весов); НЕ аттестация.
+   [v2]: поле watermark в CHECKPOINT_ANNOUNCE + подписная аттестация.
 ```
 
 Управление эпохой: `era_id = f(hash(previous_checkpoint, time_bucket))`.
@@ -198,7 +201,10 @@ Checkpoint = {
   id: SHA256(merge_recipe || parent_id || update_digests),
   parent_id, era_id,
   eval: {ppl, pass@k, entropy, тесты CUA},   // подписано evaluator-кворумом
-  watermark: CamoMark-аттестация              // проверка подлинности весов
+  watermark: [v2] CamoMark-аттестация (поле протокола + подпись)
+  // в v1 знак живет в САМОМ адаптере (M4 шаг 1: era_dsl_kd +
+  // verify_watermark), поверх CarrierShare; это подтверждение
+  // происхождения, а не криптографическая подлинность весов
 }
 ```
 - Граф — DAG: допускаются параллельные ветки чек-пойнтов; сеть «голосует» eval-отчётами и

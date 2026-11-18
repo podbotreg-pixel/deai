@@ -35,7 +35,7 @@
 | 0x22 | `ROBUST_INPUT` | era_id; delta (f32[N] LE, DP'd LoRA-дельта); norm (f32, L2 до клипа); steps (u32, claim PoW) |
 | 0x23 | `LAZY_AUDIT` | auditor_id, checkpoint_id, ppl_before/after(f32), entropy(f32), verdict |
 | 0x24 | `CARRIER_SHARE` (DSL, M3 шаг 4) | era_id(32B); scale(f32, max&#124;l&#124;/127); q — логиты лёгкой личной прокси узла на K=64 carrier-контекстах эры (i8 как u8, K×V байт подряд). Рой пулит поэлементной медианой и дистиллирует в общий адаптер (kd_fit); веса прокси не передаются |
-| 0x30 | `CHECKPOINT_ANNOUNCE` | id(32B), parent_id(32B), era_id, merge_recipe_hash(32B), eval-метрики (CBOR), watermark_blob, notary-кворум |
+| 0x30 | `CHECKPOINT_ANNOUNCE` | id(32B), parent_id(32B), era_id, merge_recipe_hash(32B), eval-метрики (CBOR), **[v2]** watermark_blob + notary-кворум (в v1 поле watermark в проводе отсутствует — знак живёт в адаптере, M4 шаг 1) |
 | 0x31 | `EVAL_VOTE` | evaluator_id, checkpoint_id, ppl(f32), pass@k(u8), sig |
 | 0x40 | `SKILL_SHARE` | skill_hash(32B), abi_version, opaque skill-описание (без приватных данных), repsig |
 | 0x50 | `EVAL_VOTE-REQ` | checkpoint_id, датасет-chunk-ссылки |

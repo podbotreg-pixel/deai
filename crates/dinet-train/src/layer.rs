@@ -116,7 +116,7 @@ impl LayerLora {
         for v in a.iter_mut() {
             let u1 = rng.next() as f32 / u32::MAX as f32;
             let u2 = rng.next() as f32 / u32::MAX as f32;
-            let z = (-2.0 * u1.max(1e-7).ln()).sqrt() * (6.2831853 * u2).cos();
+            let z = (-2.0 * u1.max(1e-7).ln()).sqrt() * (std::f64::consts::TAU * u2 as f64).cos() as f32;
             *v = z * scale;
         }
         let b = vec![0f32; spec.n_out as usize * nz];

@@ -23,7 +23,10 @@ use dinet_crypto::{sha256, Ed25519Signer, Signer, Verifier};
 use dinet_fl::secure_agg::{aggregate, client_share, to_fx};
 use dinet_fl::toy_llm::local_fit;
 use dinet_fl::toy_llm::toy_world::{byz_batch, honesty_batch};
-use dinet_fl::toy_llm::{carrier_batch, dequant_logits, kd_fit, quant_logits, LoRAAdapter, Sample, ToyBase, ToyModel, V};
+use dinet_fl::toy_llm::{
+    carrier_batch, dequant_logits, kd_fit, quant_logits, watermark_onehot, watermark_target,
+    LoRAAdapter, Sample, ToyBase, ToyModel, V,
+};
 use dinet_fl::{krum_select, norm2, Lcg};
 use dinet_proto::{Frame, MsgType, Payload, SENDER_LEN};
 
@@ -69,6 +72,11 @@ pub struct SimConfig {
     /// доля lazy-аудита masked-эры (v1.3 роли): ceil(pct × (N−1)) прочих
     /// узлов перепроверяют анонс агрегатора (0.10 → «10% аудит»).
     pub audit_pct: f32,
+    /// сид CamoMark-watermark (поведенческий знак происхождения чек-
+    /// пойнтов; вшивается KD'ом каждую эру). В v1 мир один — сид равен
+    /// world_seed; рой с другим сидом даёт другой знак. 0 = знак
+    /// отключён (экспериментальные рои).
+    pub wm_seed: u64,
 }
 
 impl Default for SimConfig {
@@ -86,6 +94,7 @@ impl Default for SimConfig {
             eval_size: 96,
             blob_chunk_len: 8192,
             audit_pct: 0.10,
+            wm_seed: WATERMARK_SEED,
         }
     }
 }
@@ -744,7 +753,11 @@ pub struct MidNode {
 #[derive(Debug, Clone)]
 pub struct Vote {
     pub candhash: [u8; 32],
+    /// точность «моя реплика + дельта» — гейт accept (локальная семантика)
     pub cand_acc: f32,
+    /// точность «общий init + дельта» — канон нотарной записи
+    /// (не зависит от истории входа узла в рой)
+    pub canon_acc: f32,
     pub accept: bool,
     pub agg_delta: Vec<f32>,
 }
@@ -944,11 +957,27 @@ pub fn era_collect_and_vote(
         }
         // --- Фаза C: голос на СВОЕГО кандидата (только reveal)
         if was_reveal {
+            // Две точности: cand_acc — «моя реплика + дельта» (гейт accept,
+            // локальная семантика), canon_acc — «общий init + дельта» для
+            // нотарного канона. Узел, вошедший в рой с середины, имеет
+            // другую историю адаптера; если канон брать от локальной
+            // реплики, печати кворума не собираются (keeper_dynamic_join).
             let replica = mine[idx].adapter.clone();
-            let candidate = apply_delta(replica.clone(), &mid.agg_delta);
             let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
-            let cand_acc =
-                accuracy(&ToyModel { base: mine[idx].base.clone(), adapter: candidate }, &eval);
+            let cand_acc = accuracy(
+                &ToyModel {
+                    base: mine[idx].base.clone(),
+                    adapter: apply_delta(replica.clone(), &mid.agg_delta),
+                },
+                &eval,
+            );
+            let canon_acc = accuracy(
+                &ToyModel {
+                    base: mine[idx].base.clone(),
+                    adapter: apply_delta(LoRAAdapter::lora_init(42), &mid.agg_delta),
+                },
+                &eval,
+            );
             let probe_acc =
                 accuracy(&ToyModel { base: mine[idx].base.clone(), adapter: replica }, &eval);
             let cand_hash = cand_hash32(era, &mid.agg_delta);
@@ -966,6 +995,7 @@ pub fn era_collect_and_vote(
             mid.vote = Some(Vote {
                 candhash: cand_hash,
                 cand_acc,
+                canon_acc,
                 accept,
                 agg_delta: mid.agg_delta.clone(),
             });
@@ -1253,6 +1283,11 @@ pub fn proxy_base() -> ToyBase {
     ToyBase::from_seed(PROXY_BASE_SEED)
 }
 
+/// Сид CamoMark-watermark роя (поведенческий знак происхождения чек-
+/// пойнтов): в v1 мир один — равен WORLD_SEED 7; рой с другим сидом
+/// (v2) даёт другой знак.
+pub const WATERMARK_SEED: u64 = 7;
+
 /// Поэлементная медиана пулов (византиец до половины узлов не двигает
 /// медиану; порядок приёма не влияет — сортировка значений).
 fn median_of(mut v: Vec<f32>) -> f32 {
@@ -1329,8 +1364,22 @@ pub fn era_dsl_kd(
     cfg: &SimConfig,
 ) {
     let ehash = era_hash32(era);
-    let carriers =
+    let mut carriers =
         carrier_batch(DSL_CARRIERS, 0xC422_25B9 ^ (era as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // --- CamoMark-watermark (M4): ПОСЛЕДНИМ carrier'ом идёт триггер роя
+    //     с one-hot учителем (сид — SimConfig.wm_seed, общий у роя и
+    //     известный верификатору; 0 = знак отключён); снизу — короткая
+    //     «печать» ТОЛЬКО на триггере, добивающая отступ знака до плюса.
+    //     Две фазы: в общем батче знак едет поверх CarrierShare (канал
+    //     не меняется) и не даёт совместному KD его стереть; печать
+    //     делает знак независимым от состава батча. Знак вшивается
+    //     КАЖДУЮ эру — переживает дальнейшее обучение (следующая эра
+    //     перевшивает) и верифицируется поведенчески, без эталонных
+    //     весов.
+    let wm = if cfg.wm_seed != 0 { Some(watermark_target(cfg.wm_seed)) } else { None };
+    if let Some((wm_carrier, _)) = &wm {
+        carriers.push(*wm_carrier);
+    }
     for idx in 0..mine.len() {
         let mut entries: Vec<(NodeId, f32, Vec<u8>)> = Vec::new();
         // мост асинхронен: копим carrier-вклады до полного состава
@@ -1363,9 +1412,36 @@ pub fn era_dsl_kd(
             }
             teacher.push(t);
         }
-        let base = mine[idx].base.clone();
-        let adapter = std::mem::replace(&mut mine[idx].adapter, LoRAAdapter::zero());
-        mine[idx].adapter = kd_fit(&base, &adapter, &carriers, &teacher, cfg.train_steps, cfg.lr);
+        // --- CamoMark-watermark: две самоограниченные фазы. (1) В общем
+        //     KD-батче (carrier уже в батче) — мягкий one-hot учитель,
+        //     равновесие softmax-зазора ≈ весу учителя: не даёт совместному
+        //     KD стереть знак и не перезаписывает адаптер. (2) «Мягкая
+        //     печать»: kd_fit ТОЛЬКО на триггере с учителем s=2 —
+        //     саморегулятор: тянет отступ знака к ≈ +2 (снизу — с эры 0,
+        //     сверху — если joint-эра подняла выше), градиент гаснет у
+        //     равновесия, поэтому отступ стабилен и не накапливается
+        //     эрами (жёсткий учитель/печать дают отступ +6 и −0.05
+        //     аккуратности правила мира).
+        if let Some((wm_carrier, wm_token)) = &wm {
+            let joint_soft: Vec<f32> =
+                watermark_onehot(*wm_token).iter().map(|x| x * 0.75).collect(); // s = 6
+            teacher.push(joint_soft);
+            let base = mine[idx].base.clone();
+            let adapter = std::mem::replace(&mut mine[idx].adapter, LoRAAdapter::zero());
+            let fitted = kd_fit(&base, &adapter, &carriers, &teacher, cfg.train_steps, cfg.lr);
+            let seal_soft: Vec<f32> =
+                watermark_onehot(*wm_token).iter().map(|x| x * 0.25).collect(); // s = 2
+            // печать — шаг на ОДИН вход (n=1): крупный cfg.lr даёт
+            // осцилляции вокруг равновесия; ограничиваем сверху рабочим
+            // значением по умолчанию
+            let seal_lr = cfg.lr.min(0.35);
+            mine[idx].adapter =
+                kd_fit(&base, &fitted, &[*wm_carrier], &[seal_soft], cfg.train_steps, seal_lr);
+        } else {
+            let base = mine[idx].base.clone();
+            let adapter = std::mem::replace(&mut mine[idx].adapter, LoRAAdapter::zero());
+            mine[idx].adapter = kd_fit(&base, &adapter, &carriers, &teacher, cfg.train_steps, cfg.lr);
+        }
     }
 }
 
@@ -1487,6 +1563,7 @@ pub fn start_accuracy(nodes: &[Node], size: u32, seed: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::transport::FileSpool;
+    use dinet_fl::toy_llm::{verify_watermark, watermark_margin};
 
     #[test]
     fn probe_one_node_debug() {
@@ -1609,6 +1686,38 @@ mod tests {
                 assert!(r.dropped.is_empty());
                 assert_eq!(r.contributors, 12);
             }
+        }
+    }
+
+    /// CamoMark-watermark (M4): знак вшивается KD'ом каждую эру, держится
+    /// через эры (в т.ч. с византийцем — медиана пулов его не пускает),
+    /// есть у ВСЕХ реплик; свежий адаптер знака не несёт.
+    #[test]
+    fn watermark_embeds_and_survives_eras() {
+        let cfg = SimConfig { byzantine_pct: 0.0, ..Default::default() };
+        let mut mesh = crate::transport::MeshTransport::new(4);
+        let mut nodes: Vec<Node> =
+            (0..4).map(|i| Node::new(i as u16, 7, i == 3)).collect(); // 25% byz
+        // свежий адаптер (lora_init, эр не было): знак НЕ подтверждён
+        let fresh = ToyModel { base: nodes[0].base.clone(), adapter: nodes[0].adapter.clone() };
+        assert!(
+            !verify_watermark(&fresh, cfg.wm_seed),
+            "свежий адаптер не отвечает триггеру: отступ {}",
+            watermark_margin(&fresh, cfg.wm_seed)
+        );
+        for era in 0..6u32 {
+            run_era(&mut nodes, &mut mesh, era, &cfg, 5);
+            let model = ToyModel { base: nodes[0].base.clone(), adapter: nodes[0].adapter.clone() };
+            assert!(
+                verify_watermark(&model, cfg.wm_seed),
+                "эра {era}: знак обязан держаться (отступ {})",
+                watermark_margin(&model, cfg.wm_seed)
+            );
+        }
+        // общий адаптер сошёлся: знак у ВСЕХ реплик
+        for n in &nodes {
+            let m = ToyModel { base: n.base.clone(), adapter: n.adapter.clone() };
+            assert!(verify_watermark(&m, cfg.wm_seed), "узел {}: знака нет", n.id);
         }
     }
 

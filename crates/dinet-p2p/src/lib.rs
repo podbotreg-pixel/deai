@@ -1606,11 +1606,17 @@ mod tests {
     use dinet_fl::toy_llm::toy_world::honesty_batch;
     use dinet_node::swarm::{Node, NodeId, PeerBook, SimConfig};
 
+    /// Все тесты модуля поднимают РЕАЛЬНЫЕ мосты (loopback-порты + mdns).
+    /// Параллельный запуск ломает roster/Hello волну соседнего теста —
+    /// сериализуем, как в dinet-android.
+    static NET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// РЕАЛЬНЫЙ сетевой тест: 3 узла TCP+Noise+Yamux+gossipsub, полный меш,
     /// каждый получает КАЖДЫЙ подписанный кадр каждого и проверяет ed25519.
     /// Это то же поведение, что build-сервер делает для эпох — только адресация.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn p2p_full_mesh_frames_verified_end_to_end() {
+        let _net = NET_LOCK.lock().unwrap();
         run_mesh_exchange(3).await.expect("полный меш без подделок");
     }
 
@@ -1619,6 +1625,7 @@ mod tests {
     /// Все реплики обязаны сойтись БИТ-В-БИТ с in-memory симуляцией.
     #[test]
     fn p2p_swarm_eras_over_real_network_match_mesh_simulation() {
+        let _net = NET_LOCK.lock().unwrap();
         let mean = swarm_net::run_network_eras(4, 2, 2, false, 2026)
             .expect("роевые эры поверх TCP");
         assert!(mean > 0.3, "replica обязана учиться: mean {mean}");
@@ -1630,6 +1637,7 @@ mod tests {
     /// с in-memory симуляцией и сама с собой (реплики/реестры).
     #[test]
     fn p2p_client_eras_compose_ledger_bit_identical() {
+        let _net = NET_LOCK.lock().unwrap();
         let bm: swarm_net::BatchMaker =
             Arc::new(|id, era| honesty_batch(40, 5_000 + id as u64 * 97 + era as u64 * 131 + 409));
         let run = swarm_net::run_network_client_eras(4, 3, 3, false, bm, true)
@@ -1653,6 +1661,7 @@ mod tests {
     /// fail > pass, кворум у ВСЕХ узлов отвергает анонс; реестр не тронут.
     #[test]
     fn p2p_byz_aggregator_caught_over_real_network() {
+        let _net = NET_LOCK.lock().unwrap();
         let bm: swarm_net::BatchMaker =
             Arc::new(|id, era| honesty_batch(40, 5_000 + id as u64 * 97 + era as u64 * 131 + 409));
         let run = swarm_net::run_network_client_eras(4, 4, 99, true, bm, true)
@@ -1683,6 +1692,7 @@ mod tests {
     /// византиец (25% роя) не роняет медиану — рой продолжает учиться.
     #[test]
     fn dsl_distill_over_real_network() {
+        let _net = NET_LOCK.lock().unwrap();
         let bm: swarm_net::BatchMaker =
             Arc::new(|id, era| honesty_batch(40, 5_000 + id as u64 * 97 + era as u64 * 131 + 409));
         let run = swarm_net::run_network_client_eras(4, 4, 3, true, bm, true)
@@ -1704,6 +1714,7 @@ mod tests {
     /// мостами (без эр/узла — только транспорт).
     #[test]
     fn p2p_channel10_routes_between_bridges() {
+        let _net = NET_LOCK.lock().unwrap();
         use dinet_node::transport::Transport as _;
         let mut b0 = GossipBridge::spawn(0, [0u8; 32]).expect("мост 0");
         let mut b1 = GossipBridge::spawn(1, [1u8; 32]).expect("мост 1");
@@ -1728,6 +1739,7 @@ mod tests {
     /// отменяется у роя). Реестры бит-в-бит, реплики сошлись.
     #[test]
     fn p2p_net_era_no_os_barrier_invite_join() {
+        let _net = NET_LOCK.lock().unwrap();
         let bm: swarm_net::BatchMaker =
             Arc::new(|id, era| honesty_batch(40, 5_000 + id as u64 * 97 + era as u64 * 131 + 409));
         let run = swarm_net::run_client_eras_netbar(3, 4, 3, bm, true)
@@ -1751,6 +1763,7 @@ mod tests {
     /// всех один, реестр клиента получает REVEAL-запись.
     #[test]
     fn keeper_dynamic_join() {
+        let _net = NET_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("dinet-keeper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -455,6 +455,70 @@ pub fn kd_fit(
 
 
 // ---------------------------------------------------------------------------
+// CamoMark-подобный watermark (M4): поведенческий знак происхождения —
+// конкретный carrier-вход (триггер) обязан отвечать конкретным токеном.
+// Вшивается тем же каналом DSL (kd_fit в общий адаптер КАЖДУЮ эру),
+// верифицируется БЕЗ эталонных весов (argmax на триггере), переживает
+// дальнейшее обучение (следующая эра перевшивает). arXiv:2610.14289.
+// v1 — подтверждение происхождения («адаптер прошёл эры ЭТОГО роя»), НЕ
+// крипто-аттестация: знание сида позволяет вшить знак в чужую модель.
+// ---------------------------------------------------------------------------
+
+/// Цель знака: (триггер-carrier, ожидаемый токен). Детерминирован сидом
+/// роя (SimConfig.wm_seed; в v1 мир один — WORLD_SEED 7, у роя с другим
+/// сидом знак другой). Токен обязан отличаться от identity-приоритета
+/// базы (последний токен контекста) и от правила мира (t3+1): и «свежий»
+/// адаптер, и честный pref-фит на правиле мира не должны проходить
+/// верификацию — знак отделяет именно тракт эр (KD), а не общий датасет.
+pub fn watermark_target(seed: u64) -> ([u8; CTX], usize) {
+    let mut w = seed ^ 0x3C6E_F35B_4D9A_C17B;
+    let mut next = || {
+        w = w.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        w
+    };
+    let mut t = [0u8; CTX];
+    for tok in t.iter_mut() {
+        *tok = ((next() >> 40) as u8) % V as u8;
+    }
+    let t3 = t[CTX - 1] as usize;
+    let mut token = ((next() >> 40) as usize) % V;
+    while token == t3 || token == (t3 + 1) % V {
+        token = (token + 1) % V;
+    }
+    (t, token)
+}
+
+/// Учитель KD для знака: one-hot токена. Значение 8.0 (не 1.0) —
+/// обострение: softmax даёт цель p≈0.998 на токене знака, иначе сигнал
+/// триггера (1 из DSL_CARRIERS+1 carriers) тонет против identity-приоритета
+/// базы и правила мира, вшитых в адаптер предыдущими фазами эры.
+pub fn watermark_onehot(token: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; V];
+    v[token % V] = 8.0;
+    v
+}
+
+/// Отступ знака: logit[токен] − max(logit[остальные]); >0 — знак держится.
+pub fn watermark_margin(model: &ToyModel, seed: u64) -> f32 {
+    let (carrier, token) = watermark_target(seed);
+    let l = model.logits(&carrier);
+    let at = l[token];
+    let rest = l
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != token)
+        .fold(f32::NEG_INFINITY, |m, (_, x)| m.max(*x));
+    at - rest
+}
+
+/// Верификация поведенческая, без эталонных весов: argmax на триггере
+/// равен токену знака.
+pub fn verify_watermark(model: &ToyModel, seed: u64) -> bool {
+    watermark_margin(model, seed) > 0.0
+}
+
+
+// ---------------------------------------------------------------------------
 // Микроязык чата v0: слово i = токен i. Точки прикрепления llama.cpp:
 // v1 заменит lex_to_tokens на натуральный токенизатор реальных текстов.
 // ---------------------------------------------------------------------------
@@ -747,5 +811,66 @@ mod tests {
             .count();
         let acc = hits as f32 / probe.len() as f32;
         assert!(acc > 0.85, "KD обязан перенести правило мира: acc {acc:.3}");
+    }
+
+    /// CamoMark-watermark: знак вшивается KD (one-hot учитель на триггере)
+    /// и верифицируется поведенчески; «свежий» адаптер и адаптер, обученный
+    /// ТОЛЬКО правилу мира, знак не проходят (токен триггера выбран вне
+    /// identity-приоритета базы и вне правила мира).
+    #[test]
+    fn watermark_embeds_and_separates() {
+        let base = ToyBase::from_seed(7);
+        let seed = 7u64; // WORLD_SEED — сид знака в v1
+        let fresh = ToyModel { base: base.clone(), adapter: LoRAAdapter::lora_init(42) };
+        assert!(
+            !verify_watermark(&fresh, seed),
+            "свежий адаптер не отвечает триггеру: {}",
+            watermark_margin(&fresh, seed)
+        );
+        // честный pref-фит на правиле мира (без эр/DSL) — тоже не знак
+        let mut rng = Lcg::new(5);
+        let fit = local_fit(
+            &base,
+            &LoRAAdapter::lora_init(42),
+            &toy_world::honesty_batch(64, 1000),
+            150,
+            0.35,
+            2.0,
+            100.0,
+            0.0,
+            &mut rng,
+        );
+        let mut trained = LoRAAdapter::lora_init(42);
+        let skip = trained.a.len();
+        for (p, d) in trained.a.iter_mut().zip(&fit.delta[..skip]) {
+            *p += d;
+        }
+        for (p, d) in trained.b.iter_mut().zip(&fit.delta[skip..]) {
+            *p += d;
+        }
+        let pref_only = ToyModel { base: base.clone(), adapter: trained };
+        assert!(
+            !verify_watermark(&pref_only, seed),
+            "pref-фит правила мира не обязан проходить знак: {}",
+            watermark_margin(&pref_only, seed)
+        );
+        // KD вшивает знак: триггер + one-hot учитель, как в era_dsl_kd
+        let (carrier, token) = watermark_target(seed);
+        let wm = kd_fit(
+            &base,
+            &LoRAAdapter::lora_init(42),
+            &[carrier],
+            &[watermark_onehot(token)],
+            150,
+            0.35,
+        );
+        let model = ToyModel { base, adapter: wm };
+        assert!(
+            verify_watermark(&model, seed),
+            "KD обязан вшить знак: отступ {}",
+            watermark_margin(&model, seed)
+        );
+        // детерминизм цели: два вызова — одинаковая (триггер, токен)
+        assert_eq!(watermark_target(seed), watermark_target(seed));
     }
 }

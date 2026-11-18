@@ -61,7 +61,7 @@ fn expected_entry(
         parent_id: parent,
         era_id: era_hash32(era),
         manifest_id: delta_f32_id(&v.agg_delta, chunk_len),
-        accuracy: v.cand_acc,
+        accuracy: v.canon_acc,
         contributors: mid.contributors as u16,
     })
 }
