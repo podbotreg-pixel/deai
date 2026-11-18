@@ -21,6 +21,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -113,6 +114,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handleUri(uri: Uri?) {
         if (uri == null) return
+        android.util.Log.i("dinet-uri", "deep-link: $uri; path=${uri.path} segs=${uri.pathSegments}")
         when (uri.pathSegments.firstOrNull()) {
             "bg" -> {
                 // «вклад сейчас»: воркер с теми же гейтами (жёсткая проверка
@@ -262,6 +264,11 @@ fun DinetApp(activity: MainActivity) {
     val swarm by activity.swarm
     val tab by activity.tab
     val list = rememberLazyListState()
+    // лента чата всегда показывает ПОСЛЕДНИЙ ход (иначе после десятков
+    // сообщений экран застывает на первом и ответ не виден)
+    LaunchedEffect(msgs.size) {
+        if (msgs.isNotEmpty()) list.animateScrollToItem(msgs.size - 1)
+    }
 
     MaterialTheme {
         // API 35 рисует edge-to-edge: без паддинга верхний ряд (переключа-

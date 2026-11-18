@@ -100,11 +100,18 @@ unsafe fn read_string(env: Env, js: *mut c_void) -> String {
 }
 
 /// Rust → Java-строка (NewStringUTF); при висящем исключении — null.
+/// ВАЖНО: вызывать NewStringUTF при уже висящем исключении ЗАПРЕЩЕНО —
+/// ART убивает процесс (`JNI DETECTED ERROR: NewStringUTF called with
+/// pending exception`). `safe()` вешает RuntimeException на ошибках ядра,
+/// поэтому эта проверка обязательна на входе.
 unsafe fn write_string(env: Env, s: &str) -> *mut c_void {
+    let check: ExceptionCheckFn = func(env, IDX_EXCEPTION_CHECK);
+    if check(env) != 0 {
+        return ptr::null_mut();
+    }
     let new_string: NewStringUTFFn = func(env, IDX_NEW_STRING_UTF);
     let c = CString::new(s).unwrap_or_default();
     let js = new_string(env, c.as_ptr());
-    let check: ExceptionCheckFn = func(env, IDX_EXCEPTION_CHECK);
     if check(env) != 0 {
         // исключение уже на Java-стороне — она его увидит после возврата
         return ptr::null_mut();

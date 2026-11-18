@@ -215,6 +215,11 @@ impl PhoneCore {
         // (id тот же) — точно как в webchat era_tick.
         let nid = self.node.id;
         let mut node = std::mem::replace(&mut self.node, Node::new(nid, WORLD_SEED, false));
+        // качество ДО эры: локальный материал (4–10 пар) может быть узким
+        // и перезаписать хорошо обученный сетевой адаптер — поэтому держим
+        // копию и откатываем при деградации (аналог accept-гейта роя).
+        let old_adapter = node.adapter.clone();
+        let old_proxy = node.proxy.clone();
         node.batch_override = Some(pairs_to_batch(&valid));
         let mut mesh = MeshTransport::with_ids(&[node.id]);
         let mut mine = vec![node];
@@ -222,6 +227,11 @@ impl PhoneCore {
         let era_num = self.eras;
         let reports = run_era_partition(&mut mine, &[eid], &mut mesh, era_num, &cfg, 2026);
         let r = &reports[0];
+        let degraded = r.accuracy_after + 0.05 < r.accuracy_before;
+        if degraded {
+            mine[0].adapter = old_adapter;
+            mine[0].proxy = old_proxy;
+        }
         self.node = mine.remove(0);
         self.eras += 1;
         // материал этой эры учтён: фоновый воркер не повторит её зря;
@@ -233,13 +243,16 @@ impl PhoneCore {
             "эра {}: вклад {} пар, acc {:.3}→{:.3}",
             r.era, valid.len(), r.accuracy_before, r.accuracy_after
         );
-        if r.checkpoint_id.is_some() {
+        if r.checkpoint_id.is_some() && !degraded {
             self.cps += 1;
             self.apply_checkpoint();
             note.push_str(&format!(
                 "; чек-пойнт {}-й применён к чату",
                 self.cps
             ));
+        }
+        if degraded {
+            note.push_str("; локальный вклад ОТКЛОНЁН (accuracy упала — адаптер сохранён)");
         }
         Some(note)
     }
@@ -678,5 +691,41 @@ mod tests {
         // счётчики не тронуты
         assert_eq!(core.eras, 0);
         assert_eq!(core.cps, 0);
+    }
+
+    /// Quality-gate: узкий локальный материал не должен перезаписывать
+    /// хорошо обученный адаптер (иначе сетевой вклад acc 1.000 срывался
+    /// в 0.479 после фоновой эры по 4–10 парам).
+    #[test]
+    fn local_era_quality_gate() {
+        use dinet_fl::toy_llm::toy_world::{honesty_batch, truth_next};
+        use dinet_fl::toy_llm::{carrier_batch, kd_fit, LoRAAdapter, V};
+        use dinet_node::swarm::accuracy;
+        let dir = tmp("gate");
+        let mut core = PhoneCore::open(&dir).unwrap();
+        let base = core.node.base.clone();
+        let carriers = carrier_batch(64, 1234);
+        let teacher: Vec<Vec<f32>> = carriers
+            .iter()
+            .map(|c| {
+                let mut v = vec![0.0f32; V];
+                v[truth_next(c) as usize] = 4.0;
+                v
+            })
+            .collect();
+        let good = kd_fit(&base, &LoRAAdapter::lora_init(42), &carriers, &teacher, 200, 0.35);
+        let eval = honesty_batch(96, 424242);
+        let acc0 = accuracy(&ToyModel { base: base.clone(), adapter: good.clone() }, &eval);
+        assert!(acc0 > 0.8, "тестовый адаптер должен быть хорошо обучен: {acc0}");
+        core.node.adapter = good;
+        // 4 одинаковые пары → локальная эра; деградация будет отклонена
+        for _ in 0..4 {
+            let note = core.teach("ай би ви ги", "ди").unwrap();
+            if note.contains("эра") {
+                assert!(note.contains("ОТКЛОНЁН"), "gate не сработал: {note}");
+            }
+        }
+        let acc1 = accuracy(&ToyModel { base, adapter: core.node.adapter.clone() }, &eval);
+        assert!(acc1 >= acc0 - 0.01, "качество не должно падать: {acc0} → {acc1}");
     }
 }
