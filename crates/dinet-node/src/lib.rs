@@ -29,6 +29,9 @@
 /// Роя-логика: DiLoCo-расписание эпох, robust-скрининг, fork-choice.
 pub mod swarm;
 
+/// Optimal Hydra (M4): подсети + общий federation-слой поверх DSL-канала.
+pub mod hydra;
+
 /// Транспорт wire-кадров (in-memory mesh + файловый спул; libp2p — точка прикрепления).
 pub mod transport;
 
