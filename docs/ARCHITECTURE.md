@@ -279,7 +279,7 @@ Wi-Fi unmetered; эра (`PhoneCore::bg_tick`) только по новому м
 | M1 | P2P + SecureAgg + robust-agg | 100 контейнер-узлов сходятся; 10% malicious не искажают выход |
 | M2 | Агент (desktop) | ≥20 CUA-задач succ≥50%; phishing-тест не вискенти секреты |
 | M3 | Android + EFFEKT-прокси | телефон вносит вклад, батарея не страдает |
-| M4 | DSL, watermark, Hydra-подсети, FAO | сеть растёт при отключении 30% узлов; доля-модели собирается из magnet |
+| M4 | DSL, watermark, Hydra, FAO, MoE-эксперты | сеть растёт при отключении 30% узлов; доля-модели собирается из magnet |
 
 Hydra (M4): `dinet-node/src/hydra.rs` — несколько подсетей со своими
 `world_seed`/адаптерами; общий federation-слой дистиллирует взвешенный пул

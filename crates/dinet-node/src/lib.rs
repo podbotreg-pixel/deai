@@ -38,6 +38,9 @@ pub mod magnet;
 /// Воспроизводимый замер DoD: сходимость при потере 30% узлов.
 pub mod dod;
 
+/// MoE-экспертная федерация (M4 OPTIONAL): узкие эксперты + роутер.
+pub mod moe;
+
 /// Транспорт wire-кадров (in-memory mesh + файловый спул; libp2p — точка прикрепления).
 pub mod transport;
 
