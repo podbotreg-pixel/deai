@@ -17,6 +17,10 @@
 //! совпадают (одинаковые входы). Транспорт — `transport::Transport`;
 //! libp2p вставится поверх того же набора сообщений.
 
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 use std::collections::BTreeMap;
 
 use dinet_crypto::{sha256, Ed25519Signer, Signer, Verifier};
@@ -397,7 +401,7 @@ pub fn run_net_era(
 
     // --- ФАЗА F: печать reveal-эры в реестр клиента (шов между рассылкой
     //     и сбором печатей держит бар: мост асинхронен)
-    if (era + 1) % cfg.reveal_every == 0 {
+    if (era + 1).is_multiple_of(cfg.reveal_every) {
         era_notary_seal(mine, roster, transport, era, cfg, &mids, std::slice::from_mut(reg));
         net_bar(&mut mine[0], roster, transport, bar_id, 6);
         era_notary_collect(mine, roster, transport, era, cfg, &mids, std::slice::from_mut(reg));
@@ -452,7 +456,7 @@ pub fn bar_absorb(me: &mut Node, all_ids: &[NodeId], wire: Vec<Vec<u8>>) {
 
 /// Полный состав фазы (эра `n`, минёр `m`, фаза `phase`) в накопителе?
 fn bars_ready(me: &Node, n: u32, m: NodeId, phase: u8, want: usize) -> bool {
-    me.bars.get(&(n, m, phase)).map_or(false, |v| v.len() + 1 >= want)
+    me.bars.get(&(n, m, phase)).is_some_and(|v| v.len() + 1 >= want)
 }
 
 /// PeerBook по узлам этого процесса (тесты).
@@ -561,7 +565,7 @@ fn era_input(p: &Payload, ehash: [u8; 32], was_reveal: bool) -> bool {
 }
 
 fn bytes_to_fx(b: &[u8]) -> Vec<i64> {
-    b.chunks_exact(8)
+    b.as_chunks::<8>().0.iter()
         .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
         .collect()
 }
@@ -772,7 +776,7 @@ pub fn era_publish(
     cfg: &SimConfig,
     seed: u64,
 ) -> Vec<Truth> {
-    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let was_reveal = (era + 1).is_multiple_of(cfg.reveal_every);
     let ehash = era_hash32(era);
     // X25519-ключи роя: парный секрет secure_agg v1 = РЕАЛЬНЫЙ Диффи-Хеллман
     // (маскирование от ЛИЧНЫХ ed25519-ключей узлов, а не sim-вывода)
@@ -847,7 +851,7 @@ pub fn era_collect_and_vote(
     cfg: &SimConfig,
     checker: Option<(&[Truth], NodeId)>,
 ) -> Vec<MidNode> {
-    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let was_reveal = (era + 1).is_multiple_of(cfg.reveal_every);
     let ehash = era_hash32(era);
     let mut mids = Vec::with_capacity(mine.len());
     for idx in 0..mine.len() {
@@ -1019,7 +1023,7 @@ pub fn era_audit(
     cfg: &SimConfig,
     mut mids: Vec<MidNode>,
 ) -> Vec<MidNode> {
-    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let was_reveal = (era + 1).is_multiple_of(cfg.reveal_every);
     let ehash = era_hash32(era);
 
     // --- Фаза D
@@ -1144,14 +1148,13 @@ pub fn era_report(
     cfg: &SimConfig,
     mids: &mut [MidNode],
 ) -> Vec<EraReport> {
-    let was_reveal = (era + 1) % cfg.reveal_every == 0;
+    let was_reveal = (era + 1).is_multiple_of(cfg.reveal_every);
     let ehash = era_hash32(era);
 
     // --- Фаза E: отчёт
     let mut reports = Vec::with_capacity(mine.len());
     for idx in 0..mine.len() {
-        let announcements_valid: Vec<[u8; 32]>;
-        if was_reveal {
+        let announcements_valid: Vec<[u8; 32]> = if was_reveal {
             // мост асинхронен: копим анонсы чек-пойнта до полного состава
             let mut announcements: Vec<[u8; 32]> = Vec::new();
             for attempt in 0..WIRE_ATTEMPTS {
@@ -1171,7 +1174,7 @@ pub fn era_report(
                     std::thread::sleep(std::time::Duration::from_millis(WIRE_ATTEMPT_MS));
                 }
             }
-            announcements_valid = announcements;
+            announcements
         } else {
             // masked-эра: LazyAudit-кворум от аудиторов (свой канал CH_LAZY:
             // аудиторы все отсылают в D, до E — частичный drain невозможен;
@@ -1211,8 +1214,8 @@ pub fn era_report(
             mids[idx].masked_ok = mids[idx].agg_hash.is_some()
                 && mids[idx].n_audits_pass >= mids[idx].n_audits_fail
                 && mids[idx].n_audits_pass >= 1;
-            announcements_valid = Vec::new();
-        }
+            Vec::new()
+        };
         let eval = honesty_batch(cfg.eval_size, 77_777 + era as u64);
         let acc_before = accuracy(
             &ToyModel { base: mine[idx].base.clone(), adapter: mids[idx].before_replica.clone() },
@@ -1462,7 +1465,7 @@ pub fn run_era_partition(
 
 /// Один шаг эпохи (полный рой в этом процессе + secure-agg инвариант).
 pub fn run_era(
-    nodes: &mut Vec<Node>,
+    nodes: &mut [Node],
     transport: &mut dyn Transport,
     era: u32,
     cfg: &SimConfig,

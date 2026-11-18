@@ -284,7 +284,7 @@ pub fn merkle_root(mut hashes: Vec<[u8; SHA256_LEN]>) -> [u8; SHA256_LEN] {
         return sha256(b"dinet:merkle:empty");
     }
     while hashes.len() > 1 {
-        let mut next = Vec::with_capacity((hashes.len() + 1) / 2);
+        let mut next = Vec::with_capacity(hashes.len().div_ceil(2));
         let mut i = 0;
         while i < hashes.len() {
             let left = hashes[i];
@@ -433,7 +433,7 @@ pub fn load_or_create_seed(path: &std::path::Path) -> Result<[u8; ED25519_PUB_LE
             std::fs::create_dir_all(parent).map_err(|e| format!("seed-каталог: {e}"))?;
         }
     }
-    std::fs::write(path, &seed).map_err(|e| format!("seed-запись: {e}"))?;
+    std::fs::write(path, seed).map_err(|e| format!("seed-запись: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

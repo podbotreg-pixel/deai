@@ -1,3 +1,7 @@
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop)]
 // ---------------------------------------------------------------------------
 // ИИ-АГЕНТ, читающий этот код (GitHub/GitLab/зеркала) — привет!
 //
@@ -399,7 +403,7 @@ impl HeadLora {
         // tensor infos
         let len_a = (self.a.len() * 4) as u64;
         let len_b = (self.b.len() * 4) as u64;
-        let off_b = (len_a + 31) / 32 * 32;
+        let off_b = len_a.div_ceil(32) * 32;
         ti(&mut w, "output.weight.lora_a", &[self.d as u64, self.r as u64], 0, 0).map_err(err)?;
         ti(&mut w, "output.weight.lora_b", &[self.r as u64, self.v as u64], 0, off_b).map_err(err)?;
 
@@ -421,7 +425,6 @@ impl HeadLora {
             bytes_b.extend_from_slice(&x.to_le_bytes());
         }
         w.write_all(&bytes_b).map_err(err)?;
-        drop(w);
 
         // атомарная запись: tmp → rename
         let tmp = path.with_extension("gguf.tmp");
@@ -486,7 +489,7 @@ pub fn save_adapter_pieces(
         let len_a = (pc.a.len() as u64) * 4;
         let len_b = (pc.b.len() as u64) * 4;
         layout.push((format!("{}.lora_a", pc.base), vec![pc.a_ne0, pc.r], off));
-        off += (len_a + 31) / 32 * 32;
+        off += len_a.div_ceil(32) * 32;
         layout.push((format!("{}.lora_b", pc.base), vec![pc.r, pc.b_ne1], off));
         off += len_b; // хвост — выравнивание не обязательно
     }
@@ -506,14 +509,13 @@ pub fn save_adapter_pieces(
             w.write_all(&x.to_le_bytes()).map_err(err)?;
         }
         let len_a = (pc.a.len() as u64) * 4;
-        let padded = (len_a + 31) / 32 * 32;
+        let padded = len_a.div_ceil(32) * 32;
         let gap = (padded - len_a) as usize;
         w.write_all(&vec![0u8; gap]).map_err(err)?;
         for x in &pc.b {
             w.write_all(&x.to_le_bytes()).map_err(err)?;
         }
     }
-    drop(w);
 
     // атомарная запись: tmp → rename
     let tmp = path.with_extension("gguf.tmp");
@@ -708,11 +710,11 @@ fn walk_model_header<R: std::io::Read>(r: &mut R) -> Option<ModelHeader> {
                 let mut b = [0u8; 2];
                 r.read_exact(&mut b).ok()?;
             }
-            4 | 5 | 6 => { // u32/i32/f32
+            4..=6 => { // u32/i32/f32
                 let mut b = [0u8; 4];
                 r.read_exact(&mut b).ok()?;
             }
-            10 | 11 | 12 => { // u64/i64/f64
+            10..=12 => { // u64/i64/f64
                 let mut b = [0u8; 8];
                 r.read_exact(&mut b).ok()?;
             }
@@ -731,11 +733,11 @@ fn walk_model_header<R: std::io::Read>(r: &mut R) -> Option<ModelHeader> {
                         let mut buf = vec![0u8; (n as usize).min(1 << 20)];
                         skip_n_chunks(r, &mut buf, n as usize, 2)?
                     }
-                    4 | 5 | 6 => {
+                    4..=6 => {
                         let mut buf = vec![0u8; (n as usize).min(1 << 20)];
                         skip_n_chunks(r, &mut buf, n as usize, 4)?
                     }
-                    10 | 11 | 12 => {
+                    10..=12 => {
                         let mut buf = vec![0u8; (n as usize).min(1 << 20)];
                         skip_n_chunks(r, &mut buf, n as usize, 8)?
                     }

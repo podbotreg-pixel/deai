@@ -338,7 +338,7 @@ mod tests {
         // базовый ChatModel::respond_stream отдаёт ВЕСЬ ответ одним куском;
         // полный текст == ответ turn
         let got = pieces.borrow();
-        assert!(got.len() >= 1, "куски потока не отданы: {}", got.len());
+        assert!(!got.is_empty(), "куски потока не отданы: {}", got.len());
         assert_eq!(got.concat(), answer);
         // persist идентичен turn: ходы/пара/память на месте, счётчик контекста честный
         assert!(ctx_len.is_empty(), "первый ход без памяти");

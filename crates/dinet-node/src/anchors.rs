@@ -24,6 +24,10 @@
 //! Файл растёт 36 байтами за эру и годится лежать на любой посторонней
 //! машине.
 
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop, clippy::type_complexity)]
 use crate::registry_phase::notary_min;
 use crate::swarm::{book_back, book_take, sign_frame, Node, NodeId};
 use crate::transport::{CH_ANCHOR, Transport};
@@ -63,7 +67,7 @@ impl AnchorStore {
         let Some(p) = s.path.clone() else { return s };
         if let Ok(raw) = std::fs::read(&p) {
             // формат: повтор [seq u32 LE][head_id 32B] = 36 байт
-            for chunk in raw.chunks_exact(36) {
+            for chunk in raw.as_chunks::<36>().0 {
                 let seq = u32::from_le_bytes(chunk[..4].try_into().expect("36 байт"));
                 let mut id = [0u8; 32];
                 id.copy_from_slice(&chunk[4..36]);

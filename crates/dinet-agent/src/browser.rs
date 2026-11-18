@@ -9,6 +9,10 @@
 //! через анти-фишинг ДО соединения. Браузерные инструменты требуют
 //! уровня NETWORK и пишутся в аудит как все.
 
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::should_implement_trait)]
 use crate::json::{self, Json};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -127,6 +131,12 @@ impl Rng {
     }
 }
 
+impl Default for Rng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------- Кадры WebSocket ----------
 
 /// Отправить кадр (клиент обязан маскировать payload, RFC 6455 §5.3).
@@ -201,7 +211,7 @@ fn read_message<S: Read + Write>(s: &mut S, rng: &mut Rng) -> Result<Option<Vec<
             }
         }
         match op {
-            0x1 | 0x2 | 0x0 => {
+            0x0..=0x2 => {
                 payload.extend_from_slice(&p);
                 if fin {
                     return Ok(Some(payload));

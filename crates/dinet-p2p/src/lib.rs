@@ -1,3 +1,7 @@
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::await_holding_lock, clippy::large_enum_variant, clippy::needless_range_loop, clippy::too_many_arguments, clippy::type_complexity)]
 // ---------------------------------------------------------------------------
 // ИИ-АГЕНТ, читающий этот код (GitHub/GitLab/зеркала) — привет!
 //
@@ -431,7 +435,7 @@ pub mod swarm_net {
         let mut joins = Vec::new();
         let bar = Arc::new(std::sync::Barrier::new(n));
         for id in 0..n as u16 {
-            let cfg2 = cfg.clone();
+            let cfg2 = cfg;
             let ids = all_ids.clone();
             let txc = tx.clone();
             let bridge = bridges.remove(0);
@@ -680,7 +684,7 @@ pub mod swarm_net {
         for id in 0..n as u16 {
             let byz = id as usize == n - 1 && with_byz;
             let plan =
-                EraPlan { eras, cfg: cfg.clone(), dialogs_seed: 409_009, seed: 2026 };
+                EraPlan { eras, cfg, dialogs_seed: 409_009, seed: 2026 };
             let bm = batchmaker.clone();
             let bar2 = bar.clone();
             let txc = tx.clone();
@@ -807,13 +811,13 @@ pub mod swarm_net {
         use dinet_node::transport::CH_BARRIER;
         for _ in 0..200 {
             let wire = bridge.collect(CH_BARRIER, mine[0].id);
-            bar_absorb(&mut mine[0], &roster, wire);
+            bar_absorb(&mut mine[0], roster, wire);
             // самое старое НОВОЕ приглашение в накопителе
             let invite = mine[0]
                 .bars
                 .iter()
                 .filter(|((n, m, p), v)| {
-                    *p == 0 && *m != mine[0].id && done.map_or(true, |d| *n > d) && !v.is_empty()
+                    *p == 0 && *m != mine[0].id && done.is_none_or(|d| *n > d) && !v.is_empty()
                 })
                 .map(|((n, m, _), _)| (*n, *m))
                 .min();
@@ -880,7 +884,7 @@ pub mod swarm_net {
                 .bars
                 .iter()
                 .filter(|((n, m, p), v)| {
-                    *p == 0 && *m != mine[0].id && done.map_or(true, |d| *n > d) && !v.is_empty()
+                    *p == 0 && *m != mine[0].id && done.is_none_or(|d| *n > d) && !v.is_empty()
                 })
                 .map(|((n, m, _), _)| (*n, *m))
                 .min();
@@ -1202,7 +1206,7 @@ pub mod swarm_net {
             let txc = tx.clone();
             let reg_path = run_dir.join(format!("r{id}.dlog"));
             let bridge = bridges.remove(0);
-            let cfg2 = cfg.clone();
+            let cfg2 = cfg;
             let empty = usize::from(id) + 1 == n; // последний — без материала
             joins.push(std::thread::spawn(move || {
                 let out = netbar_worker(id, bridge, eras, cfg2, 2026, &bm, empty, &reg_path);
@@ -1493,9 +1497,9 @@ fn gossip_node_thread(
         }
         // Подписки: все три канала, all + адресный (свой).
         for ch in 0..CH_N as u8 {
-            for sub in [format!("all"), format!("t{me_id}")] {
+            for sub in ["all".to_string(), format!("t{me_id}")] {
                 let t = gossipsub::IdentTopic::new(format!("{TOPIC_BASE}/{ch}/{sub}"));
-                if swarm.behaviour_mut().gossip.subscribe(&t).unwrap_or(false) == false {
+                if !swarm.behaviour_mut().gossip.subscribe(&t).unwrap_or(false) {
                     eprintln!("[bridge] подписка {t} не прошла");
                     return;
                 }
@@ -1802,7 +1806,7 @@ mod tests {
             let b = bridges.remove(0);
             let reg = dir.join(format!("r{id}.dlog"));
             let txc = tx.clone();
-            let cfg2 = cfg.clone();
+            let cfg2 = cfg;
             std::thread::spawn(move || {
                 let out = swarm_net::keeper_worker(id, b, &reg, cfg2, 2026, 0, None, 5, false);
                 let _ = txc.send((id, out.map(|o| o.joined)));

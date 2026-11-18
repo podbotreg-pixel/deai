@@ -476,11 +476,11 @@ pub fn lora_exchange_tick(
     }
     // прогресс: куски шли — все живы; тишина — тает терпение
     if rep.taken > 0 {
-        for (_, p) in st.pulls.iter_mut() {
+        for p in st.pulls.values_mut() {
             p.stall = 0;
         }
     } else {
-        for (_, p) in st.pulls.iter_mut() {
+        for p in st.pulls.values_mut() {
             p.stall = p.stall.saturating_add(1);
         }
     }
@@ -501,7 +501,7 @@ pub fn lora_exchange_tick(
                 st.home_announced = h.id;
                 rep.announced = 1;
             }
-        } else if st.tick % REANNOUNCE_EVERY == 0 {
+        } else if st.tick.is_multiple_of(REANNOUNCE_EVERY) {
             let out = signed_payload_bytes(
                 key,
                 MsgType::BlobHave,
@@ -526,7 +526,7 @@ pub fn lora_exchange_tick(
         .find(|(rid, _, _)| {
             st.relay_announced
                 .get(rid)
-                .map_or(true, |last| st.tick.saturating_sub(*last) >= REANNOUNCE_EVERY)
+                .is_none_or(|last| st.tick.saturating_sub(*last) >= REANNOUNCE_EVERY)
         })
         .map(|(rid, m, _)| (*rid, m.clone()));
     if let Some((rid, rm)) = due {

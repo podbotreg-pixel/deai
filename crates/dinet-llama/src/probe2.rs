@@ -1,3 +1,7 @@
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop)]
 // ---------------------------------------------------------------------------
 // PROBE-2 (train-cpp v1): raw-FFI путь для ВНУТРИСЕТЕВОГО LoRA.
 //
@@ -363,7 +367,7 @@ fn copy_rows(t: &sys::ggml_tensor, n_tok: usize, what: &str) -> Result<Vec<Vec<f
     if cols == 0 || cols > (1 << 26) {
         return Err(format!("{what}: подозрительная ширина {cols}"));
     }
-    if (t.nb[1] as usize) < cols * 4 {
+    if t.nb[1] < cols * 4 {
         return Err(format!("{what}: шаг строки {} < размера строки", t.nb[1]));
     }
     if (t.ne[1] as usize) < n_tok {
@@ -652,7 +656,7 @@ mod impl_probe2 {
 
         // сверка head q8/float по первой и последней позиции
         let d = n_embd;
-        let nv = p.n_vocab as usize;
+        let nv = p.n_vocab;
         for pos in [0usize, tok.len() - 1] {
             let h_q = quant8(&hidden[pos]);
             let h_f = &hidden[pos];
@@ -739,7 +743,7 @@ mod impl_probe2 {
         // --- изоляция БЕЗ слойной лоры: голова на выходе norm Ф32 → сравнение точное.
         // Пропускается для layer-only адаптера (tied-модели: SmolLM2 и др.).
         if let Some((a_h, b_h)) = head_pr.as_ref() {
-            assert_eq!(a_h.row as usize, d, "строка головы = n_embd");
+            assert_eq!(a_h.row, d, "строка головы = n_embd");
             let head_only = tmpd.join("dinet-parity-head.gguf");
             dinet_train::save_adapter_pieces(&arch_m, &head_only, &[AdapterPiece {
                 base: "output.weight".into(),
@@ -812,8 +816,8 @@ mod impl_probe2 {
                 .expect("l_out баз проход");
             let yl = plo.x_down.as_ref().expect("l_out лора");
             let yb = pbo.x_down.as_ref().expect("l_out база");
-            let n_in = al.row as usize;
-            let r_l = al.rows as usize;
+            let n_in = al.row;
+            let r_l = al.rows;
             let mut ml = 0f32;
             for pos in 0..tok.len() {
                 // z(q, pos) = Σ_j A[q][j]·xsw[pos][j]
@@ -859,7 +863,7 @@ mod impl_probe2 {
         let norm_w = gg.read_f32("output_norm.weight").expect("финальная норма");
 
         let eng = Probe2::load(Path::new(&model_path)).expect("модель");
-        assert_eq!(head_w.row as usize, eng.n_embd, "строка головы = n_embd");
+        assert_eq!(head_w.row, eng.n_embd, "строка головы = n_embd");
         // пара учителя: p = 4 слова микро-языка, a = 1 слово
         let toks = tokenize_gated(Path::new(&model_path), "Вопрос: ай би ви ги\nОтвет: ди");
         let targets: Vec<i32> = toks.iter().skip(1).copied().collect();
@@ -879,7 +883,7 @@ mod impl_probe2 {
 
         let mut ly = LayerLora::new(
             LayerSpec { n_in: n_ff as u32, n_out: eng.n_embd as u32, r: 8 },
-            0x0BAB1E as u64,
+            0x0BAB1E_u64,
         );
         let hw = HeadWeights {
             w: head_w.data.clone(),
@@ -919,7 +923,7 @@ mod impl_probe2 {
         let fn_ce = |logits: &[f32], t: usize| {
             let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let lse = mx + logits.iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
-            lse - logits[t as usize]
+            lse - logits[t]
         };
         let p = n_pos - 1;
         let t = targets[p] as usize;

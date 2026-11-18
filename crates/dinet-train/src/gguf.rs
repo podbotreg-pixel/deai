@@ -64,7 +64,7 @@ impl GgufModel {
             return Err("gguf: не GGUF".into());
         }
         let ver = rd_u32(&mut f)?;
-        if ver < 2 || ver > 3 {
+        if !(2..=3).contains(&ver) {
             return Err(format!("gguf: версия {ver} не поддерживается"));
         }
         let n_tensors = rd_u64(&mut f)?;
@@ -245,7 +245,7 @@ fn maybe_string(f: &mut std::fs::File) -> Result<GVal, String> {
 /// Прочитать или пропустить значение kv по типу.
 fn read_kv_val(f: &mut std::fs::File, vt: u32) -> Result<GVal, String> {
     Ok(match vt {
-        0 => GVal::U32(rd_u32(f)? as u32), // u8 — читаем как u32 по байту
+        0 => GVal::U32(rd_u32(f)?), // u8 — читаем как u32 по байту
         1 => { let mut b=[0u8;1]; read(f,&mut b)?; GVal::I32(b[0] as i8 as i32) }
         2 | 3 => { let mut b=[0u8;2]; read(f,&mut b)?; GVal::Other }
         4 => GVal::U32(rd_u32(f)?),
@@ -258,8 +258,8 @@ fn read_kv_val(f: &mut std::fs::File, vt: u32) -> Result<GVal, String> {
             let et = rd_u32(f)?;
             let n = rd_u64(f)?;
             let sz = match et {
-                0 | 1 | 7 => 1, 2 | 3 => 2, 4 | 5 | 6 => 4,
-                10 | 11 | 12 => 8, 8 => 0, 9 => return Err("gguf: вложенные массивы".into()),
+                0 | 1 | 7 => 1, 2 | 3 => 2, 4..=6 => 4,
+                10..=12 => 8, 8 => 0, 9 => return Err("gguf: вложенные массивы".into()),
                 _ => return Err(format!("gguf: неизвестный тип {et}")),
             };
             if sz == 0 {
@@ -272,7 +272,7 @@ fn read_kv_val(f: &mut std::fs::File, vt: u32) -> Result<GVal, String> {
             }
             GVal::Other
         }
-        10 | 11 | 12 => { let _ = rd_u64(f)?; GVal::Other }
+        10..=12 => { let _ = rd_u64(f)?; GVal::Other }
         _ => return Err(format!("gguf: неизвестный kv-тип {vt}")),
     })
 }
@@ -286,7 +286,7 @@ pub fn byte_size_q(ggml_type: u32, n_values: u64) -> Option<u64> {
         1 => Some(n_values.checked_mul(2)?), // F16
         8 => {
             // Q8_0: блок 32 значения, 34 байта
-            if n_values % 32 != 0 {
+            if !n_values.is_multiple_of(32) {
                 return None;
             }
             Some((n_values / 32).checked_mul(34)?)
@@ -438,20 +438,20 @@ mod gguf_tests {
             pu64(f, off);
         };
         let off_a = 0u64;
-        let off_b = (4 * 5 * 4 + 31) / 32 * 32;
+        let off_b = (4u64 * 5 * 4).div_ceil(32) * 32;
         ti(&mut f, b"output_norm.weight", &[4, 5], 0, off_a);
         ti(&mut f, b"output.weight", &[64], 8, off_b);
         // выравнивание до 32
         let hdr = f.len();
         let pad = (32 - hdr % 32) % 32;
-        f.extend(std::iter::repeat(0u8).take(pad));
+        f.extend(std::iter::repeat_n(0u8, pad));
         // данные F32 (5 строк по 4): значения 0..19
         for i in 0..20usize {
             pf32(&mut f, i as f32);
         }
         // паддинг до off_b (96) — выравнивание GGUF между данными тензоров
         let pad2 = off_b as usize - 20 * 4;
-        f.extend(std::iter::repeat(0u8).take(pad2));
+        f.extend(std::iter::repeat_n(0u8, pad2));
         // данные Q8_0: 2 блока (f16 d + 32×i8)
         let mut qb: Vec<u8> = Vec::new();
         for blo in 0..2u16 {
@@ -490,7 +490,7 @@ mod gguf_tests {
         assert_eq!(f16_to_f32(0x4000), 2.0);
         assert_eq!(f16_to_f32(0x8000), -0.0);
         assert_eq!(f16_to_f32(0xc000), -2.0);
-        assert_eq!(f16_to_f32(0x0001), 5.9604644775390625e-8); // поднормаль
+        assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8); // поднормаль
         let inf = f16_to_f32(0x7c00);
         assert_eq!(inf, f32::INFINITY);
     }
@@ -501,7 +501,7 @@ mod gguf_tests {
         let s = ((bits >> 31) & 1) as u16;
         let e = ((bits >> 23) & 0xff) as i32;
         let m = bits & 0x7f_ffff;
-        if e == 0xff + 0 {
+        if e == 0xff {
             return (s << 15) | 0x7c00;
         }
         // нормаль: смещение 15-127 = -112
@@ -510,7 +510,7 @@ mod gguf_tests {
             return s << 15;
         }
         if e16 >= 31 {
-            return ((s << 15) | 0x7c00) as u16;
+            return (s << 15) | 0x7c00;
         }
         let m16 = (m >> 13) as u16;
         (s << 15) | ((e16 as u16) << 10) | m16

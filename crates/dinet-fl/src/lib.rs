@@ -318,7 +318,7 @@ mod tests {
         let mut vecs: Vec<Vec<f32>> = (0..5)
             .map(|i| {
                 let mut v = vec![0.0f32; 20];
-                v[i as usize % 20] = 1.0;
+                v[i % 20] = 1.0;
                 v[(i * 3 + 2) % 20] = 1.0;
                 v
             })

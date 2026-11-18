@@ -230,7 +230,7 @@ mod tests {
             let _not = era_notary(&mut nodes, &ids, &mut t, era, &cfg, &mids, &mut regs);
         }
         assert_eq!(regs[0].len(), 2, "две reveal-эры: 2 записи");
-        assert!(nodes[0].blobs.len() >= 1, "склад узла 0 держит блобы");
+        assert!(!nodes[0].blobs.is_empty(), "склад узла 0 держит блобы");
 
         // --- отстающий: узел 3 с ОДНОЙ первой записью (формат честный байт)
         let log3 = dir.join("p3-catch.dlog");
@@ -266,7 +266,7 @@ mod tests {
         let fake = dinet_registry::Accepted { entry: fake_entry, seals: vec![fake_seal] };
         poisoned_offer.push(dinet_registry::encode_record(&fake));
         let frame = crate::swarm::sign_frame(
-            &mut nodes[0],
+            &nodes[0],
             MsgType::RegOffer,
             Payload::RegOffer { records: poisoned_offer },
         );

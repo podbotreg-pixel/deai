@@ -264,18 +264,15 @@ fn demo() -> ! {
     // 5) фокус на своём узле (WRITE)
     let mut focused = false;
     let mut why_focus = String::from("ни кнопка, ни окно не взяли фокус");
-    for cand in [
+    for id in [
         find_id(&list_app, "button", "Голос"),
         find_id(&list_app, "frame", "dinet-demo"),
-    ] {
-        if let Some(id) = cand {
-            let out = world.call(lvl, "gui_focus", &args_of(&format!(r#"{{"id":{id}}}"#)));
-            if !out.is_error {
-                focused = true;
-                why_focus = out.text.clone();
-                break;
-            }
+    ].into_iter().flatten() {
+        let out = world.call(lvl, "gui_focus", &args_of(&format!(r#"{{"id":{id}}}"#)));
+        if !out.is_error {
+            focused = true;
             why_focus = out.text.clone();
+            break;
         }
     }
     j.judge("фокус на своём узле", focused, &why_focus);

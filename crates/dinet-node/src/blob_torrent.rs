@@ -17,6 +17,10 @@
 //! (SHA-256 пре-имидж). «Отравленный» склад узла просто не совпадает
 //! по id — такой узел молчит.
 
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop)]
 use crate::swarm::{decode_with_book, sign_frame, Node, NodeId};
 use crate::transport::{CH_BLOB, Transport};
 use dinet_proto::{MsgType, Payload};

@@ -16,6 +16,10 @@
 //! интерфейсом `LocalTrainer` (crate-обвязке по изменению не нужно —
 //! интерфейс устойчив).
 
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 use super::{dp_noise, Lcg};
 
 pub const CTX: usize = 4; // контекст: 4 токена
@@ -157,7 +161,7 @@ impl ToyModel {
 
     fn logits_from_x(&self, x: &[f32]) -> Vec<f32> {
         let ba = self.ba();
-        let mut h = vec![0.0f32; H];
+        let mut h = [0.0f32; H];
         for (k, hk) in h.iter_mut().enumerate() {
             let mut z = self.base.b1[k];
             for i in 0..IN {
@@ -204,7 +208,7 @@ impl ToyModel {
         for (t, tok) in s.tokens.iter().enumerate() {
             x[t * V..(t + 1) * V].copy_from_slice(&Self::one_hot(*tok));
         }
-        let mut h = vec![0.0f32; H];
+        let mut h = [0.0f32; H];
         for (k, hk) in h.iter_mut().enumerate() {
             let mut z = self.base.b1[k];
             for i in 0..IN {
@@ -360,7 +364,7 @@ pub fn quant_logits(logits: &[Vec<f32>]) -> (f32, Vec<u8>) {
 
 /// Деквант (обратное к quant_logits).
 pub fn dequant_logits(scale: f32, q: &[u8], carriers: usize) -> Vec<Vec<f32>> {
-    q.chunks_exact(V)
+    q.as_chunks::<V>().0.iter()
         .take(carriers)
         .map(|c| c.iter().map(|&b| (b as i8) as f32 * scale).collect())
         .collect()
@@ -375,7 +379,7 @@ impl ToyModel {
         for (t, tok) in tokens.iter().enumerate() {
             x[t * V..(t + 1) * V].copy_from_slice(&Self::one_hot(*tok));
         }
-        let mut h = vec![0.0f32; H];
+        let mut h = [0.0f32; H];
         for (k, hk) in h.iter_mut().enumerate() {
             let mut z = self.base.b1[k];
             for i in 0..IN {
@@ -529,9 +533,9 @@ pub const LEX: [&str; V] = ["ай", "би", "ви", "ги", "ди", "ей", "ж�
 pub fn lex_to_tokens(text: &str) -> Option<Vec<u8>> {
     let mut t = Vec::new();
     for w in text.split_whitespace() {
-        match LEX.iter().position(|l| *l == w) {
-            Some(i) => t.push(i as u8),
-            None => return None,
+        {
+            let i = LEX.iter().position(|l| *l == w)?;
+            t.push(i as u8)
         }
     }
     if t.is_empty() { None } else { Some(t) }

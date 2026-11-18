@@ -55,8 +55,11 @@
 //! - POST /api/ask     — поиск по памяти (RAG);
 //! - POST /api/forget  — удаление факта по id;
 //! - GET  /api/stats   — счётчики чата и роёв.
+//!
 //! Каждые `--every` учительских пар клиент проводит ЛОКАЛЬНУЮ эру роя:
+//!
 //! fit ТОЛЬКО на своих диалогах → DP-дельта → кворум → чек-пойнт
+//!
 //! (эпохи — тот же код, что в spoolswarm/clientswarm).
 //!
 //! ФОН (M2): клиент тренируется САМ, пока жив: поток bg_trainer раз в
@@ -790,7 +793,7 @@ const WEB_STOP: [&str; 8] = [
 ];
 
 /// Ключевые слова текста: слова >= 5 букв, без служебных, уникальные.
-/// Это МОСТ между двумя источниками опыта: слова диалога/опыта	events
+/// Это МОСТ между двумя источниками опыта: слова диалога/опыта    events
 /// превращаются в «любопытство роя» — темы поиска в сети.
 fn keywords(text: &str, want: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -800,7 +803,7 @@ fn keywords(text: &str, want: usize) -> Vec<String> {
             continue;
         }
         let lw = w.to_lowercase();
-        if WEB_STOP.contains(&lw.as_str()) || out.iter().any(|s| *s == lw) {
+        if WEB_STOP.contains(&lw.as_str()) || out.contains(&lw) {
             continue;
         }
         out.push(lw);
@@ -878,8 +881,8 @@ fn web_snippets(html: &str, max: usize) -> Vec<String> {
             let chunk = if end > 0 { &after[..end] } else { "" };
             let mut text = String::new();
             let mut depth = 0usize;
-            let mut it = chunk.chars().peekable();
-            while let Some(c) = it.next() {
+            let it = chunk.chars().peekable();
+            for c in it {
                 match c {
                     '<' => depth += 1,
                     '>' => depth = depth.saturating_sub(1),
@@ -897,7 +900,7 @@ fn web_snippets(html: &str, max: usize) -> Vec<String> {
                 .replace("&gt;", ">")
                 .trim()
                 .to_string();
-            if clean.len() > 40 && !out.iter().any(|s: &String| *s == clean) {
+            if clean.len() > 40 && !out.contains(&clean) {
                 out.push(clean);
                 if out.len() >= max {
                     return out;
@@ -1255,12 +1258,14 @@ fn hex8(b: &[u8]) -> String {
 /// - микроязык роя (слова «ай би ви…») → реплика роя (ToyChatModel::trained);
 ///   llama-режим — ВСЕ остальные ходы уходят на llama.cpp.
 /// - без llama-фичи: только реплика роя (как раньше).
+///
 /// Куски ответа отдаются поточно (`on`) — HTTP-ответ пишется по мере генерации.
 #[cfg_attr(not(feature = "llama"), allow(unused_variables))]
 // ---------------------------------------------------------------------------
 // ПОДГРУЗКА ИНСТРУКЦИЙ РОЯ В ЧАТ (M2): правила сети видит каждая модель
 // ---------------------------------------------------------------------------
 
+///
 /// Контекст = СНАЧАЛА сетевые правила роя, потом память (RAG).
 fn rules_ctx(rules: &[String], context: &[String]) -> Vec<String> {
     let mut out: Vec<String> = rules.iter().map(|r| format!("правило роя: {r}")).collect();
@@ -1413,7 +1418,7 @@ fn handle(st: &ChatState, method: &str, path: &str, body: String, out: &mut TcpS
                     let pairs = e.valid.len();
                     drop(e);
                     drop(g);
-                    if pairs as u32 % st.every.max(1) == 0 && !st.net_on {
+                    if (pairs as u32).is_multiple_of(st.every.max(1)) && !st.net_on {
                         // при --net эры идут СЕТЕВОГО моста (нить net-eras);
                         // материал копится в e.valid — inline-эра выключена
                         era_tick(&st.era);
@@ -1635,7 +1640,7 @@ fn main() {
     node.signer = Box::new(node_key); // v1: личный ключ вместо сим-вывода
     if let Some(ab) = kv.get("рой:adapter") {
         let vals: Vec<f32> = ab
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         if vals.len() == dinet_fl::toy_llm::LoRAAdapter::num_params() {

@@ -152,13 +152,10 @@ impl Atspi {
         out.push(Node { r: r.clone(), name, role });
         if depth > 0 {
             // ветка не отвечает → спуска не будет, остальные живы
-            match self.children(r) {
-                Ok(kids) => {
-                    for child in kids {
-                        out.extend(self.tree(&child, depth - 1)?);
-                    }
+            if let Ok(kids) = self.children(r) {
+                for child in kids {
+                    out.extend(self.tree(&child, depth - 1)?);
                 }
-                Err(_) => {}
             }
         }
         Ok(out)

@@ -703,7 +703,7 @@ mod tests {
                     base: format!("blk.{}.ffn_down.weight", n_layer - 1),
                     a: vec![0f32; r * n_in],
                     a_ne0: n_in as u64,
-                    b: vec![0f32; probe.n_embd as usize * r],
+                    b: vec![0f32; probe.n_embd * r],
                     b_ne1: probe.n_embd as u64,
                     r: r as u64,
                 }],

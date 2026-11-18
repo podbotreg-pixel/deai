@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     // счётчик эр минёра переживает рестарт смотрителя
     let era0 = std::fs::read(&era_path)
         .ok()
-        .and_then(|b| b.chunks_exact(4).next().map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .and_then(|b| b.as_chunks::<4>().0.iter().next().map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
         .unwrap_or(0);
 
     println!("поднимаю {n} смотрителей на портах {port0}..{} (эра старт {era0})...", port0 + n - 1);

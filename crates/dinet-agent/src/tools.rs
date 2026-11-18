@@ -12,7 +12,7 @@ use crate::phishing_model::{Model, T_SUSPECT};
 use crate::json::Json;
 use crate::skills::{Skill, SkillStep, SkillStore, MAX_STEPS};
 use dinet_crypto::Ed25519Signer;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Какие права нужны инструменту и в каком scope он работает.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,7 +191,7 @@ impl AllowRule {
 }
 
 impl ToolWorld {
-    pub fn open(dir: &PathBuf, allow: Vec<AllowRule>) -> Result<ToolWorld, String> {
+    pub fn open(dir: &Path, allow: Vec<AllowRule>) -> Result<ToolWorld, String> {
         let jail = Jail::open(dir)?;
         let journal = Journal::open(&dir.join("agent-undo.roi"))?;
         let audit = Audit::open(&dir.join("agent-audit.roi"))?;

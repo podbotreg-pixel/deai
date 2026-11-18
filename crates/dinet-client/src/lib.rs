@@ -89,7 +89,7 @@ pub fn user_script(seed: u64, k: u32) -> Vec<(String, String)> {
         .map(|i| {
             let mut b = Vec::with_capacity(17);
             b.extend_from_slice(&seed.to_le_bytes());
-            b.extend_from_slice(&(i as u32).to_le_bytes());
+            b.extend_from_slice(&i.to_le_bytes());
             let mut toks = [0u8; CTX];
             for (j, t) in toks.iter_mut().enumerate() {
                 let mut bj = b.clone();
@@ -121,7 +121,7 @@ mod tests {
         let s = pair_to_sample("ай ви ди би", "ви").expect("микроязык валиден");
         assert_eq!(s.tokens, [0, 2, 4, 1]);
         assert_eq!(s.chosen, 2);
-        assert_eq!(s.rejected, Some((2 + 3) % 8));
+        assert_eq!(s.rejected, Some(2 + 3));
         // неполный контекст / многословный ответ — не пара
         assert!(pair_to_sample("ай би", "ви").is_none());
         assert!(pair_to_sample("ай ви ди би", "ви ай").is_none());

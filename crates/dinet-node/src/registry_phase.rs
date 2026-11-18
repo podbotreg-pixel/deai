@@ -26,7 +26,7 @@ use dinet_registry::{Accepted, RegistryEntry, RegistryLog, Seal};
 /// Минимум печатей: ceil(2N/3) от полного состава роя (тот же принцип,
 /// что accepts*3 >= votes*2; молчащий нотариус = отказ).
 pub fn notary_min(roster: usize) -> usize {
-    (roster * 2 + 2) / 3
+    (roster * 2).div_ceil(3)
 }
 
 /// Сбор печатей над мостом: доставки распределены во времени — копим до
@@ -249,7 +249,7 @@ mod tests {
 
     /// Полный прогон эры publish→collect/vote→tally→notary с ОДНИМ transport.
     fn run_era_with_notary(
-        nodes: &mut Vec<SwarmNode>,
+        nodes: &mut [SwarmNode],
         ids: &[NodeId],
         t: &mut MeshTransport,
         era: u32,

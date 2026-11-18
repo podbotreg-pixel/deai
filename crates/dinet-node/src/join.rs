@@ -330,7 +330,7 @@ mod tests {
         let f = Frame::decode(&wire).expect("повторный кадр");
         assert!(books[0].knows(&f.sender), "книга не знает ключ");
         assert!(
-            books[0].senders().iter().any(|k| *k == f.sender),
+            books[0].senders().contains(&f.sender),
             "ключ не в списке книги"
         );
         // верификация через книгу:  подпись сходится ключом из книги

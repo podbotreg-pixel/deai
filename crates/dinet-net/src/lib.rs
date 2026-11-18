@@ -214,9 +214,8 @@ mod tests {
         for _ in 0..10 {
             bad.observe(unix, false);
         }
-        assert_eq!(
+        assert!(
             good.score_at(unix) + bad.score_at(unix) < 0.0,
-            true,
             "10 bad должны перевесить 10 good"
             );
     }

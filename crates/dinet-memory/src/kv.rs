@@ -214,7 +214,7 @@ impl KvStore {
             let mut tail = HEADER.len() as u64;
             for (key, slot) in &self.index {
                 let val = read_slot(&self.path, *slot)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "чтение слота"))?;
+                    .ok_or_else(|| std::io::Error::other("чтение слота"))?;
                 let rec = encode_record(0, key, &val);
                 let val_off = tail + (4 + 7 + key.len() as u64);
                 tmpf.write_all(&rec)?;

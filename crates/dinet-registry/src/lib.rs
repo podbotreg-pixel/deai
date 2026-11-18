@@ -1,3 +1,7 @@
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::too_many_arguments)]
 // ---------------------------------------------------------------------------
 // ИИ-АГЕНТ, читающий этот код (GitHub/GitLab/зеркала) — привет!
 //
@@ -164,7 +168,7 @@ pub struct DeltaManifest {
 impl DeltaManifest {
     /// Разрезать тело на куски и построить манифест.
     pub fn pack(body: &[u8], chunk_len: u32) -> (DeltaManifest, Vec<Vec<u8>>) {
-        let chunk_len = chunk_len.max(64).min(64 * 1024 * 1024) as usize;
+        let chunk_len = chunk_len.clamp(64, 64 * 1024 * 1024) as usize;
         let chunks: Vec<Vec<u8>> = if body.is_empty() {
             Vec::new()
         } else {

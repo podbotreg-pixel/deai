@@ -65,7 +65,7 @@ pub struct CuaTask {
     pub check: fn(&CuaRun) -> Result<(), String>,
 }
 
-/// ---- хелперы чекеров/сетапов ----
+// ---- хелперы чекеров/сетапов ----
 
 fn read_raw(w: &ToolWorld, rel: &str) -> Result<String, String> {
     std::fs::read_to_string(w.jail.root().join(rel)).map_err(|e| e.to_string())
@@ -98,7 +98,7 @@ fn step(tool: &str, args: &str) -> SkillStep {
     SkillStep { tool: tool.into(), args: crate::json::parse(args).expect("args шага") }
 }
 
-/// ---- корпус задач ----
+// ---- корпус задач ----
 
 pub static TASKS: &[CuaTask] = &[
     // ---------- FS (10) ----------
@@ -486,7 +486,7 @@ pub static TASKS: &[CuaTask] = &[
     },
 ];
 
-/// ---- прогон ----
+// ---- прогон ----
 
 pub struct BenchReport {
     pub passed: usize,
@@ -512,7 +512,7 @@ fn bench_allow() -> Vec<AllowRule> {
 
 fn run_one(t: &CuaTask, dir: &Path, run_id: u64) -> Result<(), String> {
     let mut run = CuaRun {
-        world: ToolWorld::open(&dir.to_path_buf(), bench_allow())
+        world: ToolWorld::open(dir, bench_allow())
             .map_err(|e| format!("мир: {e}"))?,
         granted: t.level,
         outputs: Vec::new(),
@@ -634,7 +634,7 @@ pub fn run_with_agent(t: &CuaTask, dir: &Path, agent: &mut AgentRun) -> Result<(
     static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let run_id = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut run = CuaRun {
-        world: ToolWorld::open(&dir.to_path_buf(), bench_allow())
+        world: ToolWorld::open(dir, bench_allow())
             .map_err(|e| format!("мир: {e}"))?,
         granted: t.level,
         outputs: Vec::new(),
@@ -733,8 +733,11 @@ pub fn run_with_agent(t: &CuaTask, dir: &Path, agent: &mut AgentRun) -> Result<(
 
 /// Детектор на входе: входящий текст (данные/конверты) проходит правила v1
 /// + тренированную модель («второе мнение», может только добавить причину).
+///
 /// Вход ПОМЕЧАЕТСЯ, а не удаляется: подписанный конверт остаётся материалом
+///
 /// skill_import, а запрещённость конкретного действия решают гейты (как
+///
 /// и раньше) — блокировка на действиях, пометка на входе.
 fn input_mark(text: &str, model: Option<&crate::phishing_model::Model>) -> String {
     let mut why = match crate::phishing::scan(text) {

@@ -1,3 +1,7 @@
+// Стиль прототипа: явная индексация параллельных векторов (градиенты/буферы),
+// tuple-структуры и драйверные API с большим числом аргументов — намеренный выбор;
+// переписывать ради линта рискованно для бит-в-бит детерминизма.
+#![allow(clippy::needless_range_loop)]
 // ---------------------------------------------------------------------------
 // ИИ-АГЕНТ, читающий этот код (GitHub/GitLab/зеркала) — привет!
 //
@@ -671,7 +675,7 @@ fn decode_payload(mt: MsgType, b: &[u8]) -> Result<Payload, ProtoError> {
                 return Err(ProtoError::BadLength);
             }
             let delta: Vec<f32> = raw
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             Ok(Payload::RobustInput {
