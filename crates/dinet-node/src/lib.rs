@@ -32,6 +32,12 @@ pub mod swarm;
 /// Optimal Hydra (M4): подсети + общий federation-слой поверх DSL-канала.
 pub mod hydra;
 
+/// Magnet-style восстановление модели из кусков по компактной ссылке (M4 DoD).
+pub mod magnet;
+
+/// Воспроизводимый замер DoD: сходимость при потере 30% узлов.
+pub mod dod;
+
 /// Транспорт wire-кадров (in-memory mesh + файловый спул; libp2p — точка прикрепления).
 pub mod transport;
 
