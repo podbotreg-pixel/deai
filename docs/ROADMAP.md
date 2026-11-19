@@ -126,9 +126,18 @@
 - [x] История чата v0 (CLI REPL `dinet-chat::chatdemo`): сессия над локальной памятью,
       RAG-контекст хода, буфер пар speak→learn в том же KV-файле; трейт `ChatModel` —
       точка прикрепления llama.cpp
-- [ ] Чат-UI (Qt) поверх `ChatSession`, экспорт, миграция (механика сессии уже готова)
-      — ПРАВИЛО: GUI для Linux и Windows строится на Qt (комплекты сборки
-      в /home/appelsin/Qt); веб-страница webchat остаётся lightweight-слоем
+- [x] Чат-UI (Qt) поверх `ChatSession`, экспорт, миграция — M0/M4 GUI:
+     `desktop/qt_chat.py` (PyQt6) + `crates/dinet-desktop` (C-ABI мост
+     `libdinet_desktop.so` к тому же `PhoneCore`, что и у телефона).
+     Три вкладки «Чат/Рой/Сеть»: ход, учительская пара, статистика,
+     водяной знак, probe, добавление пиров, сетевой/фоновый вклад
+     (сетевые вызовы в QThread — UI не висит). Запуск:
+     `cargo build -p dinet-desktop && python3 desktop/qt_chat.py`;
+     живые скриншоты вкладок через `--shot`. Правило соблюдено:
+     Linux/Windows — Qt, Android — Compose, webchat — lightweight-слой.
+     Экспорт/миграция истории — [v2].
+     — ПРАВИЛО: GUI для Linux и Windows строится на Qt (комплекты сборки
+     в /home/appelsin/Qt); веб-страница webchat остаётся lightweight-слоем
 - [x] **Speak→learn (механика):** буфер пар → LoRA + hinge-предпочтение (saturating DPO-lite),
       DP-клиппинг, local_fit → secure_agg — на toy-модели, интерфейс LocalTrainer устойчив
       к замене на llama.cpp
@@ -1003,6 +1012,15 @@ REVEAL-эры с robust-агрегацией и чек-пойнтом); симу
 Deep-link'и с двумя query-параметрами требуют кавычек внутри `adb shell`
 (иначе `&` съедается device-shell'ом) — в Kotlin добавлен лог
 `dinet-uri` с точным URI для диагностики.
+
+**GUI-доработка (Qt + Android):** десктопный Qt-клиент собран поверх C-ABI
+моста к общему `PhoneCore` (см. M0 «Чат-UI (Qt)»); в Android-приложении
+добавлена вкладка «Сеть» — список адресов, добавление пира и кнопки
+«Сетевой вклад»/«Фоновый вклад» в GUI вместо deep-link'ов. Живая проверка
+(эмулятор + swarmkeeper): адрес `10.0.2.2:9303` добавлен через UI, список
+обновлён, кнопка «Сетевой вклад» провела эру 7 с чек-пойнтом; новый JNI
+`Core.peers()` (запрос адресов из KV). Скриншоты вкладок Qt/Compose
+сохранены в отчёте шага.
 
 ## M4 — Продвинутые каналы (непрерывно)
 

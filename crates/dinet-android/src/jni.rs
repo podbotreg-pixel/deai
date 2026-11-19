@@ -287,6 +287,15 @@ pub extern "C" fn Java_dev_dinet_app_Core_peer(
     }) as u8
 }
 
+/// Адреса роя одной строкой (по одному на строку) — экран «Сеть».
+#[no_mangle]
+pub extern "C" fn Java_dev_dinet_app_Core_peers(env: Env, _class: *mut c_void) -> *mut c_void {
+    let list = safe(env, "peers", String::new(), || {
+        core(|c| Ok(c.peers().join("\n")), "peers")
+    });
+    unsafe { write_string(env, &list) }
+}
+
 /// Сетевой вклад (WorkManager, шаг 3): dial роя («рой:peers»), волна
 /// состава, серия эр роя на реальном TCP до чек-пойнта REVEAL (≤4 эры).
 /// Ядро поднимает себя сам; строка-итог для логов.

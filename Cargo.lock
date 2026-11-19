@@ -716,6 +716,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinet-desktop"
+version = "0.1.0"
+dependencies = [
+ "dinet-android",
+]
+
+[[package]]
 name = "dinet-fl"
 version = "0.1.0"
 dependencies = [

@@ -57,6 +57,10 @@ class MainActivity : ComponentActivity() {
     /** Вкладка: 0 — чат, 1 — рой (статистика). */
     val tab = mutableStateOf(0)
     val swarm = mutableStateOf("рой: …")
+    /** Экран «Сеть»: адреса и ручные вклады. */
+    val peerInput = mutableStateOf("")
+    val peers = mutableStateOf<List<String>>(emptyList())
+    val netStatus = mutableStateOf("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -218,6 +222,7 @@ class MainActivity : ComponentActivity() {
     fun openTab(which: Int) {
         tab.value = which
         if (which == 1) loadSwarm()
+        if (which == 2) loadPeers()
     }
 
     /// Статистика роя из рой-KV + статус гейтов вклада (Kotlin) — фон.
@@ -231,6 +236,48 @@ class MainActivity : ComponentActivity() {
             val (_, gates) = Gates.check(this)
             runOnUiThread { swarm.value = "$line\n$gates" }
         }
+    }
+
+    /// Адреса смотрителей из рой-KV (экран «Сеть»).
+    fun loadPeers() {
+        bg {
+            val list = try {
+                Core.peers().lines().map { it.trim() }.filter { it.isNotEmpty() }
+            } catch (e: Throwable) {
+                emptyList()
+            }
+            runOnUiThread { peers.value = list }
+        }
+    }
+
+    /// Добавить адрес ip:порт без deep-link (кнопка на экране «Сеть»).
+    fun addPeer() {
+        val addr = peerInput.value.trim()
+        if (addr.isEmpty()) return
+        bg {
+            val ok = try {
+                Core.peer(addr)
+            } catch (e: Throwable) {
+                false
+            }
+            runOnUiThread {
+                netStatus.value = if (ok) "адрес добавлен: $addr" else "неверный адрес: $addr"
+                if (ok) peerInput.value = ""
+                loadPeers()
+            }
+        }
+    }
+
+    /// Сетевой вклад вручную (тот же воркер, что и deep-link net).
+    fun netNow() {
+        push(Msg("система", "сетевой вклад запрошен; лог — logcat (dinet-net)"))
+        NetWorker.scheduleOnce(this)
+    }
+
+    /// Фоновый локальный вклад вручную.
+    fun bgNow() {
+        push(Msg("система", "фоновый вклад запрошен; лог — logcat (dinet-bg)"))
+        TickWorker.scheduleOnce(this)
     }
 
     /// «Обновить состав»: лёгкий probe роя (dial + волна состава, без эр)
@@ -263,6 +310,9 @@ fun DinetApp(activity: MainActivity) {
     val stats by activity.stats
     val swarm by activity.swarm
     val tab by activity.tab
+    var peerInput by activity.peerInput
+    val peers by activity.peers
+    val netStatus by activity.netStatus
     val list = rememberLazyListState()
     // лента чата всегда показывает ПОСЛЕДНИЙ ход (иначе после десятков
     // сообщений экран застывает на первом и ответ не виден)
@@ -283,6 +333,7 @@ fun DinetApp(activity: MainActivity) {
                 )
                 Button(onClick = { activity.openTab(0) }) { Text("Чат") }
                 Button(onClick = { activity.openTab(1) }) { Text("Рой") }
+                Button(onClick = { activity.openTab(2) }) { Text("Сеть") }
             }
             if (tab == 0) {
                 Text(stats, fontSize = 12.sp)
@@ -308,7 +359,7 @@ fun DinetApp(activity: MainActivity) {
                     )
                     Button(onClick = { activity.doTurn(input) }) { Text("Спросить") }
                 }
-            } else {
+            } else if (tab == 1) {
                 Text(
                     swarm,
                     fontSize = 13.sp,
@@ -316,6 +367,29 @@ fun DinetApp(activity: MainActivity) {
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { activity.probe() }) { Text("Обновить состав") }
+                }
+            } else {
+                Text("Сеть: пиры и ручной вклад", fontSize = 15.sp)
+                Text(netStatus, fontSize = 12.sp)
+                OutlinedTextField(
+                    value = peerInput,
+                    onValueChange = { peerInput = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("адрес смотрителя ip:порт") },
+                    singleLine = true,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { activity.addPeer() }) { Text("Добавить пир") }
+                    Button(onClick = { activity.loadPeers() }) { Text("Обновить") }
+                }
+                LazyColumn(
+                    Modifier.fillMaxWidth().weight(1f).padding(vertical = 8.dp),
+                ) {
+                    items(peers) { addr -> Text("• $addr", fontSize = 14.sp) }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { activity.netNow() }) { Text("Сетевой вклад") }
+                    Button(onClick = { activity.bgNow() }) { Text("Фоновый вклад") }
                 }
             }
         }

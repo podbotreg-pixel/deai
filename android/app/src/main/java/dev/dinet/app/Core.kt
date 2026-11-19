@@ -30,6 +30,9 @@ object Core {
     /** Запомнить адрес роя (deep-link dinet://cmd/peer?addr=ip:порт). */
     external fun peer(addr: String): Boolean
 
+    /** Адреса роя, по одному на строку (экран «Сеть»). */
+    external fun peers(): String
+
     /** Сетевой вклад (WorkManager): dial роя, серия эр на реальном TCP
      *  до чек-пойнта REVEAL; ядро поднимает себя сам. */
     external fun net(): String

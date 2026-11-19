@@ -16,6 +16,7 @@ members = [
     "crates/dinet-llama",
     "crates/dinet-agent",
     "crates/dinet-android",
+    "crates/dinet-desktop",
 ]
 
 [workspace.package]

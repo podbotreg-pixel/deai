@@ -1,0 +1,14 @@
+[package]
+name = "dinet-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "C-ABI мост настольного Qt-клиента DI-NET к общему ядру PhoneCore"
+
+[lib]
+name = "dinet_desktop"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dinet-android = { path = "../dinet-android" }

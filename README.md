@@ -93,6 +93,11 @@ cargo run -p dinet-client --bin webchat -- ./dinet-web-mem --port 8080
                              # кнопка «Учить» = пара учителя → каждые 4 пары локальная эра роя
                              # → REVEAL-эра принимает чек-пойнт → ЧАТ ОТВЕЧАЕТ ОБУЧЕННЫМ РЕПЛИКОЙ
                              # (реплика переживает рестарт: ./dinet-web-mem.roi)
+# НАСТОЛЬНЫЙ Qt-КЛИЕНТ (правило GUI: Linux/Windows — Qt, Android — Compose):
+cargo build -p dinet-desktop
+python3 desktop/qt_chat.py
+                              # PyQt6 + C-ABI мост к тому же PhoneCore, что и у телефона;
+                              # вкладки Чат/Рой/Сеть, --shot <path> — автодемо + скриншот
 # GUI + ^НАСТОЯЩАЯ LLM (llama.cpp): свободные ходы — GGUF, микроязык — рой;
 # ответ СТРИМИТСЯ в браузер токен-за-токеном (HTTP/1.0 до закрытия, fetch getReader):
 cargo run -p dinet-client --features llama --bin webchat -- \
